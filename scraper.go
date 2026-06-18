@@ -27,7 +27,12 @@ func (p Proxy) String() string {
 }
 
 func Scrape(url string) ([]Proxy, error) {
-	resp, err := http.Get(url)
+	t := &http.Transport{}
+	t.RegisterProtocol("file", http.NewFileTransport(http.Dir("/")))
+
+	c := &http.Client{Transport: t}
+    resp, err := c.Get(url)
+
 	if err != nil {
 		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
