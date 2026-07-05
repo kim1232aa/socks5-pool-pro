@@ -55,6 +55,7 @@ tr:hover td{background:#1e293b55}
 .current-node .cn-meta{color:#64748b;font-size:0.78rem;margin-left:6px}
 tr.active td{background:#14311f !important}
 .badge-inuse{background:#065f46;color:#4ade80;padding:1px 7px;border-radius:4px;font-size:0.68rem;font-weight:bold}
+.exit-diff{color:#fbbf24}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%}
 form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
 input,select{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:0.8rem}
@@ -98,9 +99,10 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 
   <div id="group-cards-container" class="group-cards"></div>
 
+  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(健康检查时穿过该节点探测得到),不是节点自身 IP 的定位。若"出口IP"和"地址"不同,说明该节点是链式/透明代理,或你的网络本身套了透明出口代理。</p>
   <table>
-  <thead><tr><th></th><th>协议</th><th>地址</th><th>国家/城市</th><th>来源</th><th>延迟</th><th>速度</th><th>操作</th></tr></thead>
-  <tbody id="node-tbody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
+  <thead><tr><th></th><th>协议</th><th>地址(节点IP)</th><th>出口IP</th><th>国家/城市(按出口)</th><th>来源</th><th>延迟</th><th>速度</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="9" class="empty">加载中...</td></tr></tbody>
   </table>
 
   <details class="proxyip-section">
@@ -255,7 +257,7 @@ function renderNodes(nodes) {
   var banner = document.querySelector('#current-node-banner .cn-addr');
   var active = null;
   if (!nodes.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
     if (banner) banner.textContent = '无 (代理池为空)';
     return;
   }
@@ -265,10 +267,16 @@ function renderNodes(nodes) {
     var loc = escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
     var lat = n.latency_ms ? n.latency_ms + 'ms' : '-';
     var spd = n.speed_kbps ? Math.round(n.speed_kbps) + ' kbps' : '-';
+    var nodeIP = (n.addr || '').split(':')[0];
+    var exit = n.exit_ip || '';
+    var exitCell = exit
+      ? '<span class="mono' + (exit !== nodeIP ? ' exit-diff' : '') + '">' + escapeHtml(exit) + '</span>'
+      : '<span class="small">-</span>';
     html += '<tr class="' + (n.active ? 'active' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
       '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : '') + '</td>' +
       '<td>' + protoBadge(n.protocol) + '</td>' +
       '<td class="mono">' + escapeHtml(n.addr) + '</td>' +
+      '<td>' + exitCell + '</td>' +
       '<td>' + loc + '</td>' +
       '<td class="small">' + escapeHtml(n.source || '') + '</td>' +
       '<td>' + lat + '</td>' +

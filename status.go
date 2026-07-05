@@ -52,6 +52,7 @@ type NodeView struct {
 	Country   string  `json:"country"`
 	City      string  `json:"city"`
 	Source    string  `json:"source"`
+	ExitIP    string  `json:"exit_ip"`
 	LatencyMs int64   `json:"latency_ms"`
 	SpeedKbps float64 `json:"speed_kbps"`
 	Active    bool    `json:"active"` // this node is the ANY group's current upstream
@@ -157,7 +158,7 @@ func nodeViewOf(px Proxy, activeAddr string) NodeView {
 	return NodeView{
 		Key: px.Key(), Addr: px.Addr(), Protocol: px.Protocol,
 		Country: px.Country, City: px.City, Source: px.SourceName,
-		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
+		ExitIP: px.ExitIP, LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
 		Active: activeAddr != "" && px.Addr() == activeAddr,
 	}
 }

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -45,24 +47,40 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 			defer func() { <-sem }()
 
 			start := time.Now()
-			var ok bool
-			if px.Protocol == "proxyip" {
-				ok = checkReachable(px, timeout)
-			} else {
-				ok = checkGoogle(px, timeout)
-			}
-			if !ok {
-				return
-			}
-			px.LatencyMs = time.Since(start).Milliseconds()
 
-			// Geo only for survivors, and only when the source didn't
-			// already supply it (EDT-Pages/proxyip feeds do).
-			if px.Country == "" {
-				country, city := LookupGeo(px.IP, timeout)
-				px.Country = strings.TrimSpace(country)
-				px.City = strings.TrimSpace(city)
+			if px.Protocol == "proxyip" {
+				// proxyip nodes don't forward, so there's no "exit" to
+				// probe; just prove reachability and trust source geo.
+				if !checkReachable(px, timeout) {
+					return
+				}
+				px.LatencyMs = time.Since(start).Milliseconds()
+			} else {
+				// Connectivity check uses a rate-limit-free endpoint so
+				// aliveness never depends on the geo service being up.
+				if !checkGoogle(px, timeout) {
+					return
+				}
+				px.LatencyMs = time.Since(start).Milliseconds()
+
+				// Best-effort: discover the REAL exit IP (how the outside
+				// world sees this proxy) and geolocate THAT, so country is
+				// trustworthy. All of this is non-fatal - a node stays
+				// alive even if the exit/geo probes are rate-limited; it
+				// just falls back to source-supplied or front-IP geo.
+				px.ExitIP = probeExitIP(px, timeout)
+				if px.ExitIP != "" {
+					if c, ci := LookupGeo(px.ExitIP, timeout); c != "" && c != "Unknown" {
+						px.Country, px.City = c, ci
+					}
+				}
+				if px.Country == "" {
+					c, ci := LookupGeo(px.IP, timeout)
+					px.Country = strings.TrimSpace(c)
+					px.City = strings.TrimSpace(ci)
+				}
 			}
+
 			if blockedCountries[strings.ToLower(px.Country)] {
 				return
 			}
@@ -78,9 +96,8 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 }
 
 // checkGoogle verifies a forwarding-capable proxy by fetching Google's
-// generate_204 endpoint through the upstream tunnel. Works uniformly for
-// socks5/http/https upstreams since DialUpstream already establishes the
-// tunnel to the target before this ever touches protocol-specific bytes.
+// generate_204 endpoint through the upstream tunnel. Google doesn't rate-
+// limit this, so it's a reliable aliveness signal (unlike a geo service).
 func checkGoogle(px Proxy, timeout time.Duration) bool {
 	conn, err := DialUpstream(px, "www.google.com:80", timeout)
 	if err != nil {
@@ -100,6 +117,38 @@ func checkGoogle(px Proxy, timeout time.Duration) bool {
 		return false
 	}
 	return string(resp[:4]) == "HTTP"
+}
+
+// probeExitIP fetches the proxy's real exit IP by asking a lenient
+// "what's my IP" service through the tunnel. Returns "" on any failure -
+// callers treat it as best-effort and never drop a node over it.
+func probeExitIP(px Proxy, timeout time.Duration) string {
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+				return DialUpstream(px, addr, timeout)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := client.Get("http://api.ipify.org/")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return ""
+	}
+	ip := strings.TrimSpace(string(body))
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	return ip
 }
 
 // checkReachable is a minimal TCP-connect probe for "proxyip" entries,

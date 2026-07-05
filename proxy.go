@@ -32,6 +32,15 @@ type Proxy struct {
 	// SpeedKbps is the download throughput measured by an on-demand speed
 	// test (see speedtest.go), in kilobits/sec. Zero if never tested.
 	SpeedKbps float64
+
+	// ExitIP is the address the outside world actually sees when traffic
+	// is sent through this proxy, measured during the health check by
+	// asking a geo service through the tunnel. It can differ from IP for
+	// chained/transparent proxies (or when the whole host sits behind a
+	// transparent egress proxy). Country/City reflect the geolocation of
+	// this exit IP, not of IP. Empty if the exit probe couldn't determine
+	// it (e.g. geo service rate-limited).
+	ExitIP string
 }
 
 func (p Proxy) Addr() string {
