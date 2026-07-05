@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"math"
 	"math/rand"
 	"strings"
 	"sync"
@@ -20,7 +21,16 @@ const (
 	StrategyRandom     = "random"      // pick uniformly at random on every new connection
 	StrategyLatency    = "latency"     // prefer the lowest measured health-check latency
 	StrategySpeed      = "speed"       // prefer the highest on-demand speed-test throughput
+	StrategyScore      = "score"       // prefer the highest composite quality score
 )
+
+// nodeStats accumulates observed reliability for one node across
+// connections and background re-checks, keyed by Proxy.Key().
+type nodeStats struct {
+	Successes     int   `json:"successes"`
+	Failures      int   `json:"failures"`
+	LastLatencyMs int64 `json:"last_latency_ms"`
+}
 
 // Group is a user-defined named subset of the pool plus a selection
 // strategy. GroupAny and GroupDirect are reserved built-ins that always
@@ -53,15 +63,140 @@ type ProxyPool struct {
 	proxies      []Proxy // forwarding-capable (socks5/http/https)
 	proxyIPNodes []Proxy // informational-only "proxyip" nodes (see parser.go)
 	groupState   map[string]*groupCursor
+	stats        map[string]*nodeStats // keyed by Proxy.Key()
+	cache        *poolCache
 }
 
 func NewProxyPool() *ProxyPool {
-	return &ProxyPool{groupState: make(map[string]*groupCursor)}
+	return &ProxyPool{
+		groupState: make(map[string]*groupCursor),
+		stats:      make(map[string]*nodeStats),
+	}
+}
+
+// RecordResult logs the outcome of using a node (from the SOCKS5 server or
+// a background re-check) so its quality score reflects real reliability.
+func (p *ProxyPool) RecordResult(key string, ok bool, latencyMs int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := p.stats[key]
+	if st == nil {
+		st = &nodeStats{}
+		p.stats[key] = st
+	}
+	if ok {
+		st.Successes++
+		if latencyMs > 0 {
+			st.LastLatencyMs = latencyMs
+		}
+	} else {
+		st.Failures++
+	}
+}
+
+// scoreLocked computes a 0-100 quality score for px from its stats,
+// latency, and speed. Caller must hold p.mu. Weights success-rate most,
+// then latency, then measured speed. Nodes with no observations yet get a
+// neutral success-rate so they aren't unfairly buried.
+func (p *ProxyPool) scoreLocked(px Proxy) float64 {
+	st := p.stats[px.Key()]
+
+	successRate := 0.75 // neutral-ish prior for unobserved nodes
+	if st != nil {
+		total := st.Successes + st.Failures
+		if total > 0 {
+			successRate = float64(st.Successes) / float64(total)
+		}
+	}
+
+	lat := px.LatencyMs
+	if st != nil && st.LastLatencyMs > 0 {
+		lat = st.LastLatencyMs
+	}
+	latScore := 1.0
+	if lat > 0 {
+		latScore = 1.0 / (1.0 + float64(lat)/1000.0) // 0ms→1, 1s→0.5
+	}
+
+	speedScore := 0.0
+	if px.SpeedKbps > 0 {
+		speedScore = math.Min(px.SpeedKbps/10000.0, 1.0) // cap at ~10 Mbps
+	}
+
+	return 100 * (0.6*successRate + 0.3*latScore + 0.1*speedScore)
+}
+
+// Score returns the quality score for a node (0 if unknown).
+func (p *ProxyPool) Score(px Proxy) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.scoreLocked(px)
+}
+
+// StatsOf returns the accumulated success/failure counts for a node.
+func (p *ProxyPool) StatsOf(key string) (successes, failures int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if st := p.stats[key]; st != nil {
+		return st.Successes, st.Failures
+	}
+	return 0, 0
+}
+
+// UpdateLatency refreshes a live node's measured latency (from a
+// background re-check) so latency/score strategies stay current.
+func (p *ProxyPool) UpdateLatency(key string, latencyMs int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.proxies {
+		if p.proxies[i].Key() == key {
+			p.proxies[i].LatencyMs = latencyMs
+			break
+		}
+	}
+}
+
+// statsSnapshot / restoreStats support persisting scores across restarts.
+func (p *ProxyPool) statsSnapshot() map[string]nodeStats {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]nodeStats, len(p.stats))
+	for k, v := range p.stats {
+		out[k] = *v
+	}
+	return out
+}
+
+func (p *ProxyPool) restoreStats(m map[string]nodeStats) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k, v := range m {
+		vv := v
+		p.stats[k] = &vv
+	}
+}
+
+// SetCache enables persistence of the live pool to disk (see poolcache.go).
+func (p *ProxyPool) SetCache(c *poolCache) {
+	p.mu.Lock()
+	p.cache = c
+	p.mu.Unlock()
+}
+
+// Prime seeds the pool from cached nodes at startup, so it's usable before
+// the first scrape completes. Does not write back to the cache.
+func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
+	p.mu.Lock()
+	p.proxies = forwarding
+	p.proxyIPNodes = proxyip
+	p.mu.Unlock()
+	log.Printf("[pool] primed from cache: %d forwarding, %d proxyip nodes", len(forwarding), len(proxyip))
 }
 
 // Update replaces the live proxy list, splitting out info-only proxyip
 // nodes. Per-group cursors are left as-is; Pick re-anchors automatically
-// against whatever is present in the new list.
+// against whatever is present in the new list. The new pool is persisted
+// to the cache (if enabled) for fast recovery on restart.
 func (p *ProxyPool) Update(all []Proxy) {
 	var fwd, info []Proxy
 	for _, px := range all {
@@ -74,7 +209,11 @@ func (p *ProxyPool) Update(all []Proxy) {
 	p.mu.Lock()
 	p.proxies = fwd
 	p.proxyIPNodes = info
+	cache := p.cache
 	p.mu.Unlock()
+	if cache != nil {
+		cache.save(fwd, info, p.statsSnapshot())
+	}
 	log.Printf("[pool] updated: %d forwarding proxies, %d proxyip (info-only) nodes", len(fwd), len(info))
 }
 
@@ -223,6 +362,8 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 		chosen = bestBy(candidates, func(c Proxy) float64 { return float64(c.LatencyMs) }, false)
 	case StrategySpeed:
 		chosen = bestBy(candidates, func(c Proxy) float64 { return c.SpeedKbps }, true)
+	case StrategyScore:
+		chosen = bestBy(candidates, p.scoreLocked, true)
 	default: // sticky
 		chosen = candidates[0]
 		for _, c := range candidates {
@@ -349,6 +490,8 @@ func (p *ProxyPool) EffectiveCurrent(groupName string, groups []Group) (Proxy, b
 		return bestBy(candidates, func(c Proxy) float64 { return float64(c.LatencyMs) }, false), true, false
 	case StrategySpeed:
 		return bestBy(candidates, func(c Proxy) float64 { return c.SpeedKbps }, true), true, false
+	case StrategyScore:
+		return bestBy(candidates, p.Score, true), true, false
 	case StrategyRoundRobin, StrategyRandom:
 		if px, ok := find(lastPicked); ok {
 			return px, true, true

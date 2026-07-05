@@ -12,6 +12,7 @@ const (
 	RuleDomainSuffix  = "DOMAIN-SUFFIX"
 	RuleDomainKeyword = "DOMAIN-KEYWORD"
 	RuleIPCIDR        = "IP-CIDR"
+	RuleGeosite       = "GEOSITE" // value is a bundled category: "cn" or "gfw"
 	RuleMatch         = "MATCH"
 )
 
@@ -27,7 +28,7 @@ type Rule struct {
 
 func validRuleType(t string) bool {
 	switch t {
-	case RuleDomain, RuleDomainSuffix, RuleDomainKeyword, RuleIPCIDR, RuleMatch:
+	case RuleDomain, RuleDomainSuffix, RuleDomainKeyword, RuleIPCIDR, RuleGeosite, RuleMatch:
 		return true
 	}
 	return false
@@ -63,6 +64,10 @@ func MatchGroup(rules []Rule, host string) string {
 			if _, cidr, err := net.ParseCIDR(r.Value); err == nil && cidr.Contains(ip) {
 				return r.Group
 			}
+		case RuleGeosite:
+			if ip == nil && geositeMatch(r.Value, lowerHost) {
+				return r.Group
+			}
 		case RuleMatch:
 			return r.Group
 		}
@@ -90,6 +95,9 @@ func (cs *ConfigStore) AddRule(r Rule) (Rule, error) {
 		if _, _, err := net.ParseCIDR(r.Value); err != nil {
 			return Rule{}, fmt.Errorf("invalid CIDR: %w", err)
 		}
+	}
+	if r.Type == RuleGeosite && !validGeositeCategory(r.Value) {
+		return Rule{}, fmt.Errorf("GEOSITE value must be %q or %q", GeositeCN, GeositeGFW)
 	}
 	if r.Group == "" {
 		return Rule{}, fmt.Errorf("group is required")
@@ -172,6 +180,25 @@ func (cs *ConfigStore) SetDefaultGroup(group string) error {
 	})
 }
 
+// InstallGFWPreset replaces the routing table with a GFW-style ruleset:
+// LAN + mainland-China domains go DIRECT (bypass the proxy), and everything
+// else is proxied via ANY. This is the common "domestic direct, foreign
+// proxied" setup. Existing custom rules are replaced.
+func (cs *ConfigStore) InstallGFWPreset() error {
+	return cs.mutate(func(c *PoolConfig) error {
+		c.Rules = []Rule{
+			{ID: generateID("rule"), Type: RuleIPCIDR, Value: "127.0.0.0/8", Group: GroupDirect},
+			{ID: generateID("rule"), Type: RuleIPCIDR, Value: "10.0.0.0/8", Group: GroupDirect},
+			{ID: generateID("rule"), Type: RuleIPCIDR, Value: "172.16.0.0/12", Group: GroupDirect},
+			{ID: generateID("rule"), Type: RuleIPCIDR, Value: "192.168.0.0/16", Group: GroupDirect},
+			{ID: generateID("rule"), Type: RuleGeosite, Value: GeositeCN, Group: GroupDirect},
+			{ID: generateID("rule"), Type: RuleGeosite, Value: GeositeGFW, Group: GroupAny},
+			{ID: generateID("rule"), Type: RuleMatch, Group: GroupAny},
+		}
+		return nil
+	})
+}
+
 func (cs *ConfigStore) Groups() []Group {
 	return cs.Snapshot().Groups
 }
@@ -186,7 +213,7 @@ func (cs *ConfigStore) AddGroup(g Group) (Group, error) {
 		return Group{}, fmt.Errorf("%q is a reserved group name", g.Name)
 	}
 	switch g.Strategy {
-	case StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed:
+	case StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed, StrategyScore:
 	case "":
 		g.Strategy = StrategySticky
 	default:
@@ -212,7 +239,7 @@ func (cs *ConfigStore) AddGroup(g Group) (Group, error) {
 // the group.
 func (cs *ConfigStore) SetGroupStrategy(id, strategy string) error {
 	switch strategy {
-	case StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed:
+	case StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed, StrategyScore:
 	default:
 		return fmt.Errorf("unknown strategy: %q", strategy)
 	}

@@ -113,12 +113,15 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 
+		dialStart := time.Now()
 		remote, err := DialUpstream(upstream, targetAddr, 10*time.Second)
 		if err != nil {
 			log.Printf("[server] upstream %s (group %s) failed: %v, switching...", upstream.Addr(), groupName, err)
+			s.pool.RecordResult(upstream.Key(), false, 0)
 			exclude[upstream.Key()] = true
 			continue
 		}
+		s.pool.RecordResult(upstream.Key(), true, time.Since(dialStart).Milliseconds())
 
 		// Success - log which upstream carried this target, so it's
 		// visible which node each domain actually used.

@@ -56,6 +56,19 @@ tr:hover td{background:#1e293b55}
 tr.active td{background:#14311f !important}
 .badge-inuse{background:#065f46;color:#4ade80;padding:1px 7px;border-radius:4px;font-size:0.68rem;font-weight:bold}
 .exit-diff{color:#fbbf24}
+.table-scroll{overflow-x:auto}
+.filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+.filter-bar .chk{font-size:0.8rem;color:#94a3b8;display:flex;align-items:center;gap:4px}
+.anon{padding:1px 6px;border-radius:4px;font-size:0.68rem;font-weight:bold}
+.anon-elite{background:#064e3b;color:#6ee7b7}
+.anon-anonymous{background:#1e3a8a;color:#93c5fd}
+.anon-transparent{background:#7f1d1d;color:#fca5a5}
+.anon-unknown{background:#334155;color:#94a3b8}
+.score{font-weight:bold}
+.score-hi{color:#4ade80}.score-mid{color:#fbbf24}.score-lo{color:#f87171}
+.copy-btn{cursor:pointer;color:#64748b;margin-left:6px;font-size:0.7rem}
+.copy-btn:hover{color:#38bdf8}
+.preset-bar{background:#1e293b;border-radius:8px;padding:12px 14px;margin:12px 0;font-size:0.82rem;color:#94a3b8;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%}
 form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
 input,select{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:0.8rem}
@@ -99,11 +112,28 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 
   <div id="group-cards-container" class="group-cards"></div>
 
-  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(健康检查时穿过该节点探测得到),不是节点自身 IP 的定位。若"出口IP"和"地址"不同,说明该节点是链式/透明代理,或你的网络本身套了透明出口代理。</p>
+  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(穿过节点探测),不是节点自身 IP。"匿名"=高匿(elite,不暴露)/普通(anonymous,可被识别为代理)/透明(transparent,泄露你的真实IP)。"评分"综合成功率/延迟/速度。默认已开启剔除"假代理"(出口IP==本机出口的透明节点),用 -require-ip-change=false 关闭。</p>
+
+  <div class="filter-bar">
+    <input id="f-text" placeholder="搜索 IP/地址..." oninput="applyNodeView()">
+    <select id="f-country" onchange="applyNodeView()"><option value="">全部国家</option></select>
+    <select id="f-proto" onchange="applyNodeView()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
+    <select id="f-sort" onchange="applyNodeView()">
+      <option value="score">按评分↓</option>
+      <option value="latency">按延迟↑</option>
+      <option value="speed">按速度↓</option>
+      <option value="country">按国家</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="applyNodeView()"> 只看真正改IP的</label>
+    <span id="node-count" class="small"></span>
+  </div>
+
+  <div class="table-scroll">
   <table>
-  <thead><tr><th></th><th>协议</th><th>地址(节点IP)</th><th>出口IP</th><th>国家/城市(按出口)</th><th>来源</th><th>延迟</th><th>速度</th><th>操作</th></tr></thead>
-  <tbody id="node-tbody"><tr><td colspan="9" class="empty">加载中...</td></tr></tbody>
+  <thead><tr><th></th><th>协议</th><th>地址(节点IP)</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="11" class="empty">加载中...</td></tr></tbody>
   </table>
+  </div>
 
   <details class="proxyip-section">
     <summary>ProxyIP 节点(仅展示,不参与本地转发) - {{.ProxyIPTotal}} 个</summary>
@@ -152,6 +182,11 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 </div>
 
 <div id="tab-rules" class="tab-panel" style="display:none">
+  <div class="preset-bar">
+    <b style="color:#e2e8f0">一键 GFW 分流</b>
+    <span>国内域名/内网 直连(DIRECT),其余走代理(ANY);会覆盖当前规则。</span>
+    <button class="btn" onclick="if(confirm('用 GFW 分流预设覆盖当前所有规则?'))postJSON('/api/rules/preset-gfw',{},reloadOrAlert)">启用 GFW 分流</button>
+  </div>
   <table>
   <tr><th>#</th><th>类型</th><th>值</th><th>目标分组</th><th>操作</th></tr>
   {{range $i, $r := .Rules}}
@@ -175,11 +210,11 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 
   <form class="inline" id="form-add-rule">
     <select name="type">{{range .RuleTypes}}<option value="{{.}}">{{.}}</option>{{end}}</select>
-    <input name="value" placeholder="值,如 netflix.com 或 10.0.0.0/8">
+    <input name="value" placeholder="值,如 netflix.com / 10.0.0.0/8 / cn / gfw">
     <select name="group">{{range .GroupOptions}}<option value="{{.}}">{{.}}</option>{{end}}</select>
     <button class="btn" type="submit">添加规则</button>
   </form>
-  <p class="note">规则按从上到下的顺序匹配目标域名/IP,命中即用对应分组转发;DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD 匹配域名,IP-CIDR 匹配字面 IP 目标。最下面的 MATCH 是兜底规则,始终存在。</p>
+  <p class="note">规则按从上到下的顺序匹配目标域名/IP,命中即用对应分组转发;DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD 匹配域名,IP-CIDR 匹配字面 IP 目标,GEOSITE 值填 <b>cn</b>(内置中国常用域名)或 <b>gfw</b>(内置常见被墙域名)。最下面的 MATCH 是兜底规则,始终存在。</p>
 
   <div class="default-group-editor">
     <span>默认(兜底)分组:</span>
@@ -251,47 +286,116 @@ function renderGroups(groups) {
 
 function protoBadge(p) { return '<span class="proto proto-' + escapeHtml(p) + '">' + escapeHtml(p) + '</span>'; }
 
-function renderNodes(nodes) {
+function anonBadge(a) {
+  var label = {elite:'高匿', anonymous:'普通', transparent:'透明'}[a] || '未知';
+  var cls = a && ['elite','anonymous','transparent'].indexOf(a) >= 0 ? a : 'unknown';
+  return '<span class="anon anon-' + cls + '">' + label + '</span>';
+}
+function scoreCell(s) {
+  var v = Math.round(s || 0);
+  var cls = v >= 70 ? 'score-hi' : (v >= 45 ? 'score-mid' : 'score-lo');
+  return '<span class="score ' + cls + '">' + v + '</span>';
+}
+
+var allNodes = [];
+
+function onNodesFetched(nodes) {
+  allNodes = nodes || [];
+  // populate country filter options once per distinct set
+  var sel = document.getElementById('f-country');
+  if (sel) {
+    var cur = sel.value;
+    var countries = {};
+    allNodes.forEach(function(n){ if (n.country) countries[n.country] = true; });
+    var opts = '<option value="">全部国家</option>';
+    Object.keys(countries).sort().forEach(function(c){ opts += '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>'; });
+    sel.innerHTML = opts;
+    sel.value = cur;
+  }
+  applyNodeView();
+}
+
+function applyNodeView() {
   var tbody = document.getElementById('node-tbody');
   if (!tbody) return;
   var banner = document.querySelector('#current-node-banner .cn-addr');
+  var countEl = document.getElementById('node-count');
+
   var active = null;
-  if (!nodes.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
+  allNodes.forEach(function(n){ if (n.active) active = n; });
+
+  var text = (document.getElementById('f-text').value || '').toLowerCase();
+  var fc = document.getElementById('f-country').value;
+  var fp = document.getElementById('f-proto').value;
+  var onlyChanged = document.getElementById('f-ipchanged').checked;
+  var sort = document.getElementById('f-sort').value;
+
+  var rows = allNodes.filter(function(n) {
+    if (text && (n.addr + ' ' + (n.exit_ip||'')).toLowerCase().indexOf(text) < 0) return false;
+    if (fc && n.country !== fc) return false;
+    if (fp && n.protocol !== fp) return false;
+    if (onlyChanged && !n.ip_changed) return false;
+    return true;
+  });
+
+  rows.sort(function(a, b) {
+    switch (sort) {
+      case 'latency': return (a.latency_ms||1e9) - (b.latency_ms||1e9);
+      case 'speed': return (b.speed_kbps||0) - (a.speed_kbps||0);
+      case 'country': return (a.country||'').localeCompare(b.country||'');
+      default: return (b.score||0) - (a.score||0);
+    }
+  });
+
+  if (countEl) countEl.textContent = rows.length + ' / ' + allNodes.length + ' 节点';
+
+  if (!allNodes.length) {
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
     if (banner) banner.textContent = '无 (代理池为空)';
     return;
   }
-  var html = '';
-  nodes.forEach(function(n) {
-    if (n.active) active = n;
-    var loc = escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
-    var lat = n.latency_ms ? n.latency_ms + 'ms' : '-';
-    var spd = n.speed_kbps ? Math.round(n.speed_kbps) + ' kbps' : '-';
-    var nodeIP = (n.addr || '').split(':')[0];
-    var exit = n.exit_ip || '';
-    var exitCell = exit
-      ? '<span class="mono' + (exit !== nodeIP ? ' exit-diff' : '') + '">' + escapeHtml(exit) + '</span>'
-      : '<span class="small">-</span>';
-    html += '<tr class="' + (n.active ? 'active' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
-      '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : '') + '</td>' +
-      '<td>' + protoBadge(n.protocol) + '</td>' +
-      '<td class="mono">' + escapeHtml(n.addr) + '</td>' +
-      '<td>' + exitCell + '</td>' +
-      '<td>' + loc + '</td>' +
-      '<td class="small">' + escapeHtml(n.source || '') + '</td>' +
-      '<td>' + lat + '</td>' +
-      '<td class="speed-cell">' + spd + '</td>' +
-      '<td>' +
-        '<button class="btn-sm" onclick="switchNode(this)">使用</button>' +
-        '<button class="btn-sm" onclick="runSpeedtest(this)">测速</button>' +
-      '</td></tr>';
-  });
-  tbody.innerHTML = html;
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">没有匹配的节点</td></tr>';
+  } else {
+    var html = '';
+    rows.forEach(function(n) {
+      var loc = escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
+      var lat = n.latency_ms ? n.latency_ms + 'ms' : '-';
+      var spd = n.speed_kbps ? Math.round(n.speed_kbps) + ' kbps' : '-';
+      var nodeIP = (n.addr || '').split(':')[0];
+      var exit = n.exit_ip || '';
+      var exitCell = exit
+        ? '<span class="mono' + (exit !== nodeIP ? ' exit-diff' : '') + '">' + escapeHtml(exit) + '</span>'
+        : '<span class="small">-</span>';
+      html += '<tr class="' + (n.active ? 'active' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
+        '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : '') + '</td>' +
+        '<td>' + protoBadge(n.protocol) + '</td>' +
+        '<td class="mono">' + escapeHtml(n.addr) + '<span class="copy-btn" onclick="copyAddr(\'' + escapeHtml(n.addr) + '\',this)">复制</span></td>' +
+        '<td>' + exitCell + '</td>' +
+        '<td>' + anonBadge(n.anonymity) + '</td>' +
+        '<td>' + loc + '</td>' +
+        '<td>' + scoreCell(n.score) + '</td>' +
+        '<td>' + lat + '</td>' +
+        '<td class="speed-cell">' + spd + '</td>' +
+        '<td class="small">' + escapeHtml(n.source || '') + '</td>' +
+        '<td>' +
+          '<button class="btn-sm" onclick="switchNode(this)">使用</button>' +
+          '<button class="btn-sm" onclick="runSpeedtest(this)">测速</button>' +
+        '</td></tr>';
+    });
+    tbody.innerHTML = html;
+  }
+
   if (banner) {
     banner.innerHTML = active
-      ? escapeHtml(active.addr) + '<span class="cn-meta">' + protoBadge(active.protocol) + ' ' + escapeHtml(active.country || '') + '</span>'
-      : escapeHtml(nodes[0].addr) + '<span class="cn-meta">(默认选择)</span>';
+      ? escapeHtml(active.addr) + '<span class="cn-meta">' + protoBadge(active.protocol) + ' 出口 ' + escapeHtml(active.exit_ip || '?') + ' ' + escapeHtml(active.country || '') + '</span>'
+      : (allNodes.length ? escapeHtml(allNodes[0].addr) + '<span class="cn-meta">(默认选择)</span>' : '无');
   }
+}
+
+function copyAddr(addr, el) {
+  if (navigator.clipboard) { navigator.clipboard.writeText(addr); }
+  if (el) { var t = el.textContent; el.textContent = '已复制'; setTimeout(function(){ el.textContent = t; }, 1000); }
 }
 
 function rowKey(btn) { var tr = btn.closest('tr'); return tr ? tr.getAttribute('data-key') : ''; }
@@ -315,7 +419,7 @@ function pollStatus() {
     renderGroups(d.groups || []);
   }).catch(function(){});
   fetch('/api/nodes').then(function(r){ return r.json(); }).then(function(nodes) {
-    renderNodes(nodes || []);
+    onNodesFetched(nodes || []);
   }).catch(function(){});
 }
 pollStatus();

@@ -35,6 +35,7 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/api/rules/delete", s.handleRuleDelete)
 	mux.HandleFunc("/api/rules/move", s.handleRuleMove)
 	mux.HandleFunc("/api/rules/default", s.handleRuleDefault)
+	mux.HandleFunc("/api/rules/preset-gfw", s.handleRulePresetGFW)
 
 	mux.HandleFunc("/api/groups", s.handleGroups)
 	mux.HandleFunc("/api/groups/strategy", s.handleGroupStrategy)
@@ -53,8 +54,13 @@ type NodeView struct {
 	City      string  `json:"city"`
 	Source    string  `json:"source"`
 	ExitIP    string  `json:"exit_ip"`
+	IPChanged bool    `json:"ip_changed"`
+	Anonymity string  `json:"anonymity"`
 	LatencyMs int64   `json:"latency_ms"`
 	SpeedKbps float64 `json:"speed_kbps"`
+	Score     float64 `json:"score"`
+	Successes int     `json:"successes"`
+	Failures  int     `json:"failures"`
 	Active    bool    `json:"active"` // this node is the ANY group's current upstream
 }
 
@@ -158,7 +164,8 @@ func nodeViewOf(px Proxy, activeAddr string) NodeView {
 	return NodeView{
 		Key: px.Key(), Addr: px.Addr(), Protocol: px.Protocol,
 		Country: px.Country, City: px.City, Source: px.SourceName,
-		ExitIP: px.ExitIP, LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
+		ExitIP: px.ExitIP, IPChanged: px.IPChanged, Anonymity: px.Anonymity,
+		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
 		Active: activeAddr != "" && px.Addr() == activeAddr,
 	}
 }
@@ -169,7 +176,10 @@ func (s *StatusServer) nodeViews() []NodeView {
 	activeAddr := s.anyCurrentAddr()
 	nodes := make([]NodeView, 0, s.pool.Size())
 	for _, px := range s.pool.All() {
-		nodes = append(nodes, nodeViewOf(px, activeAddr))
+		nv := nodeViewOf(px, activeAddr)
+		nv.Score = s.pool.Score(px)
+		nv.Successes, nv.Failures = s.pool.StatsOf(px.Key())
+		nodes = append(nodes, nv)
 	}
 	return nodes
 }
@@ -206,9 +216,9 @@ func (s *StatusServer) buildDashboardData() DashboardData {
 		Rules:         rules,
 		DefaultGroup:  defaultGroup,
 		GroupOptions:  groupOptions,
-		RuleTypes:     []string{RuleDomain, RuleDomainSuffix, RuleDomainKeyword, RuleIPCIDR},
+		RuleTypes:     []string{RuleDomain, RuleDomainSuffix, RuleDomainKeyword, RuleIPCIDR, RuleGeosite},
 		Formats:       []string{FormatTextRegex, FormatEDTJSON, FormatProxyIPJSON, FormatPlainList, FormatJSONArray},
-		Strategies:    []string{StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed},
+		Strategies:    []string{StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed, StrategyScore},
 	}
 }
 
@@ -396,6 +406,14 @@ func (s *StatusServer) handleRuleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.MoveRule(in.ID, in.Delta); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func (s *StatusServer) handleRulePresetGFW(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.InstallGFWPreset(); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}

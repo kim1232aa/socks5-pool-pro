@@ -36,12 +36,22 @@ func main() {
 
 	pool := NewProxyPool()
 
-	// Initial scrape + check
-	refreshPool(cfg, store, pool)
-
-	if pool.Size() == 0 {
-		log.Printf("[warn] no alive proxies found, will retry on next scrape cycle")
+	// Seed from the on-disk cache so the pool is usable immediately, then
+	// enable write-back so every refresh keeps the cache fresh.
+	cache := newPoolCache(cfg.DataDir)
+	if fwd, info, stats := cache.load(); len(fwd) > 0 || len(info) > 0 {
+		pool.Prime(fwd, info)
+		pool.restoreStats(stats)
 	}
+	pool.SetCache(cache)
+
+	// Measure our own direct egress once, as the baseline for detecting
+	// transparent proxies that don't actually change the exit IP.
+	InitBaselineExit(cfg.CheckTimeout)
+
+	// Initial scrape + check (runs in the background so the dashboard and
+	// cached pool are available right away instead of blocking on it).
+	go refreshPool(cfg, store, pool)
 
 	// Background: periodic scrape + manual refresh
 	go func() {
@@ -74,6 +84,15 @@ func main() {
 		}
 	}()
 
+	// Background: periodically re-check alive nodes' latency/health so the
+	// latency/score strategies stay current between full refreshes.
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			reCheckAlive(cfg, pool)
+		}
+	}()
+
 	// Background: status dashboard
 	go func() {
 		status := NewStatusServer(pool, store)
@@ -86,6 +105,39 @@ func main() {
 	// Start SOCKS5 server (blocks)
 	server := NewServer(cfg.ListenAddr, pool, store)
 	log.Fatal(server.Start())
+}
+
+// reCheckAlive re-probes connectivity/latency for the nodes already in the
+// pool and records the outcome, so quality scores reflect ongoing health
+// (not just the state at last scrape). Cheap: only touches live nodes, no
+// scraping or geo lookups.
+func reCheckAlive(cfg *Config, pool *ProxyPool) {
+	nodes := pool.All()
+	if len(nodes) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, cfg.MaxConcurrent)
+	for _, px := range nodes {
+		if px.Protocol == "proxyip" {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(px Proxy) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			start := time.Now()
+			ok := checkGoogle(px, cfg.CheckTimeout)
+			latency := time.Since(start).Milliseconds()
+			pool.RecordResult(px.Key(), ok, latency)
+			if ok {
+				pool.UpdateLatency(px.Key(), latency)
+			}
+		}(px)
+	}
+	wg.Wait()
+	log.Printf("[recheck] re-probed %d live nodes", len(nodes))
 }
 
 // refreshPool fetches every enabled source concurrently, dedups the
@@ -134,7 +186,7 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 		candidates = candidates[:cfg.MaxCandidates]
 	}
 
-	alive := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent)
+	alive := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange)
 	pool.Update(alive)
 
 	scrapeMu.Lock()

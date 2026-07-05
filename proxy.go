@@ -41,6 +41,16 @@ type Proxy struct {
 	// this exit IP, not of IP. Empty if the exit probe couldn't determine
 	// it (e.g. geo service rate-limited).
 	ExitIP string
+
+	// IPChanged is true when the proxy's exit IP genuinely differs from
+	// our own direct egress - i.e. using it actually changes your public
+	// IP. False for transparent proxies that don't.
+	IPChanged bool
+
+	// Anonymity is "elite", "anonymous", "transparent", or "" (unknown),
+	// classified by whether the proxy leaks your real IP / advertises
+	// itself via request headers.
+	Anonymity string
 }
 
 func (p Proxy) Addr() string {

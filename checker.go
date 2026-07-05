@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -31,12 +32,13 @@ var blockedCountries = map[string]bool{
 // that pass. Doing geo up-front on every candidate (often thousands) would
 // blow straight through ip-api.com's ~45 req/min free-tier limit, and the
 // 429 responses used to get misparsed into garbage "country" values.
-func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []Proxy {
+func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool) []Proxy {
 	var (
-		mu    sync.Mutex
-		alive []Proxy
-		wg    sync.WaitGroup
-		sem   = make(chan struct{}, maxConcurrent)
+		mu      sync.Mutex
+		alive   []Proxy
+		dropped int // transparent proxies filtered by requireIPChange
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, maxConcurrent)
 	)
 
 	for _, p := range proxies {
@@ -69,6 +71,19 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 				// alive even if the exit/geo probes are rate-limited; it
 				// just falls back to source-supplied or front-IP geo.
 				px.ExitIP = probeExitIP(px, timeout)
+				px.IPChanged = px.ExitIP != "" && baselineExitIP != "" && px.ExitIP != baselineExitIP
+
+				// Drop transparent proxies that don't actually change the
+				// exit IP - but only when we can positively tell (we have
+				// both a baseline and a measured exit that match). Unknown
+				// exits are kept rather than falsely dropped.
+				if requireIPChange && baselineExitIP != "" && px.ExitIP != "" && !px.IPChanged {
+					mu.Lock()
+					dropped++
+					mu.Unlock()
+					return
+				}
+
 				if px.ExitIP != "" {
 					if c, ci := LookupGeo(px.ExitIP, timeout); c != "" && c != "Unknown" {
 						px.Country, px.City = c, ci
@@ -79,6 +94,8 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 					px.Country = strings.TrimSpace(c)
 					px.City = strings.TrimSpace(ci)
 				}
+
+				px.Anonymity = probeAnonymity(px, timeout)
 			}
 
 			if blockedCountries[strings.ToLower(px.Country)] {
@@ -92,6 +109,9 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 	}
 
 	wg.Wait()
+	if dropped > 0 {
+		log.Printf("[checker] dropped %d transparent proxies (exit IP == our own egress %s; disable with -require-ip-change=false)", dropped, baselineExitIP)
+	}
 	return alive
 }
 
@@ -149,6 +169,92 @@ func probeExitIP(px Proxy, timeout time.Duration) string {
 		return ""
 	}
 	return ip
+}
+
+// baselineExitIP is our own direct (non-proxied) public egress IP. A proxy
+// whose measured exit IP equals this doesn't actually change your public
+// IP (it's transparent, or the whole host sits behind a transparent egress
+// proxy). Set once by InitBaselineExit; "" if the probe failed.
+var (
+	baselineExitIP   string
+	baselineExitOnce sync.Once
+)
+
+// InitBaselineExit measures our own direct egress IP once at startup.
+func InitBaselineExit(timeout time.Duration) {
+	baselineExitOnce.Do(func() {
+		client := &http.Client{Timeout: timeout}
+		resp, err := client.Get("http://api.ipify.org/")
+		if err != nil {
+			log.Printf("[baseline] direct egress probe failed (transparent-proxy filter disabled): %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil {
+			baselineExitIP = ip
+			log.Printf("[baseline] our direct egress IP = %s (proxies exiting from this IP are transparent)", ip)
+		}
+	})
+}
+
+// proxyLeakHeaders are request headers a proxy may inject that reveal it's
+// a proxy (and sometimes the client's real IP).
+var proxyLeakHeaders = []string{
+	"X-Forwarded-For", "Via", "X-Real-Ip", "Forwarded",
+	"Client-Ip", "Proxy-Connection", "X-Proxy-Id", "X-Forwarded",
+}
+
+// probeAnonymity classifies a proxy as elite/anonymous/transparent by
+// fetching an endpoint that echoes the request headers it received, through
+// the tunnel. Best-effort: returns "" (unknown) if the judge is
+// unreachable. "transparent" = your real IP leaks; "anonymous" = it's
+// detectable as a proxy but hides your IP; "elite" = neither.
+func probeAnonymity(px Proxy, timeout time.Duration) string {
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+				return DialUpstream(px, addr, timeout)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := client.Get("http://httpbin.org/get")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var r struct {
+		Origin  string            `json:"origin"`
+		Headers map[string]string `json:"headers"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&r); err != nil {
+		return ""
+	}
+
+	leak := baselineExitIP != "" && strings.Contains(r.Origin, baselineExitIP)
+	proxyHdr := false
+	for _, h := range proxyLeakHeaders {
+		if v, ok := r.Headers[h]; ok {
+			proxyHdr = true
+			if baselineExitIP != "" && strings.Contains(v, baselineExitIP) {
+				leak = true
+			}
+		}
+	}
+	switch {
+	case leak:
+		return "transparent"
+	case proxyHdr:
+		return "anonymous"
+	default:
+		return "elite"
+	}
 }
 
 // checkReachable is a minimal TCP-connect probe for "proxyip" entries,

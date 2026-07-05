@@ -7,13 +7,14 @@ import (
 )
 
 type Config struct {
-	ListenAddr     string
-	StatusAddr     string
-	DataDir        string
-	ScrapeInterval time.Duration
-	CheckTimeout   time.Duration
-	MaxConcurrent  int
-	MaxCandidates  int
+	ListenAddr      string
+	StatusAddr      string
+	DataDir         string
+	ScrapeInterval  time.Duration
+	CheckTimeout    time.Duration
+	MaxConcurrent   int
+	MaxCandidates   int
+	RequireIPChange bool
 }
 
 func ParseConfig() *Config {
@@ -25,6 +26,7 @@ func ParseConfig() *Config {
 	flag.DurationVar(&cfg.CheckTimeout, "check-timeout", 10*time.Second, "proxy check timeout")
 	flag.IntVar(&cfg.MaxConcurrent, "max-concurrent", 20, "max concurrent health checks")
 	flag.IntVar(&cfg.MaxCandidates, "max-candidates", 3000, "cap on total scraped candidates checked per refresh cycle (some sources return 100k+ entries; a random subset is sampled each cycle when over the cap)")
+	flag.BoolVar(&cfg.RequireIPChange, "require-ip-change", true, "drop transparent proxies whose exit IP equals our own direct egress (i.e. that don't actually change your public IP)")
 	flag.Parse()
 
 	// Cloud deployment: always use fixed ports
