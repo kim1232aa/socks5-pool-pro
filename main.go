@@ -119,15 +119,7 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 	}
 	wg.Wait()
 
-	seen := make(map[string]bool)
-	var deduped []Proxy
-	for _, px := range all {
-		if seen[px.Key()] {
-			continue
-		}
-		seen[px.Key()] = true
-		deduped = append(deduped, px)
-	}
+	deduped := dedupeByAddr(all)
 
 	// Some sources (e.g. large community-aggregated lists) return well
 	// over 100k raw entries. Checking all of them every cycle would make
@@ -152,6 +144,41 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 
 	log.Printf("[main] pool refreshed: %d alive / %d checked (from %d sources, %d raw, %d deduped)",
 		pool.Size(), len(candidates), len(sources), len(all), len(deduped))
+}
+
+// dedupeByAddr collapses candidates down to one entry per ip:port,
+// regardless of which protocol(s) a source claimed for it. Some
+// aggregated lists tag the same physical host under two or three
+// different protocols with heavy overlap (e.g. Fyvri's http/https/socks5
+// files overlap 84-96% by address) - almost certainly loose upstream
+// classification rather than genuinely multi-protocol hosts. Without
+// this, the random max-candidates sample wastes multiple slots re-testing
+// the same machine instead of spreading across distinct hosts. When a
+// host appears under multiple protocols, the more specific one wins:
+// socks5 > https > http > proxyip.
+func dedupeByAddr(list []Proxy) []Proxy {
+	rank := map[string]int{"socks5": 3, "https": 2, "http": 1, "proxyip": 0}
+
+	best := make(map[string]Proxy, len(list))
+	var order []string
+	for _, px := range list {
+		key := px.Addr()
+		cur, ok := best[key]
+		if !ok {
+			best[key] = px
+			order = append(order, key)
+			continue
+		}
+		if rank[px.Protocol] > rank[cur.Protocol] {
+			best[key] = px
+		}
+	}
+
+	out := make([]Proxy, 0, len(order))
+	for _, key := range order {
+		out = append(out, best[key])
+	}
+	return out
 }
 
 // TriggerRefresh sends a manual refresh signal (non-blocking).
