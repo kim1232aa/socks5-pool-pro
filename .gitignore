@@ -1,2 +1,3 @@
 *.exe
 socks5-pool
+/data/

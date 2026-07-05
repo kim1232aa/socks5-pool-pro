@@ -16,16 +16,17 @@ const (
 	atypIPv6      = 0x04
 )
 
+// Server is the local SOCKS5 endpoint that clients connect to. Every
+// incoming request is routed through the configured rules to a Group (or
+// DIRECT), then forwarded via that group's chosen upstream.
 type Server struct {
 	listenAddr string
 	pool       *ProxyPool
+	store      *ConfigStore
 }
 
-func NewServer(listenAddr string, pool *ProxyPool) *Server {
-	return &Server{
-		listenAddr: listenAddr,
-		pool:       pool,
-	}
+func NewServer(listenAddr string, pool *ProxyPool, store *ConfigStore) *Server {
+	return &Server{listenAddr: listenAddr, pool: pool, store: store}
 }
 
 func (s *Server) Start() error {
@@ -65,32 +66,56 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// Parse target address
 	targetAddr, err := parseTarget(buf[:n])
 	if err != nil {
 		s.sendReply(conn, 0x04) // host unreachable
 		return
 	}
 
-	// 3. Use current proxy, switch on failure
+	host, _, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		s.sendReply(conn, 0x04)
+		return
+	}
+
+	rules := s.store.Rules()
+	groups := s.store.Groups()
+	groupName := MatchGroup(rules, host)
+
+	if groupName == GroupDirect {
+		remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		if err != nil {
+			log.Printf("[server] direct dial %s failed: %v", targetAddr, err)
+			s.sendReply(conn, 0x01)
+			return
+		}
+		s.sendReply(conn, 0x00)
+		relay(conn, remote)
+		return
+	}
+
+	// 3. Pick an upstream for the matched group, retrying against other
+	// members on failure.
+	exclude := make(map[string]bool)
 	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
 		var upstream Proxy
 		var ok bool
 		if i == 0 {
-			upstream, ok = s.pool.Current()
+			upstream, ok, _ = s.pool.Pick(groupName, groups)
 		} else {
-			upstream, ok = s.pool.SwitchNext()
+			upstream, ok, _ = s.pool.PickExcluding(groupName, groups, exclude)
 		}
 		if !ok {
-			log.Printf("[server] no proxies available")
+			log.Printf("[server] no proxies available for group %q", groupName)
 			s.sendReply(conn, 0x01) // general failure
 			return
 		}
 
-		remote, err := dialViaSOCKS5(upstream, targetAddr, 10*time.Second)
+		remote, err := DialUpstream(upstream, targetAddr, 10*time.Second)
 		if err != nil {
-			log.Printf("[server] upstream %s failed: %v, switching...", upstream.Addr(), err)
+			log.Printf("[server] upstream %s (group %s) failed: %v, switching...", upstream.Addr(), groupName, err)
+			exclude[upstream.Key()] = true
 			continue
 		}
 
@@ -146,72 +171,6 @@ func parseTarget(buf []byte) (string, error) {
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
-// dialViaSOCKS5 connects to target through an upstream SOCKS5 proxy.
-func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", upstream.Addr(), timeout)
-	if err != nil {
-		return nil, err
-	}
-	conn.SetDeadline(time.Now().Add(timeout))
-
-	// SOCKS5 greeting
-	conn.Write([]byte{0x05, 0x01, 0x00})
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	if buf[0] != 0x05 {
-		conn.Close()
-		return nil, fmt.Errorf("not socks5")
-	}
-
-	// Parse target host:port
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
-
-	// Build connect request
-	req := []byte{0x05, 0x01, 0x00}
-
-	// Check if host is an IP
-	if ip := net.ParseIP(host); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			req = append(req, atypIPv4)
-			req = append(req, ip4...)
-		} else {
-			req = append(req, atypIPv6)
-			req = append(req, ip...)
-		}
-	} else {
-		// Domain name
-		req = append(req, atypDomain, byte(len(host)))
-		req = append(req, []byte(host)...)
-	}
-	req = append(req, byte(port>>8), byte(port&0xff))
-
-	conn.Write(req)
-
-	// Read reply
-	resp := make([]byte, 256)
-	n, err := conn.Read(resp)
-	if err != nil || n < 2 || resp[1] != 0x00 {
-		conn.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("upstream connect failed, status: %d", resp[1])
-	}
-
-	// Clear deadline for relay
-	conn.SetDeadline(time.Time{})
-	return conn, nil
-}
-
 // relay copies data bidirectionally between two connections.
 func relay(left, right net.Conn) {
 	defer left.Close()
@@ -220,7 +179,6 @@ func relay(left, right net.Conn) {
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
 		io.Copy(dst, src)
-		// Try half-close if supported
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}

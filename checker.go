@@ -2,22 +2,25 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Blocked countries: China mainland + Hong Kong (can't access Google)
+// Blocked countries: China mainland + Hong Kong (can't reach Google).
 var blockedCountries = map[string]bool{
 	"china":     true,
 	"hong kong": true,
+	"cn":        true,
+	"hk":        true,
 }
 
-// CheckProxies concurrently checks a list of proxies.
-// Filters out CN/HK IPs, tests Google connectivity.
+// CheckProxies concurrently verifies a list of candidate proxies.
+// Forwarding-capable proxies (socks5/http/https) are verified via a real
+// Google connectivity round-trip through DialUpstream, and their latency
+// is recorded. "proxyip" entries don't speak a forwarding protocol (see
+// parser.go), so they only get a lightweight raw TCP reachability probe.
 func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []Proxy {
 	var (
 		mu    sync.Mutex
@@ -33,81 +36,79 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// Lookup geo first, skip blocked countries
-			country, city := LookupGeo(px.IP, timeout)
-			px.Country = strings.TrimSpace(country)
-			px.City = strings.TrimSpace(city)
+			// Only look up geo when the source didn't already supply it
+			// (EDT-Pages/proxyip feeds do; the plain-text feed doesn't) -
+			// avoids hammering ip-api.com's rate limit unnecessarily.
+			if px.Country == "" {
+				country, city := LookupGeo(px.IP, timeout)
+				px.Country = strings.TrimSpace(country)
+				px.City = strings.TrimSpace(city)
+			}
 
 			if blockedCountries[strings.ToLower(px.Country)] {
-				log.Printf("[checker] %s skipped (%s)", px.Addr(), px.Country)
 				return
 			}
 
-			if checkGoogle(px, timeout) {
-				log.Printf("[checker] %s OK (%s %s)", px.Addr(), px.Country, px.City)
-				mu.Lock()
-				alive = append(alive, px)
-				mu.Unlock()
+			start := time.Now()
+			var ok bool
+			if px.Protocol == "proxyip" {
+				ok = checkReachable(px, timeout)
+			} else {
+				ok = checkGoogle(px, timeout)
 			}
+			if !ok {
+				return
+			}
+			px.LatencyMs = time.Since(start).Milliseconds()
+
+			mu.Lock()
+			alive = append(alive, px)
+			mu.Unlock()
 		}(p)
 	}
 
 	wg.Wait()
-	log.Printf("[checker] %d/%d proxies alive (Google-verified, non-CN/HK)", len(alive), len(proxies))
 	return alive
 }
 
-// checkGoogle connects through the proxy to Google's 204 endpoint.
-func checkGoogle(p Proxy, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", p.Addr(), timeout)
+// checkGoogle verifies a forwarding-capable proxy by fetching Google's
+// generate_204 endpoint through the upstream tunnel. Works uniformly for
+// socks5/http/https upstreams since DialUpstream already establishes the
+// tunnel to the target before this ever touches protocol-specific bytes.
+func checkGoogle(px Proxy, timeout time.Duration) bool {
+	conn, err := DialUpstream(px, "www.google.com:80", timeout)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	// SOCKS5 greeting
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return false
-	}
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil || buf[0] != 0x05 {
+	req := "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
 		return false
 	}
 
-	// Connect to www.google.com:80 through proxy
-	target := "www.google.com"
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(target))}
-	req = append(req, []byte(target)...)
-	req = append(req, 0x00, 0x50) // port 80
-
-	if _, err := conn.Write(req); err != nil {
-		return false
-	}
-
-	resp := make([]byte, 256)
+	resp := make([]byte, 512)
 	n, err := conn.Read(resp)
-	if err != nil || n < 2 || resp[1] != 0x00 {
+	if err != nil || n < 4 {
 		return false
 	}
-
-	// Send HTTP request to Google's generate_204 endpoint
-	httpReq := "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
-	if _, err := conn.Write([]byte(httpReq)); err != nil {
-		return false
-	}
-
-	respBuf := make([]byte, 512)
-	n, err = conn.Read(respBuf)
-	if err != nil || n < 12 {
-		return false
-	}
-
-	// Check we got HTTP response (200 or 204 both fine)
-	return string(respBuf[:4]) == "HTTP"
+	return string(resp[:4]) == "HTTP"
 }
 
-// LookupGeo queries ip-api.com for IP geolocation.
+// checkReachable is a minimal TCP-connect probe for "proxyip" entries,
+// which don't speak SOCKS5/HTTP and so can't be verified via checkGoogle.
+func checkReachable(px Proxy, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", px.Addr(), timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// LookupGeo queries ip-api.com for IP geolocation. Only called when a
+// source doesn't already supply country/city metadata.
 func LookupGeo(ip string, timeout time.Duration) (country, city string) {
 	conn, err := net.DialTimeout("tcp", "ip-api.com:80", timeout)
 	if err != nil {
