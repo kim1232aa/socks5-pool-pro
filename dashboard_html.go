@@ -50,6 +50,12 @@ tr:hover td{background:#1e293b55}
 .proto-http{background:#14532d;color:#86efac}
 .proto-https{background:#3b0764;color:#d8b4fe}
 .proto-proxyip{background:#451a03;color:#fdba74}
+.current-node{background:#0c2a1a;border:1px solid #14532d;border-radius:8px;padding:10px 14px;margin:12px 0;font-size:0.9rem;color:#94a3b8}
+.current-node .cn-addr{color:#4ade80;font-family:monospace;font-weight:bold;font-size:1rem}
+.current-node .cn-meta{color:#64748b;font-size:0.78rem;margin-left:6px}
+tr.active td{background:#14311f !important}
+.badge-inuse{background:#065f46;color:#4ade80;padding:1px 7px;border-radius:4px;font-size:0.68rem;font-weight:bold}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%}
 form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
 input,select{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:0.8rem}
 input::placeholder{color:#64748b}
@@ -88,39 +94,14 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 </div>
 
 <div id="tab-nodes" class="tab-panel">
-  <div id="group-cards-container" class="group-cards">
-    {{range .Groups}}
-    <div class="group-card">
-      <div class="gc-name">{{.Name}}</div>
-      <div class="gc-strategy">{{.Strategy}}</div>
-      <div class="gc-count">{{.Count}} 节点</div>
-      <div class="gc-current">{{if .Current}}当前: {{.Current}}{{else}}尚未使用{{end}}</div>
-    </div>
-    {{end}}
-    <div class="group-card direct"><div class="gc-name">DIRECT</div><div class="gc-strategy">直连,不经过代理</div></div>
-  </div>
+  <div id="current-node-banner" class="current-node">当前使用节点: <span class="cn-addr">加载中...</span></div>
 
-  {{if .Nodes}}
+  <div id="group-cards-container" class="group-cards"></div>
+
   <table>
-  <tr><th>协议</th><th>地址</th><th>国家/城市</th><th>来源</th><th>延迟</th><th>速度</th><th>操作</th></tr>
-  {{range .Nodes}}
-  <tr>
-    <td><span class="proto proto-{{.Protocol}}">{{.Protocol}}</span></td>
-    <td class="mono">{{.Addr}}</td>
-    <td>{{.Country}}{{if .City}}, {{.City}}{{end}}</td>
-    <td class="small">{{.Source}}</td>
-    <td>{{if .LatencyMs}}{{.LatencyMs}}ms{{else}}-{{end}}</td>
-    <td class="speed-cell">{{if .SpeedKbps}}{{printf "%.0f" .SpeedKbps}} kbps{{else}}-{{end}}</td>
-    <td>
-      <button class="btn-sm" onclick="postJSON('/api/nodes/switch',{key:'{{.Key}}'},reloadOrAlert)">使用</button>
-      <button class="btn-sm" onclick="runSpeedtest('{{.Key}}', this)">测速</button>
-    </td>
-  </tr>
-  {{end}}
+  <thead><tr><th></th><th>协议</th><th>地址</th><th>国家/城市</th><th>来源</th><th>延迟</th><th>速度</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
   </table>
-  {{else}}
-  <p class="empty">暂无可用节点,等待下次抓取周期...</p>
-  {{end}}
 
   <details class="proxyip-section">
     <summary>ProxyIP 节点(仅展示,不参与本地转发) - {{.ProxyIPTotal}} 个</summary>
@@ -219,8 +200,8 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
         {{range $.Strategies}}<option value="{{.}}" {{if eq . $cur}}selected{{end}}>{{.}}</option>{{end}}
       </select>
     </td>
-    <td class="small">{{if .Countries}}国家: {{range .Countries}}{{.}} {{end}}<br>{{end}}{{if .Protocols}}协议: {{range .Protocols}}{{.}} {{end}}<br>{{end}}{{if .Sources}}来源: {{range .Sources}}{{.}} {{end}}{{end}}</td>
-    <td>{{.Count}} / {{if .Current}}{{.Current}}{{else}}-{{end}}</td>
+    <td class="small">{{if .Nodes}}指定节点: {{range .Nodes}}{{.}} {{end}}<br>{{end}}{{if .Countries}}国家: {{range .Countries}}{{.}} {{end}}<br>{{end}}{{if .Protocols}}协议: {{range .Protocols}}{{.}} {{end}}<br>{{end}}{{if .Sources}}来源: {{range .Sources}}{{.}} {{end}}{{end}}</td>
+    <td>{{.Count}} / {{if .Current}}{{.Current}}{{if .Dynamic}} (每连接轮换){{end}}{{else}}-{{end}}</td>
     <td><button class="btn-sm danger" onclick="if(confirm('删除分组 {{.Name}}? 引用它的规则会自动回退到 ANY'))postJSON('/api/groups/delete',{id:'{{.ID}}'},reloadOrAlert)">删除</button></td>
   </tr>
   {{end}}
@@ -230,12 +211,13 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
   <form class="inline" id="form-add-group">
     <input name="name" placeholder="分组名称" required>
     <select name="strategy">{{range .Strategies}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <input name="nodes" placeholder="指定节点 ip:port,逗号分隔 (钉死到具体节点时用)">
     <input name="countries" placeholder="国家代码,逗号分隔,如 US,JP (留空=不限)">
     <input name="protocols" placeholder="协议,逗号分隔,如 socks5,http (留空=不限)">
     <input name="sources" placeholder="来源名称,逗号分隔 (留空=不限)">
     <button class="btn" type="submit">创建分组</button>
   </form>
-  <p class="note">分组是按国家/协议/来源过滤出的节点子集,配合分流规则使用(例如把 DOMAIN-SUFFIX netflix.com 指到一个只含 US 节点的分组)。策略: sticky=固定直到手动切换或失败, round-robin=每次新连接轮换, random=随机, latency=优先延迟最低, speed=优先测速结果最高(需先手动测速)。</p>
+  <p class="note">分组是从代理池里筛出的节点子集,配合分流规则使用。<b>要把某个域名固定走某一个节点</b>:在"指定节点"里填那个节点的 ip:port(可在节点标签页复制),建一个分组,再在分流规则里把该域名指向这个分组即可。筛选条件可组合(指定节点 / 国家 / 协议 / 来源)。策略: sticky=固定直到手动切换或失败, round-robin=每次新连接轮换, random=随机, latency=优先延迟最低, speed=优先测速结果最高(需先手动测速)。</p>
 </div>
 
 </div>
@@ -255,13 +237,61 @@ function renderGroups(groups) {
   if (!container) return;
   var html = '';
   groups.forEach(function(g) {
+    var cur = g.current ? ('当前: ' + escapeHtml(g.current) + (g.dynamic ? ' <span class="cn-meta">每连接轮换</span>' : '')) : '暂无可用节点';
     html += '<div class="group-card"><div class="gc-name">' + escapeHtml(g.name) + '</div>' +
       '<div class="gc-strategy">' + escapeHtml(g.strategy) + '</div>' +
       '<div class="gc-count">' + g.count + ' 节点</div>' +
-      '<div class="gc-current">' + (g.current ? '当前: ' + escapeHtml(g.current) : '尚未使用') + '</div></div>';
+      '<div class="gc-current">' + cur + '</div></div>';
   });
   html += '<div class="group-card direct"><div class="gc-name">DIRECT</div><div class="gc-strategy">直连,不经过代理</div></div>';
   container.innerHTML = html;
+}
+
+function protoBadge(p) { return '<span class="proto proto-' + escapeHtml(p) + '">' + escapeHtml(p) + '</span>'; }
+
+function renderNodes(nodes) {
+  var tbody = document.getElementById('node-tbody');
+  if (!tbody) return;
+  var banner = document.querySelector('#current-node-banner .cn-addr');
+  var active = null;
+  if (!nodes.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
+    if (banner) banner.textContent = '无 (代理池为空)';
+    return;
+  }
+  var html = '';
+  nodes.forEach(function(n) {
+    if (n.active) active = n;
+    var loc = escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
+    var lat = n.latency_ms ? n.latency_ms + 'ms' : '-';
+    var spd = n.speed_kbps ? Math.round(n.speed_kbps) + ' kbps' : '-';
+    html += '<tr class="' + (n.active ? 'active' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
+      '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : '') + '</td>' +
+      '<td>' + protoBadge(n.protocol) + '</td>' +
+      '<td class="mono">' + escapeHtml(n.addr) + '</td>' +
+      '<td>' + loc + '</td>' +
+      '<td class="small">' + escapeHtml(n.source || '') + '</td>' +
+      '<td>' + lat + '</td>' +
+      '<td class="speed-cell">' + spd + '</td>' +
+      '<td>' +
+        '<button class="btn-sm" onclick="switchNode(this)">使用</button>' +
+        '<button class="btn-sm" onclick="runSpeedtest(this)">测速</button>' +
+      '</td></tr>';
+  });
+  tbody.innerHTML = html;
+  if (banner) {
+    banner.innerHTML = active
+      ? escapeHtml(active.addr) + '<span class="cn-meta">' + protoBadge(active.protocol) + ' ' + escapeHtml(active.country || '') + '</span>'
+      : escapeHtml(nodes[0].addr) + '<span class="cn-meta">(默认选择)</span>';
+  }
+}
+
+function rowKey(btn) { var tr = btn.closest('tr'); return tr ? tr.getAttribute('data-key') : ''; }
+
+function switchNode(btn) {
+  postJSON('/api/nodes/switch', {key: rowKey(btn)}, function(err) {
+    if (err) { alert(err); } else { pollStatus(); }
+  });
 }
 
 function pollStatus() {
@@ -276,7 +306,11 @@ function pollStatus() {
     if (elNext) elNext.textContent = d.next_scrape || 'N/A';
     renderGroups(d.groups || []);
   }).catch(function(){});
+  fetch('/api/nodes').then(function(r){ return r.json(); }).then(function(nodes) {
+    renderNodes(nodes || []);
+  }).catch(function(){});
 }
+pollStatus();
 setInterval(pollStatus, 15000);
 
 function doRefresh(btn) {
@@ -288,7 +322,8 @@ function doRefresh(btn) {
   }).catch(function(){ btn.disabled = false; btn.textContent = orig; });
 }
 
-function runSpeedtest(key, btn) {
+function runSpeedtest(btn) {
+  var key = rowKey(btn);
   btn.disabled = true;
   var orig = btn.textContent;
   btn.textContent = '测速中...';
@@ -345,7 +380,7 @@ document.getElementById('form-add-group').addEventListener('submit', function(e)
   var f = e.target;
   function splitList(v) { return v.split(',').map(function(s){ return s.trim(); }).filter(Boolean); }
   postJSON('/api/groups', {
-    name: f.name.value, strategy: f.strategy.value,
+    name: f.name.value, strategy: f.strategy.value, nodes: splitList(f.nodes.value),
     countries: splitList(f.countries.value), protocols: splitList(f.protocols.value), sources: splitList(f.sources.value)
   }, function(err) { if (err) { alert(err); } else { location.hash = 'groups'; location.reload(); } });
 });

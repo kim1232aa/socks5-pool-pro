@@ -89,6 +89,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			s.sendReply(conn, 0x01)
 			return
 		}
+		log.Printf("[route] %s -> DIRECT", host)
 		s.sendReply(conn, 0x00)
 		relay(conn, remote)
 		return
@@ -119,7 +120,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		// Success
+		// Success - log which upstream carried this target, so it's
+		// visible which node each domain actually used.
+		log.Printf("[route] %s -> group %s -> %s://%s", host, groupName, upstream.Protocol, upstream.Addr())
 		s.sendReply(conn, 0x00)
 		relay(conn, remote)
 		return

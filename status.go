@@ -23,6 +23,7 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 
+	mux.HandleFunc("/api/nodes", s.handleNodes)
 	mux.HandleFunc("/api/nodes/switch", s.handleNodeSwitch)
 	mux.HandleFunc("/api/nodes/speedtest", s.handleNodeSpeedtest)
 
@@ -53,6 +54,7 @@ type NodeView struct {
 	Source    string  `json:"source"`
 	LatencyMs int64   `json:"latency_ms"`
 	SpeedKbps float64 `json:"speed_kbps"`
+	Active    bool    `json:"active"` // this node is the ANY group's current upstream
 }
 
 type GroupView struct {
@@ -61,10 +63,12 @@ type GroupView struct {
 	Strategy  string   `json:"strategy"`
 	Count     int      `json:"count"`
 	Current   string   `json:"current"`
+	Dynamic   bool     `json:"dynamic"` // current rotates per-connection (round-robin/random)
 	Builtin   bool     `json:"builtin"`
 	Countries []string `json:"countries,omitempty"`
 	Protocols []string `json:"protocols,omitempty"`
 	Sources   []string `json:"sources,omitempty"`
+	Nodes     []string `json:"nodes,omitempty"`
 }
 
 type StatusSummary struct {
@@ -80,26 +84,39 @@ func (s *StatusServer) buildGroupViews() []GroupView {
 	groups := s.store.Groups()
 
 	views := []GroupView{}
-	anyCurrent := ""
-	if px, ok := s.pool.Peek(GroupAny); ok {
-		anyCurrent = px.Addr()
+	anyCurrent, anyOK, anyDynamic := s.pool.EffectiveCurrent(GroupAny, groups)
+	anyAddr := ""
+	if anyOK {
+		anyAddr = anyCurrent.Addr()
 	}
 	views = append(views, GroupView{
-		Name: GroupAny, Strategy: StrategySticky, Count: len(all), Current: anyCurrent, Builtin: true,
+		Name: GroupAny, Strategy: StrategySticky, Count: len(all),
+		Current: anyAddr, Dynamic: anyDynamic, Builtin: true,
 	})
 
 	for _, g := range groups {
 		candidates, strategy := resolveGroup(all, g.Name, groups)
+		cur, ok, dynamic := s.pool.EffectiveCurrent(g.Name, groups)
 		current := ""
-		if px, ok := s.pool.Peek(g.Name); ok {
-			current = px.Addr()
+		if ok {
+			current = cur.Addr()
 		}
 		views = append(views, GroupView{
-			ID: g.ID, Name: g.Name, Strategy: strategy, Count: len(candidates), Current: current,
-			Countries: g.Countries, Protocols: g.Protocols, Sources: g.Sources,
+			ID: g.ID, Name: g.Name, Strategy: strategy, Count: len(candidates),
+			Current: current, Dynamic: dynamic,
+			Countries: g.Countries, Protocols: g.Protocols, Sources: g.Sources, Nodes: g.Nodes,
 		})
 	}
 	return views
+}
+
+// anyCurrentAddr returns the address of the node the ANY group would use
+// right now (for marking the active row in the node table).
+func (s *StatusServer) anyCurrentAddr() string {
+	if px, ok, _ := s.pool.EffectiveCurrent(GroupAny, s.store.Groups()); ok {
+		return px.Addr()
+	}
+	return ""
 }
 
 func (s *StatusServer) buildSummary() StatusSummary {
@@ -136,25 +153,34 @@ type DashboardData struct {
 	Strategies   []string
 }
 
-func nodeViewOf(px Proxy) NodeView {
+func nodeViewOf(px Proxy, activeAddr string) NodeView {
 	return NodeView{
 		Key: px.Key(), Addr: px.Addr(), Protocol: px.Protocol,
 		Country: px.Country, City: px.City, Source: px.SourceName,
 		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
+		Active: activeAddr != "" && px.Addr() == activeAddr,
 	}
+}
+
+// nodeViews returns the live forwarding node list with the ANY group's
+// current upstream flagged Active.
+func (s *StatusServer) nodeViews() []NodeView {
+	activeAddr := s.anyCurrentAddr()
+	nodes := make([]NodeView, 0, s.pool.Size())
+	for _, px := range s.pool.All() {
+		nodes = append(nodes, nodeViewOf(px, activeAddr))
+	}
+	return nodes
 }
 
 func (s *StatusServer) buildDashboardData() DashboardData {
 	summary := s.buildSummary()
 
-	var nodes []NodeView
-	for _, px := range s.pool.All() {
-		nodes = append(nodes, nodeViewOf(px))
-	}
+	nodes := s.nodeViews()
 
 	var proxyIPs []NodeView
 	for _, px := range s.pool.ProxyIPNodes() {
-		proxyIPs = append(proxyIPs, nodeViewOf(px))
+		proxyIPs = append(proxyIPs, nodeViewOf(px, ""))
 	}
 
 	groupOptions := []string{GroupAny, GroupDirect}
@@ -221,6 +247,10 @@ func (s *StatusServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- handlers: nodes ----
+
+func (s *StatusServer) handleNodes(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.nodeViews())
+}
 
 func (s *StatusServer) handleNodeSwitch(w http.ResponseWriter, r *http.Request) {
 	var in struct {

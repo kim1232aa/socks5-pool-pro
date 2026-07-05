@@ -32,6 +32,12 @@ type Group struct {
 	Countries []string `json:"countries,omitempty"` // country code allowlist; empty = any
 	Protocols []string `json:"protocols,omitempty"` // protocol allowlist; empty = any
 	Sources   []string `json:"sources,omitempty"`   // source-name allowlist; empty = any
+	// Nodes is an explicit allowlist of node addresses ("ip:port"). When
+	// set, only these exact nodes are group members - this is how you pin
+	// a rule (e.g. a domain) to one specific node: make a group whose
+	// Nodes is that single address. Empty = any node (subject to the
+	// other filters).
+	Nodes []string `json:"nodes,omitempty"`
 }
 
 type groupCursor struct {
@@ -142,6 +148,9 @@ func resolveGroup(all []Proxy, groupName string, groups []Group) ([]Proxy, strin
 		if strings.EqualFold(g.Name, groupName) || g.ID == groupName {
 			var out []Proxy
 			for _, px := range all {
+				if len(g.Nodes) > 0 && !containsFold(g.Nodes, px.Addr()) {
+					continue
+				}
 				if len(g.Countries) > 0 && !containsFold(g.Countries, px.Country) {
 					continue
 				}
@@ -297,18 +306,58 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 	return next, true
 }
 
-// Peek returns the last proxy returned by Pick for groupName, without
-// consuming any round-robin state - used for read-only dashboard display.
-func (p *ProxyPool) Peek(groupName string) (Proxy, bool) {
+// EffectiveCurrent reports which node a group would use *right now*, for
+// read-only dashboard display, without consuming any round-robin/sticky
+// state. For deterministic strategies (sticky/latency/speed) it returns
+// the node an actual Pick would choose, so the dashboard is never blank
+// or out of sync with reality even before the first request. For
+// per-connection strategies (round-robin/random) there is no single
+// "current" node, so it returns the most recently picked one with
+// dynamic=true to signal "rotates every connection".
+//
+// Returns (proxy, ok, dynamic): ok=false means the group currently has no
+// members.
+func (p *ProxyPool) EffectiveCurrent(groupName string, groups []Group) (Proxy, bool, bool) {
+	if groupName == GroupDirect {
+		return Proxy{}, false, false
+	}
+	candidates, strategy := resolveGroup(p.All(), groupName, groups)
+	if len(candidates) == 0 {
+		return Proxy{}, false, false
+	}
+
 	p.mu.RLock()
-	gc, ok := p.groupState[groupName]
-	var key string
-	if ok {
-		key = gc.lastPicked
+	gc := p.groupState[groupName]
+	var stickyKey, lastPicked string
+	if gc != nil {
+		stickyKey = gc.stickyKey
+		lastPicked = gc.lastPicked
 	}
 	p.mu.RUnlock()
-	if key == "" {
+
+	find := func(key string) (Proxy, bool) {
+		for _, c := range candidates {
+			if c.Key() == key {
+				return c, true
+			}
+		}
 		return Proxy{}, false
 	}
-	return p.Find(key)
+
+	switch strategy {
+	case StrategyLatency:
+		return bestBy(candidates, func(c Proxy) float64 { return float64(c.LatencyMs) }, false), true, false
+	case StrategySpeed:
+		return bestBy(candidates, func(c Proxy) float64 { return c.SpeedKbps }, true), true, false
+	case StrategyRoundRobin, StrategyRandom:
+		if px, ok := find(lastPicked); ok {
+			return px, true, true
+		}
+		return candidates[0], true, true
+	default: // sticky
+		if px, ok := find(stickyKey); ok {
+			return px, true, false
+		}
+		return candidates[0], true, false
+	}
 }

@@ -1,19 +1,22 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
 
 // Blocked countries: China mainland + Hong Kong (can't reach Google).
+// Keyed by both ISO code and full name so it works whichever a source
+// supplies (LookupGeo now normalizes to ISO codes, but source feeds vary).
 var blockedCountries = map[string]bool{
-	"china":     true,
-	"hong kong": true,
 	"cn":        true,
 	"hk":        true,
+	"china":     true,
+	"hong kong": true,
 }
 
 // CheckProxies concurrently verifies a list of candidate proxies.
@@ -21,6 +24,11 @@ var blockedCountries = map[string]bool{
 // Google connectivity round-trip through DialUpstream, and their latency
 // is recorded. "proxyip" entries don't speak a forwarding protocol (see
 // parser.go), so they only get a lightweight raw TCP reachability probe.
+//
+// Connectivity is checked FIRST, and geo lookup runs only on the handful
+// that pass. Doing geo up-front on every candidate (often thousands) would
+// blow straight through ip-api.com's ~45 req/min free-tier limit, and the
+// 429 responses used to get misparsed into garbage "country" values.
 func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []Proxy {
 	var (
 		mu    sync.Mutex
@@ -36,19 +44,6 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// Only look up geo when the source didn't already supply it
-			// (EDT-Pages/proxyip feeds do; the plain-text feed doesn't) -
-			// avoids hammering ip-api.com's rate limit unnecessarily.
-			if px.Country == "" {
-				country, city := LookupGeo(px.IP, timeout)
-				px.Country = strings.TrimSpace(country)
-				px.City = strings.TrimSpace(city)
-			}
-
-			if blockedCountries[strings.ToLower(px.Country)] {
-				return
-			}
-
 			start := time.Now()
 			var ok bool
 			if px.Protocol == "proxyip" {
@@ -60,6 +55,17 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 				return
 			}
 			px.LatencyMs = time.Since(start).Milliseconds()
+
+			// Geo only for survivors, and only when the source didn't
+			// already supply it (EDT-Pages/proxyip feeds do).
+			if px.Country == "" {
+				country, city := LookupGeo(px.IP, timeout)
+				px.Country = strings.TrimSpace(country)
+				px.City = strings.TrimSpace(city)
+			}
+			if blockedCountries[strings.ToLower(px.Country)] {
+				return
+			}
 
 			mu.Lock()
 			alive = append(alive, px)
@@ -107,37 +113,32 @@ func checkReachable(px Proxy, timeout time.Duration) bool {
 	return true
 }
 
-// LookupGeo queries ip-api.com for IP geolocation. Only called when a
-// source doesn't already supply country/city metadata.
+// LookupGeo queries ip-api.com for IP geolocation, returning the ISO
+// country code (e.g. "US") and city. Only called for nodes that passed
+// the connectivity check and whose source didn't already supply geo.
+//
+// It validates the HTTP status and the JSON "status" field, returning
+// "Unknown" on any error or rate-limit (429). Returning the ISO code
+// keeps country values consistent with the source feeds (EDT/ProxyIP also
+// use codes), so country-filtered groups match regardless of source.
 func LookupGeo(ip string, timeout time.Duration) (country, city string) {
-	conn, err := net.DialTimeout("tcp", "ip-api.com:80", timeout)
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get("http://ip-api.com/json/" + ip + "?fields=status,countryCode,city")
 	if err != nil {
 		return "Unknown", ""
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "Unknown", "" // typically 429 rate-limited
+	}
 
-	req := fmt.Sprintf("GET /csv/%s?fields=country,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n", ip)
-	conn.Write([]byte(req))
-
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
+	var r struct {
+		Status      string `json:"status"`
+		CountryCode string `json:"countryCode"`
+		City        string `json:"city"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil || r.Status != "success" || r.CountryCode == "" {
 		return "Unknown", ""
 	}
-
-	body := string(buf[:n])
-	for i := 0; i < len(body)-3; i++ {
-		if body[i:i+4] == "\r\n\r\n" {
-			body = body[i+4:]
-			break
-		}
-	}
-
-	for i, c := range body {
-		if c == ',' {
-			return body[:i], body[i+1:]
-		}
-	}
-	return body, ""
+	return r.CountryCode, r.City
 }
