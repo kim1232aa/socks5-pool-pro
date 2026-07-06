@@ -292,7 +292,7 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("node not found: %s", in.Key))
 		return
 	}
-	kbps, err := SpeedTest(px, 15*time.Second)
+	kbps, err := SpeedTest(px, 20*time.Second)
 	if err != nil {
 		writeJSON(w, map[string]string{"error": err.Error()})
 		return

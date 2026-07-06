@@ -1,3 +1,4 @@
 *.exe
 socks5-pool
 /data/
+Dockerfile.local
