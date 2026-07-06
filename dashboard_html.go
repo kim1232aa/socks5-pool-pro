@@ -125,6 +125,8 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
       <option value="country">按国家</option>
     </select>
     <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="applyNodeView()"> 只看真正改IP的</label>
+    <button class="btn-sm" onclick="exportNodes('csv')" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
+    <button class="btn-sm" onclick="exportNodes('tme')" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
     <span id="node-count" class="small"></span>
   </div>
 
@@ -396,6 +398,16 @@ function applyNodeView() {
 function copyAddr(addr, el) {
   if (navigator.clipboard) { navigator.clipboard.writeText(addr); }
   if (el) { var t = el.textContent; el.textContent = '已复制'; setTimeout(function(){ el.textContent = t; }, 1000); }
+}
+
+function exportNodes(fmt) {
+  var q = 'format=' + fmt;
+  var c = document.getElementById('f-country').value; if (c) q += '&country=' + encodeURIComponent(c);
+  var p = document.getElementById('f-proto').value; if (p) q += '&protocol=' + encodeURIComponent(p);
+  if (document.getElementById('f-ipchanged').checked) q += '&only_changed=1';
+  var a = document.createElement('a');
+  a.href = '/api/nodes/export?' + q;
+  document.body.appendChild(a); a.click(); a.remove();
 }
 
 function rowKey(btn) { var tr = btn.closest('tr'); return tr ? tr.getAttribute('data-key') : ''; }

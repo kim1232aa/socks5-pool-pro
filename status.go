@@ -26,6 +26,7 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/api/nodes", s.handleNodes)
 	mux.HandleFunc("/api/nodes/switch", s.handleNodeSwitch)
 	mux.HandleFunc("/api/nodes/speedtest", s.handleNodeSpeedtest)
+	mux.HandleFunc("/api/nodes/export", s.handleNodeExport)
 
 	mux.HandleFunc("/api/sources", s.handleSources)
 	mux.HandleFunc("/api/sources/toggle", s.handleSourceToggle)
