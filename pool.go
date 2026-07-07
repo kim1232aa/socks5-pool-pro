@@ -229,6 +229,25 @@ func (p *ProxyPool) Update(all []Proxy) {
 		}
 	}
 	p.mu.Lock()
+	// Preserve any manually-locked node across a refresh. A refresh replaces
+	// the whole pool, and with random candidate sampling a still-good locked
+	// node might simply not be re-checked this cycle - dropping it would
+	// silently break the user's lock (the sticky pick would fall back to some
+	// other node). So if a group is pinned and its node isn't in the fresh
+	// list but was in the previous one, carry it over.
+	kept := 0
+	for _, gc := range p.groupState {
+		if !gc.pinned || gc.stickyKey == "" {
+			continue
+		}
+		if containsKey(fwd, gc.stickyKey) {
+			continue
+		}
+		if px, ok := findByKey(p.proxies, gc.stickyKey); ok {
+			fwd = append(fwd, px)
+			kept++
+		}
+	}
 	p.proxies = fwd
 	p.proxyIPNodes = info
 	cache := p.cache
@@ -236,7 +255,11 @@ func (p *ProxyPool) Update(all []Proxy) {
 	if cache != nil {
 		cache.save(fwd, info, p.statsSnapshot())
 	}
-	log.Printf("[pool] updated: %d forwarding proxies, %d proxyip (info-only) nodes", len(fwd), len(info))
+	if kept > 0 {
+		log.Printf("[pool] updated: %d forwarding proxies (%d locked node(s) preserved), %d proxyip (info-only) nodes", len(fwd), kept, len(info))
+	} else {
+		log.Printf("[pool] updated: %d forwarding proxies, %d proxyip (info-only) nodes", len(fwd), len(info))
+	}
 }
 
 func (p *ProxyPool) Size() int {
@@ -294,6 +317,24 @@ func containsFold(list []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func containsKey(list []Proxy, key string) bool {
+	for _, px := range list {
+		if px.Key() == key {
+			return true
+		}
+	}
+	return false
+}
+
+func findByKey(list []Proxy, key string) (Proxy, bool) {
+	for _, px := range list {
+		if px.Key() == key {
+			return px, true
+		}
+	}
+	return Proxy{}, false
 }
 
 // resolveGroup filters all down to groupName's members and resolves its
