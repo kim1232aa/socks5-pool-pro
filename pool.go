@@ -54,6 +54,28 @@ type groupCursor struct {
 	stickyKey  string
 	rrIdx      int
 	lastPicked string
+	// pinned marks a manual lock: the user explicitly chose this node from
+	// the dashboard, so the periodic auto-rotation must leave it alone until
+	// the lock is cleared (SetAuto). Only meaningful for sticky groups.
+	pinned bool
+}
+
+// countryGroupPrefix marks a dynamic routing target that resolves to "any
+// live node whose real exit is in this ISO country", e.g. "COUNTRY:US".
+// Unlike a named Group it needs no pre-creation, so a routing rule can point
+// a domain straight at a country (DOMAIN-SUFFIX com -> COUNTRY:US, DOMAIN
+// 111.com -> COUNTRY:JP).
+const countryGroupPrefix = "COUNTRY:"
+
+// parseCountryGroup returns the ISO country code of a "COUNTRY:XX" dynamic
+// group target, or ok=false for any other group name.
+func parseCountryGroup(name string) (code string, ok bool) {
+	if strings.HasPrefix(name, countryGroupPrefix) {
+		if cc := strings.TrimSpace(strings.TrimPrefix(name, countryGroupPrefix)); cc != "" {
+			return cc, true
+		}
+	}
+	return "", false
 }
 
 // ProxyPool holds the live, health-checked node list plus per-group
@@ -283,6 +305,19 @@ func resolveGroup(all []Proxy, groupName string, groups []Group) ([]Proxy, strin
 	if groupName == "" || groupName == GroupAny {
 		return all, StrategySticky
 	}
+	// Dynamic country group ("COUNTRY:JP"): any live node whose real exit is
+	// in that country. Prefer the fastest such node - "give me a JP node"
+	// almost always means "the best JP node", and there's no per-country
+	// group config to carry a different strategy.
+	if cc, ok := parseCountryGroup(groupName); ok {
+		var out []Proxy
+		for _, px := range all {
+			if strings.EqualFold(px.Country, cc) {
+				out = append(out, px)
+			}
+		}
+		return out, StrategyLatency
+	}
 	for _, g := range groups {
 		if strings.EqualFold(g.Name, groupName) || g.ID == groupName {
 			var out []Proxy
@@ -417,11 +452,34 @@ func (p *ProxyPool) ForceSticky(groupName, key string) bool {
 	}
 	gc.stickyKey = key
 	gc.lastPicked = key
+	gc.pinned = true // manual choice: auto-rotation must not override it
 	return true
 }
 
+// SetAuto clears a group's manual lock so the periodic auto-rotation timer
+// resumes moving it. Used by the dashboard's "resume auto-rotation" button.
+func (p *ProxyPool) SetAuto(groupName string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gc, ok := p.groupState[groupName]; ok {
+		gc.pinned = false
+	}
+}
+
+// IsPinned reports whether a group is manually locked to a specific node.
+func (p *ProxyPool) IsPinned(groupName string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if gc, ok := p.groupState[groupName]; ok {
+		return gc.pinned
+	}
+	return false
+}
+
 // RotateSticky advances a group's pinned proxy to the next one in list
-// order (wrapping around). Used by the periodic auto-rotation timer.
+// order (wrapping around). Used by the periodic auto-rotation timer. It
+// no-ops (returns ok=false) when the group is manually locked, so a user's
+// explicit node choice is never rotated away underneath them.
 func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -432,6 +490,9 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 	if !ok {
 		gc = &groupCursor{}
 		p.groupState[groupName] = gc
+	}
+	if gc.pinned {
+		return Proxy{}, false
 	}
 	idx := 0
 	for i, px := range p.proxies {

@@ -25,6 +25,7 @@ func (s *StatusServer) Start(addr string) error {
 
 	mux.HandleFunc("/api/nodes", s.handleNodes)
 	mux.HandleFunc("/api/nodes/switch", s.handleNodeSwitch)
+	mux.HandleFunc("/api/nodes/auto", s.handleNodeAuto)
 	mux.HandleFunc("/api/nodes/speedtest", s.handleNodeSpeedtest)
 	mux.HandleFunc("/api/nodes/export", s.handleNodeExport)
 
@@ -72,6 +73,7 @@ type GroupView struct {
 	Count     int      `json:"count"`
 	Current   string   `json:"current"`
 	Dynamic   bool     `json:"dynamic"` // current rotates per-connection (round-robin/random)
+	Pinned    bool     `json:"pinned"`  // manually locked to Current; auto-rotation paused
 	Builtin   bool     `json:"builtin"`
 	Countries []string `json:"countries,omitempty"`
 	Protocols []string `json:"protocols,omitempty"`
@@ -100,6 +102,7 @@ func (s *StatusServer) buildGroupViews() []GroupView {
 	views = append(views, GroupView{
 		Name: GroupAny, Strategy: StrategySticky, Count: len(all),
 		Current: anyAddr, Dynamic: anyDynamic, Builtin: true,
+		Pinned: s.pool.IsPinned(GroupAny),
 	})
 
 	for _, g := range groups {
@@ -276,6 +279,13 @@ func (s *StatusServer) handleNodeSwitch(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("node not found: %s", in.Key))
 		return
 	}
+	writeJSON(w, map[string]string{"status": "ok", "pinned": "true"})
+}
+
+// handleNodeAuto clears the manual lock on the default (ANY) group so the
+// periodic auto-rotation resumes.
+func (s *StatusServer) handleNodeAuto(w http.ResponseWriter, r *http.Request) {
+	s.pool.SetAuto(GroupAny)
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 

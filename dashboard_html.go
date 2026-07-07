@@ -82,6 +82,9 @@ input:checked + .slider:before{transform:translateX(16px)}
 details.proxyip-section{margin-top:18px}
 summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 .default-group-editor{margin-top:12px;display:flex;gap:8px;align-items:center;font-size:0.8rem;color:#94a3b8}
+.lock-badge{background:#78350f;color:#fbbf24;padding:1px 8px;border-radius:4px;font-size:0.72rem;font-weight:bold;margin-left:8px}
+.auto-badge{background:#1e3a8a;color:#93c5fd;padding:1px 8px;border-radius:4px;font-size:0.72rem;font-weight:bold;margin-left:8px}
+.pager{display:flex;gap:10px;align-items:center;justify-content:center;margin:12px 0;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -112,19 +115,25 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 
   <div id="group-cards-container" class="group-cards"></div>
 
-  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(穿过节点探测),不是节点自身 IP。"匿名"=高匿(elite,不暴露)/普通(anonymous,可被识别为代理)/透明(transparent,泄露你的真实IP)。"评分"综合成功率/延迟/速度。默认已开启剔除"假代理"(出口IP==本机出口的透明节点),用 -require-ip-change=false 关闭。</p>
+  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(穿过节点探测),不是节点自身 IP。"匿名"=高匿(elite,不暴露)/普通(anonymous,可被识别为代理)/透明(transparent,泄露你的真实IP)。"评分"综合成功率/延迟/速度。默认已开启剔除"假代理"(出口IP==本机出口的透明节点),用 -require-ip-change=false 关闭。点节点上的<b>"使用"</b>即把默认(ANY)出口<b>手动锁定</b>到该节点,后台自动轮换会暂停;点上方横幅的<b>"恢复自动轮换"</b>可解锁。</p>
 
   <div class="filter-bar">
-    <input id="f-text" placeholder="搜索 IP/地址..." oninput="applyNodeView()">
-    <select id="f-country" onchange="applyNodeView()"><option value="">全部国家</option></select>
-    <select id="f-proto" onchange="applyNodeView()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
-    <select id="f-sort" onchange="applyNodeView()">
+    <input id="f-text" placeholder="搜索 IP/地址..." oninput="onFilterChange()">
+    <select id="f-country" onchange="onFilterChange()"><option value="">全部国家</option></select>
+    <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
+    <select id="f-sort" onchange="onFilterChange()">
       <option value="score">按评分↓</option>
       <option value="latency">按延迟↑</option>
       <option value="speed">按速度↓</option>
       <option value="country">按国家</option>
     </select>
-    <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="applyNodeView()"> 只看真正改IP的</label>
+    <select id="f-pagesize" onchange="onPageSizeChange()">
+      <option value="20">每页20</option>
+      <option value="50">每页50</option>
+      <option value="100">每页100</option>
+      <option value="100000">全部</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="onFilterChange()"> 只看真正改IP的</label>
     <button class="btn-sm" onclick="exportNodes('csv')" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
     <button class="btn-sm" onclick="exportNodes('tme')" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
     <span id="node-count" class="small"></span>
@@ -136,6 +145,7 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
   <tbody id="node-tbody"><tr><td colspan="11" class="empty">加载中...</td></tr></tbody>
   </table>
   </div>
+  <div class="pager" id="node-pager"></div>
 
   <details class="proxyip-section">
     <summary>ProxyIP 节点(仅展示,不参与本地转发) - {{.ProxyIPTotal}} 个</summary>
@@ -213,14 +223,14 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
   <form class="inline" id="form-add-rule">
     <select name="type">{{range .RuleTypes}}<option value="{{.}}">{{.}}</option>{{end}}</select>
     <input name="value" placeholder="值,如 netflix.com / 10.0.0.0/8 / cn / gfw">
-    <select name="group">{{range .GroupOptions}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <select name="group" id="rule-target-select">{{range .GroupOptions}}<option value="{{.}}">{{.}}</option>{{end}}</select>
     <button class="btn" type="submit">添加规则</button>
   </form>
-  <p class="note">规则按从上到下的顺序匹配目标域名/IP,命中即用对应分组转发;DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD 匹配域名,IP-CIDR 匹配字面 IP 目标,GEOSITE 值填 <b>cn</b>(内置中国常用域名)或 <b>gfw</b>(内置常见被墙域名)。最下面的 MATCH 是兜底规则,始终存在。</p>
+  <p class="note">规则按从上到下的顺序匹配目标域名/IP,命中即用对应目标转发;DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD 匹配域名,IP-CIDR 匹配字面 IP 目标,GEOSITE 值填 <b>cn</b>(内置中国常用域名)或 <b>gfw</b>(内置常见被墙域名)。<b>目标可直接选国家</b>(列表里的 <span class="mono">COUNTRY:US</span> / <span class="mono">COUNTRY:JP</span> 等,表示"该国任意节点,自动挑最快的一个"),无需先建分组。例如:<span class="mono">DOMAIN-SUFFIX com → COUNTRY:US</span>,再把 <span class="mono">DOMAIN 111.com → COUNTRY:JP</span> 拖到它上面(越靠上越优先),就能实现"*.com 走美国、111.com 走日本"。若某国当前无可用节点,会自动回退到 ANY。最下面的 MATCH 是兜底规则,始终存在。</p>
 
   <div class="default-group-editor">
     <span>默认(兜底)分组:</span>
-    <select id="default-group-select">{{range .GroupOptions}}<option value="{{.}}" {{if eq . $.DefaultGroup}}selected{{end}}>{{.}}</option>{{end}}</select>
+    <select id="default-group-select" data-default="{{.DefaultGroup}}">{{range .GroupOptions}}<option value="{{.}}" {{if eq . $.DefaultGroup}}selected{{end}}>{{.}}</option>{{end}}</select>
     <button class="btn-sm" onclick="postJSON('/api/rules/default',{group:document.getElementById('default-group-select').value},reloadOrAlert)">保存</button>
   </div>
 </div>
@@ -300,6 +310,9 @@ function scoreCell(s) {
 }
 
 var allNodes = [];
+var nodePage = 1;
+var nodePageSize = 20;
+var anyPinned = false;
 
 function onNodesFetched(nodes) {
   allNodes = nodes || [];
@@ -314,7 +327,46 @@ function onNodesFetched(nodes) {
     sel.innerHTML = opts;
     sel.value = cur;
   }
+  populateRuleTargets();
   applyNodeView();
+}
+
+// addCountryOptionsTo appends one "COUNTRY:XX" option per distinct country in
+// the live pool to a <select>, so routing rules (and the default group) can
+// target a country directly without pre-creating a group. Static group
+// options rendered by the server are preserved; only the country options
+// (tagged data-country) are rebuilt on each refresh.
+function addCountryOptionsTo(sel) {
+  if (!sel) return;
+  var cur = sel.value;
+  Array.prototype.slice.call(sel.querySelectorAll('option[data-country]')).forEach(function(o){ o.remove(); });
+  var countries = {};
+  allNodes.forEach(function(n){ if (n.country) countries[n.country] = true; });
+  Object.keys(countries).sort().forEach(function(c){
+    var o = document.createElement('option');
+    o.value = 'COUNTRY:' + c;
+    o.textContent = 'COUNTRY:' + c + '（该国任意节点）';
+    o.setAttribute('data-country', '1');
+    sel.appendChild(o);
+  });
+  var want = sel.getAttribute('data-default') || cur;
+  if (want) { sel.value = want; }
+}
+
+function populateRuleTargets() {
+  addCountryOptionsTo(document.getElementById('rule-target-select'));
+  addCountryOptionsTo(document.getElementById('default-group-select'));
+}
+
+function onFilterChange() { nodePage = 1; applyNodeView(); }
+function onPageSizeChange() {
+  nodePageSize = parseInt(document.getElementById('f-pagesize').value, 10) || 20;
+  nodePage = 1;
+  applyNodeView();
+}
+function gotoPage(p) { nodePage = p; applyNodeView(); }
+function setAuto() {
+  postJSON('/api/nodes/auto', {}, function(err){ if (err) { alert(err); } else { pollStatus(); } });
 }
 
 function applyNodeView() {
@@ -349,18 +401,32 @@ function applyNodeView() {
     }
   });
 
-  if (countEl) countEl.textContent = rows.length + ' / ' + allNodes.length + ' 节点';
+  var pager = document.getElementById('node-pager');
+  var total = rows.length;
+  var pageCount = Math.max(1, Math.ceil(total / nodePageSize));
+  if (nodePage > pageCount) nodePage = pageCount;
+  if (nodePage < 1) nodePage = 1;
+  var startIdx = (nodePage - 1) * nodePageSize;
+  var pageRows = rows.slice(startIdx, startIdx + nodePageSize);
+
+  if (countEl) {
+    countEl.textContent = total
+      ? ('显示 ' + (startIdx + 1) + '-' + (startIdx + pageRows.length) + ' / 匹配 ' + total + ' / 共 ' + allNodes.length)
+      : ('匹配 0 / 共 ' + allNodes.length);
+  }
 
   if (!allNodes.length) {
     tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
+    if (pager) pager.innerHTML = '';
     if (banner) banner.textContent = '无 (代理池为空)';
     return;
   }
   if (!rows.length) {
     tbody.innerHTML = '<tr><td colspan="11" class="empty">没有匹配的节点</td></tr>';
+    if (pager) pager.innerHTML = '';
   } else {
     var html = '';
-    rows.forEach(function(n) {
+    pageRows.forEach(function(n) {
       var loc = escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
       var lat = n.latency_ms ? n.latency_ms + 'ms' : '-';
       var spd = n.speed_kbps ? Math.round(n.speed_kbps) + ' kbps' : '-';
@@ -386,12 +452,26 @@ function applyNodeView() {
         '</td></tr>';
     });
     tbody.innerHTML = html;
+    if (pager) {
+      if (total <= nodePageSize) {
+        pager.innerHTML = '';
+      } else {
+        pager.innerHTML =
+          '<button class="btn-sm" ' + (nodePage <= 1 ? 'disabled' : '') + ' onclick="gotoPage(' + (nodePage - 1) + ')">上一页</button>' +
+          '<span class="small">第 ' + nodePage + ' / ' + pageCount + ' 页</span>' +
+          '<button class="btn-sm" ' + (nodePage >= pageCount ? 'disabled' : '') + ' onclick="gotoPage(' + (nodePage + 1) + ')">下一页</button>';
+      }
+    }
   }
 
   if (banner) {
-    banner.innerHTML = active
+    var lockUI = anyPinned
+      ? '<span class="lock-badge">🔒 手动锁定</span><button class="btn-sm" onclick="setAuto()">恢复自动轮换</button>'
+      : '<span class="auto-badge">🔄 自动轮换中</span>';
+    var body = active
       ? escapeHtml(active.addr) + '<span class="cn-meta">' + protoBadge(active.protocol) + ' 出口 ' + escapeHtml(active.exit_ip || '?') + ' ' + escapeHtml(active.country || '') + '</span>'
       : (allNodes.length ? escapeHtml(allNodes[0].addr) + '<span class="cn-meta">(默认选择)</span>' : '无');
+    banner.innerHTML = body + lockUI;
   }
 }
 
@@ -428,7 +508,11 @@ function pollStatus() {
     if (elProxyip) elProxyip.textContent = d.proxyip_total;
     if (elLast) elLast.textContent = d.last_scrape || 'N/A';
     if (elNext) elNext.textContent = d.next_scrape || 'N/A';
-    renderGroups(d.groups || []);
+    var groups = d.groups || [];
+    anyPinned = false;
+    groups.forEach(function(g){ if (g.name === 'ANY') anyPinned = !!g.pinned; });
+    renderGroups(groups);
+    if (allNodes.length) applyNodeView(); // refresh banner lock state
   }).catch(function(){});
   fetch('/api/nodes').then(function(r){ return r.json(); }).then(function(nodes) {
     onNodesFetched(nodes || []);

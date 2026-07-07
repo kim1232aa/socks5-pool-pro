@@ -108,6 +108,15 @@ func (s *Server) handleConn(conn net.Conn) {
 			upstream, ok, _ = s.pool.PickExcluding(groupName, groups, exclude)
 		}
 		if !ok {
+			// The matched group currently has no usable member - most
+			// commonly a country group ("COUNTRY:JP") with no live node in
+			// that country this cycle. Fall back to ANY so the request still
+			// succeeds instead of hard-failing, rather than blackholing it.
+			if groupName != GroupAny {
+				log.Printf("[route] group %q has no available node, falling back to ANY", groupName)
+				groupName = GroupAny
+				continue
+			}
 			log.Printf("[server] no proxies available for group %q", groupName)
 			s.sendReply(conn, 0x01) // general failure
 			return

@@ -102,6 +102,12 @@ func (cs *ConfigStore) AddRule(r Rule) (Rule, error) {
 	if r.Group == "" {
 		return Rule{}, fmt.Errorf("group is required")
 	}
+	// Normalize a dynamic country target ("country:jp" -> "COUNTRY:JP") so it
+	// matches the uppercase ISO codes stored on nodes. Any other group name
+	// is passed through and resolved (or gracefully fallen back) at dial time.
+	if cc, ok := parseCountryGroup(r.Group); ok {
+		r.Group = countryGroupPrefix + strings.ToUpper(cc)
+	}
 	r.ID = generateID("rule")
 
 	err := cs.mutate(func(c *PoolConfig) error {
