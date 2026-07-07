@@ -51,6 +51,14 @@ type Proxy struct {
 	// classified by whether the proxy leaks your real IP / advertises
 	// itself via request headers.
 	Anonymity string
+
+	// Available reflects the most recent health check that actually tested
+	// this node: true if it passed, false if it was tested and failed.
+	// Nodes are never dropped from the pool just for failing a check - only
+	// this flag flips, so a node that starts working again (common for
+	// free/rotating proxies) self-heals on its next successful check
+	// instead of having to be rediscovered from a source feed.
+	Available bool `json:"available"`
 }
 
 func (p Proxy) Addr() string {

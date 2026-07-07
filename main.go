@@ -84,9 +84,15 @@ func main() {
 		}
 	}()
 
-	// Background: periodically re-check alive nodes' latency/health so the
-	// latency/score strategies stay current between full refreshes.
+	// Background: periodically re-check known nodes' latency/health so the
+	// latency/score strategies (and each node's Available flag) stay
+	// current between full refreshes. Runs once shortly after startup too -
+	// otherwise nodes restored from an older cache file (before the
+	// Available field existed) would sit defaulted to Available=false, and
+	// so hidden by the dashboard's default filter, for up to 5 minutes.
 	go func() {
+		time.Sleep(15 * time.Second)
+		reCheckAlive(cfg, pool)
 		for {
 			time.Sleep(5 * time.Minute)
 			reCheckAlive(cfg, pool)
@@ -131,6 +137,7 @@ func reCheckAlive(cfg *Config, pool *ProxyPool) {
 			ok := checkGoogle(px, cfg.CheckTimeout)
 			latency := time.Since(start).Milliseconds()
 			pool.RecordResult(px.Key(), ok, latency)
+			pool.SetAvailable(px.Key(), ok)
 			if ok {
 				pool.UpdateLatency(px.Key(), latency)
 			}
@@ -186,8 +193,12 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 		candidates = candidates[:cfg.MaxCandidates]
 	}
 
+	checkedAddrs := make(map[string]bool, len(candidates))
+	for _, px := range candidates {
+		checkedAddrs[px.Addr()] = true
+	}
 	alive := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange)
-	pool.Update(alive)
+	pool.Update(alive, checkedAddrs)
 
 	scrapeMu.Lock()
 	lastScrapeTime = time.Now()

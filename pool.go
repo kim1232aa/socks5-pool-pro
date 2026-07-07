@@ -178,6 +178,21 @@ func (p *ProxyPool) UpdateLatency(key string, latencyMs int64) {
 	}
 }
 
+// SetAvailable flips a node's Available flag from the lightweight periodic
+// re-check (every -recheck-interval, cheaper and more frequent than a full
+// scrape). This never removes the node - it only affects whether it's
+// preferred for routing and whether the dashboard hides it by default.
+func (p *ProxyPool) SetAvailable(key string, available bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.proxies {
+		if p.proxies[i].Key() == key {
+			p.proxies[i].Available = available
+			break
+		}
+	}
+}
+
 // statsSnapshot / restoreStats support persisting scores across restarts.
 func (p *ProxyPool) statsSnapshot() map[string]nodeStats {
 	p.mu.RLock()
@@ -215,38 +230,65 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 	log.Printf("[pool] primed from cache: %d forwarding, %d proxyip nodes", len(forwarding), len(proxyip))
 }
 
-// Update replaces the live proxy list, splitting out info-only proxyip
-// nodes. Per-group cursors are left as-is; Pick re-anchors automatically
-// against whatever is present in the new list. The new pool is persisted
-// to the cache (if enabled) for fast recovery on restart.
-func (p *ProxyPool) Update(all []Proxy) {
-	var fwd, info []Proxy
-	for _, px := range all {
+// Update merges this cycle's health-check results into the live pool,
+// splitting out info-only proxyip nodes. Nodes are identified by address
+// (ip:port, matching dedupeByAddr's identity) and are never dropped here:
+//   - an address present in freshlyAlive gets its data replaced wholesale
+//     and is marked Available=true (found alive this cycle).
+//   - an address in checkedAddrs but NOT in freshlyAlive was tested and
+//     failed, so it's marked Available=false but stays in the pool.
+//   - an address in neither (skipped this cycle by random candidate
+//     sampling, or never re-scraped) is left completely untouched,
+//     including its previous Available value.
+//
+// This means the known-node list only grows (or self-heals a node back to
+// Available=true) - hiding currently-dead nodes is left to the dashboard
+// filter (see NodeView.Available), not to deletion. Use ClearUnavailable
+// for an explicit, user-triggered purge of the ones marked unavailable.
+//
+// Per-group cursors are left as-is; Pick re-anchors automatically against
+// whatever is present in the new list. The merged pool is persisted to the
+// cache (if enabled) for fast recovery on restart.
+func (p *ProxyPool) Update(freshlyAlive []Proxy, checkedAddrs map[string]bool) {
+	var freshFwd, info []Proxy
+	for _, px := range freshlyAlive {
 		if px.Protocol == "proxyip" {
 			info = append(info, px)
 		} else {
-			fwd = append(fwd, px)
+			px.Available = true
+			freshFwd = append(freshFwd, px)
 		}
 	}
+	freshAddrs := make(map[string]bool, len(freshFwd))
+	for _, px := range freshFwd {
+		freshAddrs[px.Addr()] = true
+	}
+
 	p.mu.Lock()
-	// Preserve any manually-locked node across a refresh. A refresh replaces
-	// the whole pool, and with random candidate sampling a still-good locked
-	// node might simply not be re-checked this cycle - dropping it would
-	// silently break the user's lock (the sticky pick would fall back to some
-	// other node). So if a group is pinned and its node isn't in the fresh
-	// list but was in the previous one, carry it over.
-	kept := 0
-	for _, gc := range p.groupState {
-		if !gc.pinned || gc.stickyKey == "" {
-			continue
+	merged := make(map[string]Proxy, len(p.proxies)+len(freshFwd))
+	for _, existing := range p.proxies {
+		merged[existing.Addr()] = existing
+	}
+	added, revived, failed := 0, 0, 0
+	for _, px := range freshFwd {
+		if existing, ok := merged[px.Addr()]; !ok {
+			added++
+		} else if !existing.Available {
+			revived++
 		}
-		if containsKey(fwd, gc.stickyKey) {
-			continue
+		merged[px.Addr()] = px
+	}
+	for addr, existing := range merged {
+		if checkedAddrs[addr] && !freshAddrs[addr] && existing.Available {
+			existing.Available = false
+			merged[addr] = existing
+			failed++
 		}
-		if px, ok := findByKey(p.proxies, gc.stickyKey); ok {
-			fwd = append(fwd, px)
-			kept++
-		}
+	}
+
+	fwd := make([]Proxy, 0, len(merged))
+	for _, px := range merged {
+		fwd = append(fwd, px)
 	}
 	p.proxies = fwd
 	p.proxyIPNodes = info
@@ -255,11 +297,33 @@ func (p *ProxyPool) Update(all []Proxy) {
 	if cache != nil {
 		cache.save(fwd, info, p.statsSnapshot())
 	}
-	if kept > 0 {
-		log.Printf("[pool] updated: %d forwarding proxies (%d locked node(s) preserved), %d proxyip (info-only) nodes", len(fwd), kept, len(info))
-	} else {
-		log.Printf("[pool] updated: %d forwarding proxies, %d proxyip (info-only) nodes", len(fwd), len(info))
+	log.Printf("[pool] updated: %d known forwarding proxies total (+%d new, %d revived, %d newly unavailable this cycle), %d proxyip (info-only) nodes",
+		len(fwd), added, revived, failed, len(info))
+}
+
+// ClearUnavailable permanently removes nodes currently marked
+// Available=false from the pool - an explicit, user-triggered purge (e.g.
+// a dashboard button), never automatic. Returns the number removed.
+func (p *ProxyPool) ClearUnavailable() int {
+	p.mu.Lock()
+	kept := p.proxies[:0:0]
+	removed := 0
+	for _, px := range p.proxies {
+		if px.Available {
+			kept = append(kept, px)
+		} else {
+			removed++
+		}
 	}
+	p.proxies = kept
+	info := p.proxyIPNodes
+	cache := p.cache
+	p.mu.Unlock()
+	if cache != nil {
+		cache.save(kept, info, p.statsSnapshot())
+	}
+	log.Printf("[pool] cleared %d unavailable node(s), %d remaining", removed, len(kept))
+	return removed
 }
 
 func (p *ProxyPool) Size() int {
@@ -296,6 +360,26 @@ func (p *ProxyPool) Find(key string) (Proxy, bool) {
 	return Proxy{}, false
 }
 
+// UpdateGeo records an on-demand exit-IP/geo re-verification result for the
+// proxy matching key, so a stale label (from a proxy whose exit rotated
+// since the last scrape) self-heals as soon as someone checks it.
+func (p *ProxyPool) UpdateGeo(key, exitIP, country, city string, ipChanged bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.proxies {
+		if p.proxies[i].Key() == key {
+			p.proxies[i].ExitIP = exitIP
+			p.proxies[i].IPChanged = ipChanged
+			if country != "" {
+				p.proxies[i].Country = country
+				p.proxies[i].City = city
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateSpeed records an on-demand speed-test result for the proxy
 // matching key.
 func (p *ProxyPool) UpdateSpeed(key string, kbps float64) bool {
@@ -310,6 +394,16 @@ func (p *ProxyPool) UpdateSpeed(key string, kbps float64) bool {
 	return false
 }
 
+func filterAvailable(list []Proxy) []Proxy {
+	var out []Proxy
+	for _, px := range list {
+		if px.Available {
+			out = append(out, px)
+		}
+	}
+	return out
+}
+
 func containsFold(list []string, v string) bool {
 	for _, s := range list {
 		if strings.EqualFold(s, v) {
@@ -319,30 +413,20 @@ func containsFold(list []string, v string) bool {
 	return false
 }
 
-func containsKey(list []Proxy, key string) bool {
-	for _, px := range list {
-		if px.Key() == key {
-			return true
-		}
-	}
-	return false
-}
-
-func findByKey(list []Proxy, key string) (Proxy, bool) {
-	for _, px := range list {
-		if px.Key() == key {
-			return px, true
-		}
-	}
-	return Proxy{}, false
-}
-
 // resolveGroup filters all down to groupName's members and resolves its
 // strategy. Falls back to the full pool (sticky) for GroupAny, an empty
 // name, or a name that no longer maps to a configured group (e.g. a rule
 // pointing at a since-deleted group) - so a stale reference degrades
 // gracefully instead of blackholing traffic.
 func resolveGroup(all []Proxy, groupName string, groups []Group) ([]Proxy, string) {
+	// The pool keeps every node it's ever seen alive (Update never deletes -
+	// see its docstring), so prefer nodes currently marked Available for
+	// actual routing/selection; only fall back to the full (possibly-stale)
+	// list if that leaves nothing, so routing never blackholes just because
+	// everything happens to be unavailable this cycle.
+	if live := filterAvailable(all); len(live) > 0 {
+		all = live
+	}
 	if groupName == "" || groupName == GroupAny {
 		return all, StrategySticky
 	}

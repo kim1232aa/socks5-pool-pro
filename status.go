@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,8 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/api/nodes", s.handleNodes)
 	mux.HandleFunc("/api/nodes/switch", s.handleNodeSwitch)
 	mux.HandleFunc("/api/nodes/auto", s.handleNodeAuto)
+	mux.HandleFunc("/api/nodes/verify", s.handleNodeVerify)
+	mux.HandleFunc("/api/nodes/clear-unavailable", s.handleNodesClearUnavailable)
 	mux.HandleFunc("/api/nodes/speedtest", s.handleNodeSpeedtest)
 	mux.HandleFunc("/api/nodes/export", s.handleNodeExport)
 
@@ -63,7 +66,8 @@ type NodeView struct {
 	Score     float64 `json:"score"`
 	Successes int     `json:"successes"`
 	Failures  int     `json:"failures"`
-	Active    bool    `json:"active"` // this node is the ANY group's current upstream
+	Active    bool    `json:"active"`    // this node is the ANY group's current upstream
+	Available bool    `json:"available"` // false = last check failed; kept in the pool, hidden by default
 }
 
 type GroupView struct {
@@ -170,7 +174,8 @@ func nodeViewOf(px Proxy, activeAddr string) NodeView {
 		Country: px.Country, City: px.City, Source: px.SourceName,
 		ExitIP: px.ExitIP, IPChanged: px.IPChanged, Anonymity: px.Anonymity,
 		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
-		Active: activeAddr != "" && px.Addr() == activeAddr,
+		Active:    activeAddr != "" && px.Addr() == activeAddr,
+		Available: px.Available,
 	}
 }
 
@@ -287,6 +292,64 @@ func (s *StatusServer) handleNodeSwitch(w http.ResponseWriter, r *http.Request) 
 func (s *StatusServer) handleNodeAuto(w http.ResponseWriter, r *http.Request) {
 	s.pool.SetAuto(GroupAny)
 	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// handleNodesClearUnavailable is an explicit, user-triggered purge of nodes
+// currently marked unavailable. The pool never does this on its own (see
+// ProxyPool.Update) - it's only ever invoked by a dashboard button click.
+func (s *StatusServer) handleNodesClearUnavailable(w http.ResponseWriter, r *http.Request) {
+	n := s.pool.ClearUnavailable()
+	writeJSON(w, map[string]int{"removed": n})
+}
+
+// handleNodeVerify re-probes a node's real exit IP/geo RIGHT NOW (dialing
+// through the live tunnel, same as the periodic health check does), so the
+// dashboard can answer "is this node's country label still accurate, and
+// does it actually work" on demand instead of trusting a label that may be
+// up to one scrape cycle (-scrape-interval, default 20m) stale.
+func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Key string `json:"key"`
+	}
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	px, ok := s.pool.Find(in.Key)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("node not found: %s", in.Key))
+		return
+	}
+
+	const timeout = 10 * time.Second
+	prevExitIP, prevCountry := px.ExitIP, px.Country
+
+	reachable := checkGoogle(px, timeout)
+	exitIP := probeExitIP(px, timeout)
+	country, city := "", ""
+	if exitIP != "" {
+		country, city = LookupGeo(exitIP, timeout)
+		if country == "Unknown" {
+			country = ""
+		}
+	}
+	ipChanged := exitIP != "" && baselineExitIP != "" && exitIP != baselineExitIP
+
+	if exitIP != "" {
+		s.pool.UpdateGeo(in.Key, exitIP, country, city, ipChanged)
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"reachable":     reachable,
+		"exit_ip":       exitIP,
+		"country":       country,
+		"city":          city,
+		"ip_changed":    ipChanged,
+		"prev_exit_ip":  prevExitIP,
+		"prev_country":  prevCountry,
+		"label_matched": exitIP == "" || prevCountry == "" || strings.EqualFold(country, prevCountry),
+		"baseline_exit": baselineExitIP,
+	})
 }
 
 func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Request) {

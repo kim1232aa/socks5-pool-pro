@@ -54,7 +54,9 @@ tr:hover td{background:#1e293b55}
 .current-node .cn-addr{color:#4ade80;font-family:monospace;font-weight:bold;font-size:1rem}
 .current-node .cn-meta{color:#64748b;font-size:0.78rem;margin-left:6px}
 tr.active td{background:#14311f !important}
+tr.unavail{opacity:0.5}
 .badge-inuse{background:#065f46;color:#4ade80;padding:1px 7px;border-radius:4px;font-size:0.68rem;font-weight:bold}
+.badge-unavail{background:#3f1d1d;color:#fca5a5;padding:1px 7px;border-radius:4px;font-size:0.68rem;font-weight:bold}
 .exit-diff{color:#fbbf24}
 .table-scroll{overflow-x:auto}
 .filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
@@ -115,7 +117,7 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 
   <div id="group-cards-container" class="group-cards"></div>
 
-  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(穿过节点探测),不是节点自身 IP。"匿名"=高匿(elite,不暴露)/普通(anonymous,可被识别为代理)/透明(transparent,泄露你的真实IP)。"评分"综合成功率/延迟/速度。默认已开启剔除"假代理"(出口IP==本机出口的透明节点),用 -require-ip-change=false 关闭。点节点上的<b>"使用"</b>即把默认(ANY)出口<b>手动锁定</b>到该节点,后台自动轮换会暂停;点上方横幅的<b>"恢复自动轮换"</b>可解锁。</p>
+  <p class="note">"国家/城市"是<b>真实出口 IP</b> 的定位(穿过节点探测),不是节点自身 IP。"匿名"=高匿(elite,不暴露)/普通(anonymous,可被识别为代理)/透明(transparent,泄露你的真实IP)。"评分"综合成功率/延迟/速度。默认已开启剔除"假代理"(出口IP==本机出口的透明节点),用 -require-ip-change=false 关闭。点节点上的<b>"使用"</b>即把默认(ANY)出口<b>手动锁定</b>到该节点,后台自动轮换会暂停;点上方横幅的<b>"恢复自动轮换"</b>可解锁。<b>节点不会被自动删除</b>:每轮刷新只标记"可用/不可用",不可用的节点默认被"隐藏不可用"过滤掉但仍保留在池中,下次测活成功会自动恢复显示;要彻底删除不可用节点,点"清理不可用"手动确认。</p>
 
   <div class="filter-bar">
     <input id="f-text" placeholder="搜索 IP/地址..." oninput="onFilterChange()">
@@ -134,8 +136,10 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
       <option value="100000">全部</option>
     </select>
     <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="onFilterChange()"> 只看真正改IP的</label>
+    <label class="chk"><input type="checkbox" id="f-hide-unavail" checked onchange="onFilterChange()"> 隐藏不可用</label>
     <button class="btn-sm" onclick="exportNodes('csv')" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
     <button class="btn-sm" onclick="exportNodes('tme')" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
+    <button class="btn-sm danger" onclick="clearUnavailable()" title="彻底删除所有标记为不可用的节点(需手动确认,不会自动触发)">清理不可用</button>
     <span id="node-count" class="small"></span>
   </div>
 
@@ -369,6 +373,14 @@ function setAuto() {
   postJSON('/api/nodes/auto', {}, function(err){ if (err) { alert(err); } else { pollStatus(); } });
 }
 
+function clearUnavailable() {
+  if (!confirm('彻底删除所有标记为"不可用"的节点?这个操作不可撤销(可用节点不受影响)。')) return;
+  fetch('/api/nodes/clear-unavailable', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){ alert('已清理 ' + (j.removed||0) + ' 个不可用节点'); pollStatus(); })
+    .catch(function(err){ alert(String(err)); });
+}
+
 function applyNodeView() {
   var tbody = document.getElementById('node-tbody');
   if (!tbody) return;
@@ -382,13 +394,18 @@ function applyNodeView() {
   var fc = document.getElementById('f-country').value;
   var fp = document.getElementById('f-proto').value;
   var onlyChanged = document.getElementById('f-ipchanged').checked;
+  var hideUnavail = document.getElementById('f-hide-unavail').checked;
   var sort = document.getElementById('f-sort').value;
+
+  var unavailCount = 0;
+  allNodes.forEach(function(n){ if (n.available === false) unavailCount++; });
 
   var rows = allNodes.filter(function(n) {
     if (text && (n.addr + ' ' + (n.exit_ip||'')).toLowerCase().indexOf(text) < 0) return false;
     if (fc && n.country !== fc) return false;
     if (fp && n.protocol !== fp) return false;
     if (onlyChanged && !n.ip_changed) return false;
+    if (hideUnavail && n.available === false) return false;
     return true;
   });
 
@@ -410,9 +427,10 @@ function applyNodeView() {
   var pageRows = rows.slice(startIdx, startIdx + nodePageSize);
 
   if (countEl) {
-    countEl.textContent = total
+    var suffix = unavailCount ? (' (另有 ' + unavailCount + ' 个不可用' + (hideUnavail ? '已隐藏' : '') + ')') : '';
+    countEl.textContent = (total
       ? ('显示 ' + (startIdx + 1) + '-' + (startIdx + pageRows.length) + ' / 匹配 ' + total + ' / 共 ' + allNodes.length)
-      : ('匹配 0 / 共 ' + allNodes.length);
+      : ('匹配 0 / 共 ' + allNodes.length)) + suffix;
   }
 
   if (!allNodes.length) {
@@ -435,8 +453,8 @@ function applyNodeView() {
       var exitCell = exit
         ? '<span class="mono' + (exit !== nodeIP ? ' exit-diff' : '') + '">' + escapeHtml(exit) + '</span>'
         : '<span class="small">-</span>';
-      html += '<tr class="' + (n.active ? 'active' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
-        '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : '') + '</td>' +
+      html += '<tr class="' + (n.active ? 'active' : '') + (n.available === false ? ' unavail' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
+        '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.available === false ? '<span class="badge-unavail">不可用</span>' : '')) + '</td>' +
         '<td>' + protoBadge(n.protocol) + '</td>' +
         '<td class="mono">' + escapeHtml(n.addr) + '<span class="copy-btn" onclick="copyAddr(\'' + escapeHtml(n.addr) + '\',this)">复制</span></td>' +
         '<td>' + exitCell + '</td>' +
@@ -449,6 +467,7 @@ function applyNodeView() {
         '<td>' +
           '<button class="btn-sm" onclick="switchNode(this)">使用</button>' +
           '<button class="btn-sm" onclick="runSpeedtest(this)">测速</button>' +
+          '<button class="btn-sm" onclick="runVerify(this)" title="立即重新拨号,查看真实出口IP/国家是否和标签一致">验证</button>' +
         '</td></tr>';
     });
     tbody.innerHTML = html;
@@ -544,6 +563,29 @@ function runSpeedtest(btn) {
       var row = btn.closest('tr');
       var cell = row ? row.querySelector('.speed-cell') : null;
       if (cell) cell.textContent = Math.round(j.kbps) + ' kbps';
+    })
+    .catch(function(err) { btn.disabled = false; btn.textContent = orig; alert(String(err)); });
+}
+
+function runVerify(btn) {
+  var key = rowKey(btn);
+  btn.disabled = true;
+  var orig = btn.textContent;
+  btn.textContent = '验证中...';
+  fetch('/api/nodes/verify', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key:key})})
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      btn.disabled = false;
+      btn.textContent = orig;
+      if (!j.reachable) { alert('验证失败:节点当前无法连通(可能已失效)'); pollStatus(); return; }
+      var msg = '真实出口IP: ' + (j.exit_ip || '未知') + '\n国家: ' + (j.country || '未知');
+      if (!j.label_matched) {
+        msg += '\n\n⚠️ 与列表标签不符(之前记录: ' + (j.prev_country || '未知') + ' / ' + (j.prev_exit_ip || '未知') + ')\n已用最新结果刷新该节点标签。';
+      } else {
+        msg += '\n\n✅ 与列表标签一致。';
+      }
+      alert(msg);
+      pollStatus();
     })
     .catch(function(err) { btn.disabled = false; btn.textContent = orig; alert(String(err)); });
 }
