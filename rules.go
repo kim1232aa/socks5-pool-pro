@@ -174,6 +174,14 @@ func (cs *ConfigStore) SetDefaultGroup(group string) error {
 	if group == "" {
 		return fmt.Errorf("group is required")
 	}
+	// Same normalization AddRule applies - without it, a non-canonically-
+	// cased "country:jp" passed directly via the API wouldn't match
+	// parseCountryGroup's case-sensitive "COUNTRY:" prefix check, and the
+	// default route would silently fall back to the entire pool instead of
+	// the intended country.
+	if cc, ok := parseCountryGroup(group); ok {
+		group = countryGroupPrefix + strings.ToUpper(cc)
+	}
 	return cs.mutate(func(c *PoolConfig) error {
 		for i, r := range c.Rules {
 			if r.Type == RuleMatch {

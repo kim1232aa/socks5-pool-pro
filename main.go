@@ -193,12 +193,13 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 		candidates = candidates[:cfg.MaxCandidates]
 	}
 
-	checkedAddrs := make(map[string]bool, len(candidates))
-	for _, px := range candidates {
-		checkedAddrs[px.Addr()] = true
-	}
-	alive := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange)
-	pool.Update(alive, checkedAddrs)
+	// unreachable (from CheckProxies) is addresses that were actually dialed
+	// and genuinely failed to connect - as opposed to ones that connected
+	// fine but got excluded from alive for a policy reason (transparent
+	// proxy, blocked country). Only genuine connectivity failures should
+	// flip a previously-known-good node to Available=false.
+	alive, unreachable := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange)
+	pool.Update(alive, unreachable)
 
 	scrapeMu.Lock()
 	lastScrapeTime = time.Now()

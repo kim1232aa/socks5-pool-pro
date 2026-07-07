@@ -246,6 +246,10 @@ func (cs *ConfigStore) AddSource(s Source) (Source, error) {
 	}
 	switch s.Format {
 	case FormatTextRegex, FormatEDTJSON, FormatProxyIPJSON:
+	case FormatPlainList, FormatJSONArray:
+		if s.Protocol == "" {
+			return Source{}, fmt.Errorf("protocol is required for format %q", s.Format)
+		}
 	default:
 		return Source{}, fmt.Errorf("unknown format: %q", s.Format)
 	}

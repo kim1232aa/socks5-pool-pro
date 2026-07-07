@@ -114,14 +114,43 @@ func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error
 		return nil, err
 	}
 
-	resp := make([]byte, 256)
-	n, err := conn.Read(resp)
-	if err != nil || n < 2 || resp[1] != 0x00 {
+	// The CONNECT reply is VER,REP,RSV,ATYP,BND.ADDR,BND.PORT - its total
+	// length depends on ATYP, and a single conn.Read can legitimately
+	// return the message split across multiple reads (TCP gives no
+	// message-boundary guarantee). Read exactly the fixed 4-byte header
+	// first, then exactly as many address+port bytes as ATYP specifies, so
+	// no trailing reply bytes are ever left unread in the socket buffer to
+	// corrupt the tunnel once relaying starts.
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
 		conn.Close()
-		if err != nil {
+		return nil, err
+	}
+	if header[1] != 0x00 {
+		conn.Close()
+		return nil, fmt.Errorf("upstream connect failed, status: %d", header[1])
+	}
+
+	var addrLen int
+	switch header[3] {
+	case atypIPv4:
+		addrLen = net.IPv4len
+	case atypIPv6:
+		addrLen = net.IPv6len
+	case atypDomain:
+		lenByte := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenByte); err != nil {
+			conn.Close()
 			return nil, err
 		}
-		return nil, fmt.Errorf("upstream connect failed, status: %d", resp[1])
+		addrLen = int(lenByte[0])
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("upstream connect reply: unknown address type %d", header[3])
+	}
+	if _, err := io.ReadFull(conn, make([]byte, addrLen+2)); err != nil { // +2 for BND.PORT
+		conn.Close()
+		return nil, err
 	}
 
 	conn.SetDeadline(time.Time{})
@@ -152,7 +181,14 @@ func dialHTTPConnect(px Proxy, target string, timeout time.Duration) (net.Conn, 
 		return nil, err
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	// bufio.NewReader may read (and buffer) more from conn than just the
+	// HTTP response headers in one underlying Read - if the upstream
+	// pipelines the first bytes of the tunneled stream right after its
+	// response, those bytes end up sitting in this reader's internal
+	// buffer. Returning bare `conn` afterward would silently drop them.
+	// bufConn keeps draining br first, so nothing already-buffered is lost.
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -164,5 +200,18 @@ func dialHTTPConnect(px Proxy, target string, timeout time.Duration) (net.Conn, 
 	}
 
 	conn.SetDeadline(time.Time{})
-	return conn, nil
+	return &bufConn{Conn: conn, r: br}, nil
+}
+
+// bufConn is a net.Conn whose reads are served from a bufio.Reader first -
+// used so bytes already buffered while parsing a preceding protocol
+// exchange on the same connection (e.g. the HTTP CONNECT response) aren't
+// lost when the raw conn is handed off to a caller that reads it directly.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufConn) Read(p []byte) (int, error) {
+	return b.r.Read(p)
 }

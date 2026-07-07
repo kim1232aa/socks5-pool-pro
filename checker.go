@@ -32,14 +32,26 @@ var blockedCountries = map[string]bool{
 // that pass. Doing geo up-front on every candidate (often thousands) would
 // blow straight through ip-api.com's ~45 req/min free-tier limit, and the
 // 429 responses used to get misparsed into garbage "country" values.
-func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool) []Proxy {
+//
+// The second return value, unreachable, is the set of addresses (Proxy.Addr())
+// that were actually dialed and genuinely failed to connect - as opposed to
+// ones that connected fine but got excluded from alive for a policy reason
+// (transparent proxy dropped by requireIPChange, or a blocked-country geo).
+// Callers use this distinction to avoid marking a perfectly reachable, just
+// policy-filtered node as "unavailable" (see ProxyPool.Update).
+func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool) (alive []Proxy, unreachable map[string]bool) {
 	var (
 		mu      sync.Mutex
-		alive   []Proxy
 		dropped int // transparent proxies filtered by requireIPChange
 		wg      sync.WaitGroup
 		sem     = make(chan struct{}, maxConcurrent)
 	)
+	unreachable = make(map[string]bool, len(proxies))
+	markUnreachable := func(addr string) {
+		mu.Lock()
+		unreachable[addr] = true
+		mu.Unlock()
+	}
 
 	for _, p := range proxies {
 		wg.Add(1)
@@ -54,6 +66,7 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 				// proxyip nodes don't forward, so there's no "exit" to
 				// probe; just prove reachability and trust source geo.
 				if !checkReachable(px, timeout) {
+					markUnreachable(px.Addr())
 					return
 				}
 				px.LatencyMs = time.Since(start).Milliseconds()
@@ -61,6 +74,7 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 				// Connectivity check uses a rate-limit-free endpoint so
 				// aliveness never depends on the geo service being up.
 				if !checkGoogle(px, timeout) {
+					markUnreachable(px.Addr())
 					return
 				}
 				px.LatencyMs = time.Since(start).Milliseconds()
@@ -76,7 +90,9 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 				// Drop transparent proxies that don't actually change the
 				// exit IP - but only when we can positively tell (we have
 				// both a baseline and a measured exit that match). Unknown
-				// exits are kept rather than falsely dropped.
+				// exits are kept rather than falsely dropped. This is a
+				// policy exclusion, not a connectivity failure - the node
+				// genuinely answered - so it does NOT go into unreachable.
 				if requireIPChange && baselineExitIP != "" && px.ExitIP != "" && !px.IPChanged {
 					mu.Lock()
 					dropped++
@@ -99,6 +115,7 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 			}
 
 			if blockedCountries[strings.ToLower(px.Country)] {
+				// Also a policy exclusion, not a connectivity failure.
 				return
 			}
 
@@ -112,7 +129,7 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 	if dropped > 0 {
 		log.Printf("[checker] dropped %d transparent proxies (exit IP == our own egress %s; disable with -require-ip-change=false)", dropped, baselineExitIP)
 	}
-	return alive
+	return alive, unreachable
 }
 
 // checkGoogle verifies a forwarding-capable proxy by fetching Google's

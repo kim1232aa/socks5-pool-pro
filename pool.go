@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -68,12 +69,19 @@ type groupCursor struct {
 const countryGroupPrefix = "COUNTRY:"
 
 // parseCountryGroup returns the ISO country code of a "COUNTRY:XX" dynamic
-// group target, or ok=false for any other group name.
+// group target, or ok=false for any other group name. The prefix match is
+// case-insensitive - AddRule/SetDefaultGroup rely on this to recognize and
+// canonicalize any casing a caller submits (e.g. a direct API call with
+// "country:us"), and resolveGroup relies on it to recognize whatever ended
+// up persisted. A case-sensitive check here would make those callers'
+// upper-casing normalization never even fire for a fully-lowercase input,
+// since it's gated on this function returning ok=true in the first place.
 func parseCountryGroup(name string) (code string, ok bool) {
-	if strings.HasPrefix(name, countryGroupPrefix) {
-		if cc := strings.TrimSpace(strings.TrimPrefix(name, countryGroupPrefix)); cc != "" {
-			return cc, true
-		}
+	if len(name) < len(countryGroupPrefix) || !strings.EqualFold(name[:len(countryGroupPrefix)], countryGroupPrefix) {
+		return "", false
+	}
+	if cc := strings.TrimSpace(name[len(countryGroupPrefix):]); cc != "" {
+		return cc, true
 	}
 	return "", false
 }
@@ -165,17 +173,26 @@ func (p *ProxyPool) StatsOf(key string) (successes, failures int) {
 	return 0, 0
 }
 
+// mutateProxy finds the node matching key and applies fn to it in place.
+// Caller must hold p.mu. Shared by every "look up one node by Key() and
+// change one field" operation (UpdateLatency/SetAvailable/UpdateGeo/
+// UpdateSpeed) so the lock+scan logic exists in exactly one place.
+func (p *ProxyPool) mutateProxyLocked(key string, fn func(*Proxy)) bool {
+	for i := range p.proxies {
+		if p.proxies[i].Key() == key {
+			fn(&p.proxies[i])
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateLatency refreshes a live node's measured latency (from a
 // background re-check) so latency/score strategies stay current.
 func (p *ProxyPool) UpdateLatency(key string, latencyMs int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := range p.proxies {
-		if p.proxies[i].Key() == key {
-			p.proxies[i].LatencyMs = latencyMs
-			break
-		}
-	}
+	p.mutateProxyLocked(key, func(px *Proxy) { px.LatencyMs = latencyMs })
 }
 
 // SetAvailable flips a node's Available flag from the lightweight periodic
@@ -185,12 +202,7 @@ func (p *ProxyPool) UpdateLatency(key string, latencyMs int64) {
 func (p *ProxyPool) SetAvailable(key string, available bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := range p.proxies {
-		if p.proxies[i].Key() == key {
-			p.proxies[i].Available = available
-			break
-		}
-	}
+	p.mutateProxyLocked(key, func(px *Proxy) { px.Available = available })
 }
 
 // statsSnapshot / restoreStats support persisting scores across restarts.
@@ -235,11 +247,14 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 // (ip:port, matching dedupeByAddr's identity) and are never dropped here:
 //   - an address present in freshlyAlive gets its data replaced wholesale
 //     and is marked Available=true (found alive this cycle).
-//   - an address in checkedAddrs but NOT in freshlyAlive was tested and
-//     failed, so it's marked Available=false but stays in the pool.
+//   - an address in failedAddrs (dialed and genuinely failed to connect -
+//     see CheckProxies) is marked Available=false but stays in the pool.
+//     A node that was dialed successfully but excluded from freshlyAlive for
+//     a policy reason (transparent proxy, blocked country) is neither here
+//     nor in freshlyAlive, so it's left untouched by the next branch.
 //   - an address in neither (skipped this cycle by random candidate
-//     sampling, or never re-scraped) is left completely untouched,
-//     including its previous Available value.
+//     sampling, never re-scraped, or excluded for policy) is left
+//     completely untouched, including its previous Available value.
 //
 // This means the known-node list only grows (or self-heals a node back to
 // Available=true) - hiding currently-dead nodes is left to the dashboard
@@ -249,7 +264,7 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 // Per-group cursors are left as-is; Pick re-anchors automatically against
 // whatever is present in the new list. The merged pool is persisted to the
 // cache (if enabled) for fast recovery on restart.
-func (p *ProxyPool) Update(freshlyAlive []Proxy, checkedAddrs map[string]bool) {
+func (p *ProxyPool) Update(freshlyAlive []Proxy, failedAddrs map[string]bool) {
 	var freshFwd, info []Proxy
 	for _, px := range freshlyAlive {
 		if px.Protocol == "proxyip" {
@@ -258,10 +273,6 @@ func (p *ProxyPool) Update(freshlyAlive []Proxy, checkedAddrs map[string]bool) {
 			px.Available = true
 			freshFwd = append(freshFwd, px)
 		}
-	}
-	freshAddrs := make(map[string]bool, len(freshFwd))
-	for _, px := range freshFwd {
-		freshAddrs[px.Addr()] = true
 	}
 
 	p.mu.Lock()
@@ -279,7 +290,7 @@ func (p *ProxyPool) Update(freshlyAlive []Proxy, checkedAddrs map[string]bool) {
 		merged[px.Addr()] = px
 	}
 	for addr, existing := range merged {
-		if checkedAddrs[addr] && !freshAddrs[addr] && existing.Available {
+		if failedAddrs[addr] && existing.Available {
 			existing.Available = false
 			merged[addr] = existing
 			failed++
@@ -290,6 +301,15 @@ func (p *ProxyPool) Update(freshlyAlive []Proxy, checkedAddrs map[string]bool) {
 	for _, px := range merged {
 		fwd = append(fwd, px)
 	}
+	// Go randomizes map iteration order, so without this the merged slice
+	// would be reshuffled into an unrelated random permutation on every
+	// call - breaking RotateSticky's array-adjacency "next node" rotation
+	// (it would stop being a rotation at all) and making pick()/bestBy's
+	// candidates[0] fallback change for no reason other than map reordering.
+	// Sorting by address gives a stable, reproducible order: existing nodes
+	// keep their relative position across cycles, new nodes are inserted at
+	// their sorted slot instead of a random one.
+	sort.Slice(fwd, func(i, j int) bool { return fwd[i].Addr() < fwd[j].Addr() })
 	p.proxies = fwd
 	p.proxyIPNodes = info
 	cache := p.cache
@@ -366,18 +386,14 @@ func (p *ProxyPool) Find(key string) (Proxy, bool) {
 func (p *ProxyPool) UpdateGeo(key, exitIP, country, city string, ipChanged bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := range p.proxies {
-		if p.proxies[i].Key() == key {
-			p.proxies[i].ExitIP = exitIP
-			p.proxies[i].IPChanged = ipChanged
-			if country != "" {
-				p.proxies[i].Country = country
-				p.proxies[i].City = city
-			}
-			return true
+	return p.mutateProxyLocked(key, func(px *Proxy) {
+		px.ExitIP = exitIP
+		px.IPChanged = ipChanged
+		if country != "" {
+			px.Country = country
+			px.City = city
 		}
-	}
-	return false
+	})
 }
 
 // UpdateSpeed records an on-demand speed-test result for the proxy
@@ -385,13 +401,7 @@ func (p *ProxyPool) UpdateGeo(key, exitIP, country, city string, ipChanged bool)
 func (p *ProxyPool) UpdateSpeed(key string, kbps float64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := range p.proxies {
-		if p.proxies[i].Key() == key {
-			p.proxies[i].SpeedKbps = kbps
-			return true
-		}
-	}
-	return false
+	return p.mutateProxyLocked(key, func(px *Proxy) { px.SpeedKbps = kbps })
 }
 
 func filterAvailable(list []Proxy) []Proxy {
@@ -414,19 +424,34 @@ func containsFold(list []string, v string) bool {
 }
 
 // resolveGroup filters all down to groupName's members and resolves its
-// strategy. Falls back to the full pool (sticky) for GroupAny, an empty
-// name, or a name that no longer maps to a configured group (e.g. a rule
-// pointing at a since-deleted group) - so a stale reference degrades
-// gracefully instead of blackholing traffic.
+// strategy, then prefers members currently marked Available. Falls back to
+// the full pool (sticky) for GroupAny, an empty name, or a name that no
+// longer maps to a configured group (e.g. a rule pointing at a
+// since-deleted group) - so a stale reference degrades gracefully instead
+// of blackholing traffic.
 func resolveGroup(all []Proxy, groupName string, groups []Group) ([]Proxy, string) {
+	out, strategy := resolveGroupCandidates(all, groupName, groups)
 	// The pool keeps every node it's ever seen alive (Update never deletes -
 	// see its docstring), so prefer nodes currently marked Available for
-	// actual routing/selection; only fall back to the full (possibly-stale)
-	// list if that leaves nothing, so routing never blackholes just because
-	// everything happens to be unavailable this cycle.
-	if live := filterAvailable(all); len(live) > 0 {
-		all = live
+	// actual routing/selection. This is applied to THIS group's already-
+	// narrowed candidate set, not the whole pool - otherwise a narrowly
+	// scoped group (e.g. pinned to one exact node via Group.Nodes) could be
+	// starved to zero candidates just because *unrelated* nodes elsewhere in
+	// the pool happen to be available, even though its own wanted (but
+	// transiently unavailable) node still exists. Only fall back to the
+	// full (possibly-stale) set if nothing in it is currently available, so
+	// routing never blackholes just because everything happens to be
+	// unavailable this cycle.
+	if live := filterAvailable(out); len(live) > 0 {
+		out = live
 	}
+	return out, strategy
+}
+
+// resolveGroupCandidates does the actual group-membership filtering
+// (GroupAny / COUNTRY:xx / named Group), before any Available preference is
+// applied by resolveGroup.
+func resolveGroupCandidates(all []Proxy, groupName string, groups []Group) ([]Proxy, string) {
 	if groupName == "" || groupName == GroupAny {
 		return all, StrategySticky
 	}
@@ -526,11 +551,24 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 		chosen = bestBy(candidates, p.scoreLocked, true)
 	default: // sticky
 		chosen = candidates[0]
+		found := false
 		for _, c := range candidates {
 			if c.Key() == gc.stickyKey {
 				chosen = c
+				found = true
 				break
 			}
+		}
+		if !found && gc.pinned {
+			// The manually-locked node isn't a viable candidate for THIS
+			// pick (excluded by a retry, marked unavailable, or
+			// reclassified to a different Key()) - fall back to some
+			// candidate for this one pick only, but do NOT persist that as
+			// the new pin. Leaving stickyKey untouched means the lock
+			// self-heals the moment the pinned node is viable again,
+			// instead of silently and permanently drifting to whatever
+			// candidates[0] happened to be this time.
+			break
 		}
 		gc.stickyKey = chosen.Key()
 	}

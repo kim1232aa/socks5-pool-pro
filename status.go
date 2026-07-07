@@ -18,6 +18,25 @@ func NewStatusServer(pool *ProxyPool, store *ConfigStore) *StatusServer {
 	return &StatusServer{pool: pool, store: store}
 }
 
+// requirePost rejects any request that isn't a POST with 405, before the
+// wrapped handler runs. Applied to every state-mutating single-purpose
+// endpoint below - without it, a plain GET (e.g. from a link-preview bot,
+// browser prefetch, or an accidentally-bookmarked URL) could trigger a
+// destructive action like clearing nodes or overwriting routing rules.
+// Endpoints that already switch on r.Method themselves (handleSources/
+// handleRules/handleGroups, which serve GET+POST from one path) and
+// intentionally-GET endpoints (handleRefresh, handleNodeExport - both
+// triggered via plain navigation/fetch from the dashboard) are not wrapped.
+func requirePost(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
+
 func (s *StatusServer) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
@@ -25,26 +44,26 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 
 	mux.HandleFunc("/api/nodes", s.handleNodes)
-	mux.HandleFunc("/api/nodes/switch", s.handleNodeSwitch)
-	mux.HandleFunc("/api/nodes/auto", s.handleNodeAuto)
-	mux.HandleFunc("/api/nodes/verify", s.handleNodeVerify)
-	mux.HandleFunc("/api/nodes/clear-unavailable", s.handleNodesClearUnavailable)
-	mux.HandleFunc("/api/nodes/speedtest", s.handleNodeSpeedtest)
+	mux.HandleFunc("/api/nodes/switch", requirePost(s.handleNodeSwitch))
+	mux.HandleFunc("/api/nodes/auto", requirePost(s.handleNodeAuto))
+	mux.HandleFunc("/api/nodes/verify", requirePost(s.handleNodeVerify))
+	mux.HandleFunc("/api/nodes/clear-unavailable", requirePost(s.handleNodesClearUnavailable))
+	mux.HandleFunc("/api/nodes/speedtest", requirePost(s.handleNodeSpeedtest))
 	mux.HandleFunc("/api/nodes/export", s.handleNodeExport)
 
 	mux.HandleFunc("/api/sources", s.handleSources)
-	mux.HandleFunc("/api/sources/toggle", s.handleSourceToggle)
-	mux.HandleFunc("/api/sources/delete", s.handleSourceDelete)
+	mux.HandleFunc("/api/sources/toggle", requirePost(s.handleSourceToggle))
+	mux.HandleFunc("/api/sources/delete", requirePost(s.handleSourceDelete))
 
 	mux.HandleFunc("/api/rules", s.handleRules)
-	mux.HandleFunc("/api/rules/delete", s.handleRuleDelete)
-	mux.HandleFunc("/api/rules/move", s.handleRuleMove)
-	mux.HandleFunc("/api/rules/default", s.handleRuleDefault)
-	mux.HandleFunc("/api/rules/preset-gfw", s.handleRulePresetGFW)
+	mux.HandleFunc("/api/rules/delete", requirePost(s.handleRuleDelete))
+	mux.HandleFunc("/api/rules/move", requirePost(s.handleRuleMove))
+	mux.HandleFunc("/api/rules/default", requirePost(s.handleRuleDefault))
+	mux.HandleFunc("/api/rules/preset-gfw", requirePost(s.handleRulePresetGFW))
 
 	mux.HandleFunc("/api/groups", s.handleGroups)
-	mux.HandleFunc("/api/groups/strategy", s.handleGroupStrategy)
-	mux.HandleFunc("/api/groups/delete", s.handleGroupDelete)
+	mux.HandleFunc("/api/groups/strategy", requirePost(s.handleGroupStrategy))
+	mux.HandleFunc("/api/groups/delete", requirePost(s.handleGroupDelete))
 
 	return http.ListenAndServe(addr, mux)
 }

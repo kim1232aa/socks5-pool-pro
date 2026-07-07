@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -49,8 +50,11 @@ func (s *Server) Start() error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// 1. SOCKS5 handshake - read greeting
-	buf := make([]byte, 256)
+	// 1. SOCKS5 handshake - read greeting. Sized to fit the largest legal
+	// message reused below: a domain-based CONNECT request can be up to
+	// 4+1+255+2=262 bytes (VER/CMD/RSV/ATYP + domain-length byte + a
+	// maximal 255-byte domain + port).
+	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
 	if err != nil || n < 2 || buf[0] != socks5Version {
 		return
@@ -183,7 +187,11 @@ func parseTarget(buf []byte) (string, error) {
 	}
 
 	port := int(buf[portOffset])<<8 | int(buf[portOffset+1])
-	return fmt.Sprintf("%s:%d", host, port), nil
+	// net.JoinHostPort brackets IPv6 literals (e.g. "[::1]:443"); plain
+	// fmt.Sprintf("%s:%d", ...) does not, which made net.SplitHostPort
+	// reject every IPv6 target downstream in handleConn ("too many colons
+	// in address"), so ATYP=IPv6 CONNECT requests always failed.
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 // relay copies data bidirectionally between two connections.
@@ -202,5 +210,11 @@ func relay(left, right net.Conn) {
 
 	go cp(left, right)
 	go cp(right, left)
+	// Wait for BOTH directions to finish before closing either connection -
+	// waiting for only one (the previous behavior) meant whichever
+	// direction happened to finish first (e.g. a client that half-closes
+	// after sending its request) triggered an immediate full close of both
+	// connections, truncating the other direction's still-in-flight data.
+	<-done
 	<-done
 }
