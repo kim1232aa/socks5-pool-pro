@@ -383,7 +383,7 @@ func (p *ProxyPool) Find(key string) (Proxy, bool) {
 // UpdateGeo records an on-demand exit-IP/geo re-verification result for the
 // proxy matching key, so a stale label (from a proxy whose exit rotated
 // since the last scrape) self-heals as soon as someone checks it.
-func (p *ProxyPool) UpdateGeo(key, exitIP, country, city string, ipChanged bool) bool {
+func (p *ProxyPool) UpdateGeo(key, exitIP, country, city, continent string, ipChanged bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.mutateProxyLocked(key, func(px *Proxy) {
@@ -392,6 +392,7 @@ func (p *ProxyPool) UpdateGeo(key, exitIP, country, city string, ipChanged bool)
 		if country != "" {
 			px.Country = country
 			px.City = city
+			px.Continent = continent
 		}
 	})
 }

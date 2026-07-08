@@ -21,6 +21,10 @@ type Proxy struct {
 
 	Country string
 	City    string
+	// Continent is the ISO-ish continent code (AS/NA/EU/AF/SA/OC/AN) of
+	// Country, from the same LookupGeo call - used to group the dashboard's
+	// country filter by continent, the way EDT-Pages' own panel does.
+	Continent string
 
 	// SourceName identifies which configured Source produced this entry.
 	SourceName string

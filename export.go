@@ -77,7 +77,7 @@ func exportCSV(w http.ResponseWriter, nodes []exportNode) {
 
 	cw.Write([]string{
 		"协议", "地址", "IP", "端口", "用户名", "密码",
-		"出口IP", "是否改IP", "匿名", "国家", "城市",
+		"出口IP", "是否改IP", "匿名", "大洲", "国家", "城市",
 		"评分", "延迟ms", "速度kbps", "成功", "失败", "来源", "t.me链接",
 	})
 
@@ -100,7 +100,7 @@ func exportCSV(w http.ResponseWriter, nodes []exportNode) {
 		}
 		cw.Write([]string{
 			n.Protocol, n.Addr(), n.IP, n.Port, n.Username, n.Password,
-			n.ExitIP, changed, anon, n.Country, n.City,
+			n.ExitIP, changed, anon, n.Continent, n.Country, n.City,
 			strconv.FormatFloat(n.Score, 'f', 1, 64), latency, speed,
 			strconv.Itoa(n.Successes), strconv.Itoa(n.Failures),
 			n.SourceName, tmeLink(n.Proxy),

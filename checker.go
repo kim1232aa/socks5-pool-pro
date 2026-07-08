@@ -101,14 +101,15 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 				}
 
 				if px.ExitIP != "" {
-					if c, ci := LookupGeo(px.ExitIP, timeout); c != "" && c != "Unknown" {
-						px.Country, px.City = c, ci
+					if c, ci, co := LookupGeo(px.ExitIP, timeout); c != "" && c != "Unknown" {
+						px.Country, px.City, px.Continent = c, ci, co
 					}
 				}
 				if px.Country == "" {
-					c, ci := LookupGeo(px.IP, timeout)
+					c, ci, co := LookupGeo(px.IP, timeout)
 					px.Country = strings.TrimSpace(c)
 					px.City = strings.TrimSpace(ci)
+					px.Continent = strings.TrimSpace(co)
 				}
 
 				px.Anonymity = probeAnonymity(px, timeout)
@@ -286,31 +287,34 @@ func checkReachable(px Proxy, timeout time.Duration) bool {
 }
 
 // LookupGeo queries ip-api.com for IP geolocation, returning the ISO
-// country code (e.g. "US") and city. Only called for nodes that passed
-// the connectivity check and whose source didn't already supply geo.
+// country code (e.g. "US"), city, and continent code (e.g. "NA" - one of
+// the standard AS/NA/EU/AF/SA/OC/AN codes, the same scheme used by the
+// EDT-Pages source feeds). Only called for nodes that passed the
+// connectivity check and whose source didn't already supply geo.
 //
 // It validates the HTTP status and the JSON "status" field, returning
 // "Unknown" on any error or rate-limit (429). Returning the ISO code
 // keeps country values consistent with the source feeds (EDT/ProxyIP also
 // use codes), so country-filtered groups match regardless of source.
-func LookupGeo(ip string, timeout time.Duration) (country, city string) {
+func LookupGeo(ip string, timeout time.Duration) (country, city, continent string) {
 	client := &http.Client{Timeout: timeout}
-	resp, err := client.Get("http://ip-api.com/json/" + ip + "?fields=status,countryCode,city")
+	resp, err := client.Get("http://ip-api.com/json/" + ip + "?fields=status,countryCode,city,continentCode")
 	if err != nil {
-		return "Unknown", ""
+		return "Unknown", "", ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "Unknown", "" // typically 429 rate-limited
+		return "Unknown", "", "" // typically 429 rate-limited
 	}
 
 	var r struct {
-		Status      string `json:"status"`
-		CountryCode string `json:"countryCode"`
-		City        string `json:"city"`
+		Status        string `json:"status"`
+		CountryCode   string `json:"countryCode"`
+		City          string `json:"city"`
+		ContinentCode string `json:"continentCode"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil || r.Status != "success" || r.CountryCode == "" {
-		return "Unknown", ""
+		return "Unknown", "", ""
 	}
-	return r.CountryCode, r.City
+	return r.CountryCode, r.City, r.ContinentCode
 }

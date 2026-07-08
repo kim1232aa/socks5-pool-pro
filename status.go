@@ -76,6 +76,7 @@ type NodeView struct {
 	Protocol  string  `json:"protocol"`
 	Country   string  `json:"country"`
 	City      string  `json:"city"`
+	Continent string  `json:"continent"` // AS/NA/EU/AF/SA/OC/AN - groups the dashboard's country filter
 	Source    string  `json:"source"`
 	ExitIP    string  `json:"exit_ip"`
 	IPChanged bool    `json:"ip_changed"`
@@ -190,7 +191,7 @@ type DashboardData struct {
 func nodeViewOf(px Proxy, activeAddr string) NodeView {
 	return NodeView{
 		Key: px.Key(), Addr: px.Addr(), Protocol: px.Protocol,
-		Country: px.Country, City: px.City, Source: px.SourceName,
+		Country: px.Country, City: px.City, Continent: px.Continent, Source: px.SourceName,
 		ExitIP: px.ExitIP, IPChanged: px.IPChanged, Anonymity: px.Anonymity,
 		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
 		Active:    activeAddr != "" && px.Addr() == activeAddr,
@@ -345,9 +346,9 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 
 	reachable := checkGoogle(px, timeout)
 	exitIP := probeExitIP(px, timeout)
-	country, city := "", ""
+	country, city, continent := "", "", ""
 	if exitIP != "" {
-		country, city = LookupGeo(exitIP, timeout)
+		country, city, continent = LookupGeo(exitIP, timeout)
 		if country == "Unknown" {
 			country = ""
 		}
@@ -355,7 +356,7 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	ipChanged := exitIP != "" && baselineExitIP != "" && exitIP != baselineExitIP
 
 	if exitIP != "" {
-		s.pool.UpdateGeo(in.Key, exitIP, country, city, ipChanged)
+		s.pool.UpdateGeo(in.Key, exitIP, country, city, continent, ipChanged)
 	}
 
 	writeJSON(w, map[string]interface{}{

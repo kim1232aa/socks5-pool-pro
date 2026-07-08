@@ -318,19 +318,119 @@ var nodePage = 1;
 var nodePageSize = 20;
 var anyPinned = false;
 
+// flagEmoji converts a 2-letter ISO country code to its flag emoji via the
+// regional-indicator-symbol algorithm (each letter maps to U+1F1E6 plus its
+// offset from 'A') - no per-country lookup table needed, works for any
+// valid ISO 3166-1 alpha-2 code. Same trick EDT-Pages' own admin panel
+// effectively achieves via a static country_emoji field in its data feed;
+// computing it means we don't depend on that field being present.
+function flagEmoji(cc) {
+  if (!cc || cc.length !== 2) return '🏳️';
+  var upper = cc.toUpperCase();
+  var c0 = upper.charCodeAt(0), c1 = upper.charCodeAt(1);
+  if (c0 < 65 || c0 > 90 || c1 < 65 || c1 > 90) return '🏳️';
+  return String.fromCodePoint(0x1F1E6 + (c0 - 65), 0x1F1E6 + (c1 - 65));
+}
+
+// continentInfo maps ip-api.com's continentCode (AS/NA/EU/AF/SA/OC/AN,
+// stamped on every node's .continent by the same LookupGeo call that sets
+// .country) to a display emoji+name - the same 7-continent scheme
+// EDT-Pages' own admin panel groups its region picker by.
+var continentInfo = {
+  AS: { emoji: '🌏', name: '亚洲' },
+  NA: { emoji: '🌎', name: '北美' },
+  EU: { emoji: '🌍', name: '欧洲' },
+  AF: { emoji: '🌍', name: '非洲' },
+  SA: { emoji: '🌎', name: '南美' },
+  OC: { emoji: '🌏', name: '大洋洲' },
+  AN: { emoji: '❄️', name: '南极洲' }
+};
+var continentOrder = ['AS', 'EU', 'NA', 'SA', 'OC', 'AF', 'AN', ''];
+
+// countryToContinent is a static ISO 3166-1 alpha-2 -> continent-code
+// fallback, used only when a node's .continent is empty (its Country came
+// straight from a source feed like EDT-Pages/ProxyIP, which supplies a
+// country but not a continent, so it never went through our own LookupGeo
+// call). Covers the UN member states plus common territories; anything
+// missing just falls into the "未知地区" group instead of erroring.
+var countryToContinent = {
+  // Asia
+  CN:'AS',HK:'AS',MO:'AS',TW:'AS',JP:'AS',KR:'AS',KP:'AS',MN:'AS',
+  IN:'AS',PK:'AS',BD:'AS',LK:'AS',NP:'AS',BT:'AS',MV:'AS',
+  ID:'AS',MY:'AS',SG:'AS',TH:'AS',VN:'AS',PH:'AS',MM:'AS',KH:'AS',LA:'AS',BN:'AS',TL:'AS',
+  SA:'AS',AE:'AS',IL:'AS',IQ:'AS',IR:'AS',JO:'AS',KW:'AS',LB:'AS',OM:'AS',PS:'AS',QA:'AS',SY:'AS',YE:'AS',BH:'AS',TR:'AS',
+  KZ:'AS',KG:'AS',TJ:'AS',TM:'AS',UZ:'AS',AF:'AS',AM:'AS',AZ:'AS',GE:'AS',CY:'AS',
+  // Europe
+  GB:'EU',IE:'EU',FR:'EU',DE:'EU',NL:'EU',BE:'EU',LU:'EU',CH:'EU',AT:'EU',
+  ES:'EU',PT:'EU',IT:'EU',MT:'EU',SM:'EU',VA:'EU',AD:'EU',MC:'EU',
+  PL:'EU',CZ:'EU',SK:'EU',HU:'EU',RO:'EU',BG:'EU',SI:'EU',HR:'EU',BA:'EU',RS:'EU',ME:'EU',MK:'EU',AL:'EU',XK:'EU',
+  DK:'EU',SE:'EU',NO:'EU',FI:'EU',IS:'EU',EE:'EU',LV:'EU',LT:'EU',
+  RU:'EU',UA:'EU',BY:'EU',MD:'EU',GR:'EU',LI:'EU',
+  // North America (incl. Central America & Caribbean)
+  US:'NA',CA:'NA',MX:'NA',GT:'NA',BZ:'NA',SV:'NA',HN:'NA',NI:'NA',CR:'NA',PA:'NA',
+  CU:'NA',JM:'NA',HT:'NA',DO:'NA',BS:'NA',BB:'NA',TT:'NA',GD:'NA',LC:'NA',VC:'NA',AG:'NA',DM:'NA',KN:'NA',
+  PR:'NA',
+  // South America
+  BR:'SA',AR:'SA',CL:'SA',CO:'SA',PE:'SA',VE:'SA',EC:'SA',BO:'SA',PY:'SA',UY:'SA',GY:'SA',SR:'SA',
+  // Africa
+  EG:'AF',LY:'AF',TN:'AF',DZ:'AF',MA:'AF',SD:'AF',SS:'AF',
+  NG:'AF',GH:'AF',CI:'AF',SN:'AF',ML:'AF',BF:'AF',NE:'AF',TD:'AF',TG:'AF',BJ:'AF',GN:'AF',SL:'AF',LR:'AF',GM:'AF',GW:'AF',MR:'AF',CV:'AF',
+  KE:'AF',TZ:'AF',UG:'AF',RW:'AF',BI:'AF',ET:'AF',SO:'AF',DJ:'AF',ER:'AF',
+  ZA:'AF',NA:'AF',BW:'AF',ZW:'AF',ZM:'AF',MW:'AF',MZ:'AF',AO:'AF',SZ:'AF',LS:'AF',MG:'AF',MU:'AF',SC:'AF',KM:'AF',
+  CM:'AF',CF:'AF',CG:'AF',CD:'AF',GA:'AF',GQ:'AF',ST:'AF',
+  // Oceania
+  AU:'OC',NZ:'OC',PG:'OC',FJ:'OC',SB:'OC',VU:'OC',NC:'OC',PF:'OC',WS:'OC',TO:'OC',KI:'OC',FM:'OC',PW:'OC',MH:'OC',NR:'OC',TV:'OC',GU:'OC'
+};
+
+// populateCountrySelect rebuilds #f-country grouped by continent
+// (<optgroup>), each continent's countries sorted by live node count
+// descending - mirrors EDT-Pages' "获取更多" region picker (continent
+// group -> country, count in parens), but driven by our own real
+// exit-IP-probed geo data rather than a trusted source feed.
+function populateCountrySelect() {
+  var sel = document.getElementById('f-country');
+  if (!sel) return;
+  var cur = sel.value;
+
+  var counts = {}, continentOf = {};
+  allNodes.forEach(function(n) {
+    if (!n.country) return;
+    counts[n.country] = (counts[n.country] || 0) + 1;
+    if (!continentOf[n.country]) continentOf[n.country] = n.continent || '';
+  });
+
+  var byContinent = {};
+  Object.keys(counts).forEach(function(c) {
+    // Prefer the continent our own exit-IP probe actually measured;
+    // fall back to the static table for nodes whose Country came straight
+    // from a source feed (never went through LookupGeo).
+    var cont = continentOf[c] || countryToContinent[c.toUpperCase()] || '';
+    if (!byContinent[cont]) byContinent[cont] = [];
+    byContinent[cont].push(c);
+  });
+  Object.keys(byContinent).forEach(function(cont) {
+    byContinent[cont].sort(function(a, b) { return counts[b] - counts[a]; });
+  });
+
+  var opts = '<option value="">全部国家</option>';
+  Object.keys(byContinent).sort(function(a, b) {
+    return continentOrder.indexOf(a) - continentOrder.indexOf(b);
+  }).forEach(function(cont) {
+    var info = continentInfo[cont];
+    var label = info ? (info.emoji + ' ' + info.name + ' / ' + cont) : '🏳️ 未知地区';
+    opts += '<optgroup label="' + escapeHtml(label) + '">';
+    byContinent[cont].forEach(function(c) {
+      opts += '<option value="' + escapeHtml(c) + '">' + flagEmoji(c) + ' ' + escapeHtml(c) + '(' + counts[c] + ')</option>';
+    });
+    opts += '</optgroup>';
+  });
+  sel.innerHTML = opts;
+  sel.value = cur;
+}
+
 function onNodesFetched(nodes) {
   allNodes = nodes || [];
-  // populate country filter options once per distinct set
-  var sel = document.getElementById('f-country');
-  if (sel) {
-    var cur = sel.value;
-    var countries = {};
-    allNodes.forEach(function(n){ if (n.country) countries[n.country] = true; });
-    var opts = '<option value="">全部国家</option>';
-    Object.keys(countries).sort().forEach(function(c){ opts += '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>'; });
-    sel.innerHTML = opts;
-    sel.value = cur;
-  }
+  populateCountrySelect();
   populateRuleTargets();
   applyNodeView();
 }
@@ -445,7 +545,7 @@ function applyNodeView() {
   } else {
     var html = '';
     pageRows.forEach(function(n) {
-      var loc = escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
+      var loc = (n.country ? flagEmoji(n.country) + ' ' : '') + escapeHtml(n.country || '') + (n.city ? ', ' + escapeHtml(n.city) : '');
       var lat = n.latency_ms ? n.latency_ms + 'ms' : '-';
       var spd = n.speed_kbps ? Math.round(n.speed_kbps) + ' kbps' : '-';
       var nodeIP = (n.addr || '').split(':')[0];
