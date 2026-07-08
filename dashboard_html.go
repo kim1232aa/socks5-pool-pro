@@ -155,8 +155,8 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
 
   <div class="table-scroll">
   <table>
-  <thead><tr><th></th><th>协议</th><th>地址(节点IP)</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
-  <tbody id="node-tbody"><tr><td colspan="11" class="empty">加载中...</td></tr></tbody>
+  <thead><tr><th></th><th>协议</th><th>地址(节点IP)</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th title="健康检查累计成功/失败次数">成功/失败</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="12" class="empty">加载中...</td></tr></tbody>
   </table>
   </div>
   <div class="pager" id="node-pager"></div>
@@ -327,6 +327,23 @@ var allNodes = [];
 var nodePage = 1;
 var nodePageSize = 20;
 var anyPinned = false;
+
+// inFlightOps tracks per-node async button state (key -> {speedtest?:true,
+// verify?:true}) so the 15s poll rebuilding the whole table (applyNodeView
+// replaces tbody.innerHTML wholesale) doesn't silently reset a "测速中.../
+// 验证中..." button back to its default clickable state mid-request - the
+// row re-renders itself as disabled again on every rebuild as long as the
+// operation is still in flight.
+var inFlightOps = {};
+function markOp(key, op, on) {
+  if (on) {
+    inFlightOps[key] = inFlightOps[key] || {};
+    inFlightOps[key][op] = true;
+  } else if (inFlightOps[key]) {
+    delete inFlightOps[key][op];
+    if (!Object.keys(inFlightOps[key]).length) delete inFlightOps[key];
+  }
+}
 
 // flagEmoji converts a 2-letter ISO country code to its flag emoji via the
 // regional-indicator-symbol algorithm (each letter maps to U+1F1E6 plus its
@@ -544,13 +561,13 @@ function applyNodeView() {
   }
 
   if (!allNodes.length) {
-    tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">暂无可用节点,等待下次抓取周期...</td></tr>';
     if (pager) pager.innerHTML = '';
     if (banner) banner.textContent = '无 (代理池为空)';
     return;
   }
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="11" class="empty">没有匹配的节点</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">没有匹配的节点</td></tr>';
     if (pager) pager.innerHTML = '';
   } else {
     var html = '';
@@ -563,6 +580,16 @@ function applyNodeView() {
       var exitCell = exit
         ? '<span class="mono' + (exit !== nodeIP ? ' exit-diff' : '') + '">' + escapeHtml(exit) + '</span>'
         : '<span class="small">-</span>';
+      var sf = (n.successes || 0) + '/' + (n.failures || 0);
+      var ops = inFlightOps[n.key] || {};
+      var actionsCell =
+        '<button class="btn-sm" onclick="switchNode(this)">使用</button>' +
+        (ops.speedtest
+          ? '<button class="btn-sm" disabled>测速中...</button>'
+          : '<button class="btn-sm" onclick="runSpeedtest(this)">测速</button>') +
+        (ops.verify
+          ? '<button class="btn-sm" disabled>验证中...</button>'
+          : '<button class="btn-sm" onclick="runVerify(this)" title="立即重新拨号,查看真实出口IP/国家是否和标签一致">验证</button>');
       html += '<tr class="' + (n.active ? 'active' : '') + (n.available === false ? ' unavail' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
         '<td>' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.available === false ? '<span class="badge-unavail">不可用</span>' : '')) + '</td>' +
         '<td>' + protoBadge(n.protocol) + '</td>' +
@@ -571,14 +598,11 @@ function applyNodeView() {
         '<td>' + anonBadge(n.anonymity) + '</td>' +
         '<td>' + loc + '</td>' +
         '<td>' + scoreCell(n.score) + '</td>' +
+        '<td class="small">' + sf + '</td>' +
         '<td>' + lat + '</td>' +
         '<td class="speed-cell">' + spd + '</td>' +
         '<td class="small">' + escapeHtml(n.source || '') + '</td>' +
-        '<td>' +
-          '<button class="btn-sm" onclick="switchNode(this)">使用</button>' +
-          '<button class="btn-sm" onclick="runSpeedtest(this)">测速</button>' +
-          '<button class="btn-sm" onclick="runVerify(this)" title="立即重新拨号,查看真实出口IP/国家是否和标签一致">验证</button>' +
-        '</td></tr>';
+        '<td>' + actionsCell + '</td></tr>';
     });
     tbody.innerHTML = html;
     if (pager) {
@@ -605,8 +629,36 @@ function applyNodeView() {
 }
 
 function copyAddr(addr, el) {
-  if (navigator.clipboard) { navigator.clipboard.writeText(addr); }
-  if (el) { var t = el.textContent; el.textContent = '已复制'; setTimeout(function(){ el.textContent = t; }, 1000); }
+  function flash(text) {
+    if (!el) return;
+    var orig = el.textContent;
+    el.textContent = text;
+    setTimeout(function(){ el.textContent = orig; }, 1000);
+  }
+  // navigator.clipboard only exists in a secure context (https:// or
+  // localhost) - this dashboard is plain http://, so any access from a LAN
+  // address (the normal way to reach it) has no clipboard API at all.
+  // Falling through to just claiming success would be a lie the user can't
+  // detect, so fall back to the classic hidden-textarea + execCommand
+  // trick, which still works over plain http.
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(addr).then(function(){ flash('已复制'); }).catch(function(){ flash('复制失败'); });
+    return;
+  }
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = addr;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    var ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    flash(ok ? '已复制' : '复制失败');
+  } catch (e) {
+    flash('复制失败');
+  }
 }
 
 function exportNodes(fmt) {
@@ -675,43 +727,40 @@ function saveCheckURL() {
 
 function runSpeedtest(btn) {
   var key = rowKey(btn);
-  btn.disabled = true;
-  var orig = btn.textContent;
-  btn.textContent = '测速中...';
+  markOp(key, 'speedtest', true);
+  applyNodeView();
   fetch('/api/nodes/speedtest', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key:key})})
     .then(function(r){ return r.json(); })
-    .then(function(j) {
-      btn.disabled = false;
-      btn.textContent = orig;
-      if (j.error) { alert('测速失败: ' + j.error); return; }
-      var row = btn.closest('tr');
-      var cell = row ? row.querySelector('.speed-cell') : null;
-      if (cell) cell.textContent = Math.round(j.kbps) + ' kbps';
-    })
-    .catch(function(err) { btn.disabled = false; btn.textContent = orig; alert(String(err)); });
+    .then(function(j) { if (j.error) alert('测速失败: ' + j.error); })
+    .catch(function(err) { alert(String(err)); })
+    .finally(function() {
+      markOp(key, 'speedtest', false);
+      pollStatus(); // pulls the freshly-measured speed_kbps back from the backend
+    });
 }
 
 function runVerify(btn) {
   var key = rowKey(btn);
-  btn.disabled = true;
-  var orig = btn.textContent;
-  btn.textContent = '验证中...';
+  markOp(key, 'verify', true);
+  applyNodeView();
   fetch('/api/nodes/verify', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key:key})})
     .then(function(r){ return r.json(); })
     .then(function(j) {
-      btn.disabled = false;
-      btn.textContent = orig;
-      if (!j.reachable) { alert('验证失败:节点当前无法连通(可能已失效)'); pollStatus(); return; }
-      var msg = '真实出口IP: ' + (j.exit_ip || '未知') + '\n国家: ' + (j.country || '未知');
+      if (!j.reachable) { alert('验证失败:节点当前无法连通(可能已失效)'); return; }
+      var msg = '真实出口IP: ' + (j.exit_ip || '未知') + (j.city ? '(' + j.city + ')' : '') + '\n国家: ' + (j.country || '未知');
+      msg += '\n本机直连出口(判断透明代理的对比基准): ' + (j.baseline_exit || '未知(探测失败)');
       if (!j.label_matched) {
         msg += '\n\n⚠️ 与列表标签不符(之前记录: ' + (j.prev_country || '未知') + ' / ' + (j.prev_exit_ip || '未知') + ')\n已用最新结果刷新该节点标签。';
       } else {
         msg += '\n\n✅ 与列表标签一致。';
       }
       alert(msg);
-      pollStatus();
     })
-    .catch(function(err) { btn.disabled = false; btn.textContent = orig; alert(String(err)); });
+    .catch(function(err) { alert(String(err)); })
+    .finally(function() {
+      markOp(key, 'verify', false);
+      pollStatus();
+    });
 }
 
 function showTab(name) {
