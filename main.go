@@ -49,12 +49,18 @@ func main() {
 	// transparent proxies that don't actually change the exit IP.
 	InitBaselineExit(cfg.CheckTimeout)
 
-	// Initial scrape + check (runs in the background so the dashboard and
-	// cached pool are available right away instead of blocking on it).
-	go refreshPool(cfg, store, pool)
-
-	// Background: periodic scrape + manual refresh
+	// Background: initial scrape + check, then periodic scrape + manual
+	// refresh, all serialized through one goroutine/loop. This runs in the
+	// background so the dashboard and cached pool are available right away
+	// instead of blocking on it - but it's still a single loop (not a
+	// separate "initial" goroutine plus this one) specifically so two
+	// refreshPool calls can never run concurrently: a manual refresh
+	// (e.g. from saving a new check-url) landing while the startup scrape
+	// is still in flight would otherwise race it, and whichever one
+	// finished last would "win" with possibly-stale settings even though
+	// the newer request should always be the one that takes effect.
 	go func() {
+		refreshPool(cfg, store, pool)
 		ticker := time.NewTicker(cfg.ScrapeInterval)
 		defer ticker.Stop()
 		for {
@@ -92,10 +98,10 @@ func main() {
 	// so hidden by the dashboard's default filter, for up to 5 minutes.
 	go func() {
 		time.Sleep(15 * time.Second)
-		reCheckAlive(cfg, pool)
+		reCheckAlive(cfg, store, pool)
 		for {
 			time.Sleep(5 * time.Minute)
-			reCheckAlive(cfg, pool)
+			reCheckAlive(cfg, store, pool)
 		}
 	}()
 
@@ -114,14 +120,15 @@ func main() {
 }
 
 // reCheckAlive re-probes connectivity/latency for the nodes already in the
-// pool and records the outcome, so quality scores reflect ongoing health
-// (not just the state at last scrape). Cheap: only touches live nodes, no
-// scraping or geo lookups.
-func reCheckAlive(cfg *Config, pool *ProxyPool) {
+// pool (against the currently configured CheckURL) and records the
+// outcome, so quality scores reflect ongoing health (not just the state at
+// last scrape). Cheap: only touches live nodes, no scraping or geo lookups.
+func reCheckAlive(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 	nodes := pool.All()
 	if len(nodes) == 0 {
 		return
 	}
+	testURL := store.CheckURL()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	for _, px := range nodes {
@@ -134,7 +141,7 @@ func reCheckAlive(cfg *Config, pool *ProxyPool) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			start := time.Now()
-			ok := checkGoogle(px, cfg.CheckTimeout)
+			ok := checkURL(px, testURL, cfg.CheckTimeout)
 			latency := time.Since(start).Milliseconds()
 			pool.RecordResult(px.Key(), ok, latency)
 			pool.SetAvailable(px.Key(), ok)
@@ -144,7 +151,7 @@ func reCheckAlive(cfg *Config, pool *ProxyPool) {
 		}(px)
 	}
 	wg.Wait()
-	log.Printf("[recheck] re-probed %d live nodes", len(nodes))
+	log.Printf("[recheck] re-probed %d live nodes against %s", len(nodes), testURL)
 }
 
 // refreshPool fetches every enabled source concurrently, dedups the
@@ -196,9 +203,10 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 	// unreachable (from CheckProxies) is addresses that were actually dialed
 	// and genuinely failed to connect - as opposed to ones that connected
 	// fine but got excluded from alive for a policy reason (transparent
-	// proxy, blocked country). Only genuine connectivity failures should
-	// flip a previously-known-good node to Available=false.
-	alive, unreachable := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange)
+	// proxy). Only genuine connectivity failures should flip a
+	// previously-known-good node to Available=false.
+	testURL := store.CheckURL()
+	alive, unreachable := CheckProxies(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
 	pool.Update(alive, unreachable)
 
 	scrapeMu.Lock()
@@ -206,8 +214,8 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 	nextScrapeTime = lastScrapeTime.Add(cfg.ScrapeInterval)
 	scrapeMu.Unlock()
 
-	log.Printf("[main] pool refreshed: %d alive / %d checked (from %d sources, %d raw, %d deduped)",
-		pool.Size(), len(candidates), len(sources), len(all), len(deduped))
+	log.Printf("[main] pool refreshed: %d alive / %d checked against %s (from %d sources, %d raw, %d deduped)",
+		pool.Size(), len(candidates), testURL, len(sources), len(all), len(deduped))
 }
 
 // dedupeByAddr collapses candidates down to one entry per ip:port,

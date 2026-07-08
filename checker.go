@@ -12,24 +12,23 @@ import (
 	"time"
 )
 
-// CheckProxies concurrently verifies a list of candidate proxies.
-// Forwarding-capable proxies (socks5/http/https) are verified via a real
-// Google connectivity round-trip through DialUpstream, and their latency
-// is recorded. "proxyip" entries don't speak a forwarding protocol (see
-// parser.go), so they only get a lightweight raw TCP reachability probe.
+// CheckProxies concurrently verifies a list of candidate proxies against
+// testURL - the sole criterion for "alive" is a real HTTP round-trip to
+// testURL through DialUpstream (any response counts, not just 2xx - a
+// 3xx/4xx still proves the tunnel and TLS handshake work end to end).
+// "proxyip" entries don't speak a forwarding protocol (see parser.go), so
+// they only get a lightweight raw TCP reachability probe instead.
 //
 // Connectivity is checked FIRST, and geo lookup runs only on the handful
 // that pass. Doing geo up-front on every candidate (often thousands) would
 // blow straight through ip-api.com's ~45 req/min free-tier limit, and the
 // 429 responses used to get misparsed into garbage "country" values.
 //
-// The only bar for "alive" is real connectivity (checkGoogle) - there is no
-// additional country-based filter. An earlier version also dropped nodes
-// geolocated to China/Hong Kong on the theory that they "can't reach
-// Google", but that's redundant with checkGoogle itself: if a node genuinely
-// can't reach Google, checkGoogle already rejects it above regardless of
-// where it's geolocated. Keeping a country check afterward only punished
-// nodes that had just proven they DO work.
+// There is no additional country-based filter on top of the URL check -
+// an earlier version also dropped nodes geolocated to China/Hong Kong, but
+// that was redundant with (and sometimes contradicted) the real
+// connectivity result: if a node genuinely can't reach testURL, it's
+// already rejected above regardless of where it's geolocated.
 //
 // The second return value, unreachable, is the set of addresses (Proxy.Addr())
 // that were actually dialed and genuinely failed to connect - as opposed to
@@ -37,7 +36,7 @@ import (
 // (a transparent proxy dropped by requireIPChange). Callers use this
 // distinction to avoid marking a perfectly reachable, just policy-filtered
 // node as "unavailable" (see ProxyPool.Update).
-func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool) (alive []Proxy, unreachable map[string]bool) {
+func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool, testURL string) (alive []Proxy, unreachable map[string]bool) {
 	var (
 		mu      sync.Mutex
 		dropped int // transparent proxies filtered by requireIPChange
@@ -69,9 +68,7 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 				}
 				px.LatencyMs = time.Since(start).Milliseconds()
 			} else {
-				// Connectivity check uses a rate-limit-free endpoint so
-				// aliveness never depends on the geo service being up.
-				if !checkGoogle(px, timeout) {
+				if !checkURL(px, testURL, timeout) {
 					markUnreachable(px.Addr())
 					return
 				}
@@ -126,28 +123,29 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 	return alive, unreachable
 }
 
-// checkGoogle verifies a forwarding-capable proxy by fetching Google's
-// generate_204 endpoint through the upstream tunnel. Google doesn't rate-
-// limit this, so it's a reliable aliveness signal (unlike a geo service).
-func checkGoogle(px Proxy, timeout time.Duration) bool {
-	conn, err := DialUpstream(px, "www.google.com:80", timeout)
+// checkURL verifies a forwarding-capable proxy by fetching testURL through
+// the upstream tunnel and checking that a real HTTP response comes back.
+// Any status code counts - the point is proving the full round trip
+// (TCP/SOCKS5-or-CONNECT handshake, and TLS for an https:// URL) actually
+// works for that target, not that the target returns success. The
+// response body is never read (Close is called immediately after headers
+// arrive) so this stays cheap even against a heavy page.
+func checkURL(px Proxy, testURL string, timeout time.Duration) bool {
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+				return DialUpstream(px, addr, timeout)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := client.Get(testURL)
 	if err != nil {
 		return false
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-
-	req := "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return false
-	}
-
-	resp := make([]byte, 512)
-	n, err := conn.Read(resp)
-	if err != nil || n < 4 {
-		return false
-	}
-	return string(resp[:4]) == "HTTP"
+	resp.Body.Close()
+	return true
 }
 
 // probeExitIP fetches the proxy's real exit IP by asking a lenient
@@ -269,7 +267,7 @@ func probeAnonymity(px Proxy, timeout time.Duration) string {
 }
 
 // checkReachable is a minimal TCP-connect probe for "proxyip" entries,
-// which don't speak SOCKS5/HTTP and so can't be verified via checkGoogle.
+// which don't speak SOCKS5/HTTP and so can't be verified via checkURL.
 func checkReachable(px Proxy, timeout time.Duration) bool {
 	conn, err := net.DialTimeout("tcp", px.Addr(), timeout)
 	if err != nil {

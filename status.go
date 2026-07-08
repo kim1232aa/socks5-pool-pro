@@ -42,6 +42,7 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/", s.handleDashboard)
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/settings/check-url", s.handleCheckURL)
 
 	mux.HandleFunc("/api/nodes", s.handleNodes)
 	mux.HandleFunc("/api/nodes/switch", requirePost(s.handleNodeSwitch))
@@ -186,6 +187,7 @@ type DashboardData struct {
 	RuleTypes    []string
 	Formats      []string
 	Strategies   []string
+	CheckURL     string
 }
 
 func nodeViewOf(px Proxy, activeAddr string) NodeView {
@@ -248,6 +250,7 @@ func (s *StatusServer) buildDashboardData() DashboardData {
 		RuleTypes:     []string{RuleDomain, RuleDomainSuffix, RuleDomainKeyword, RuleIPCIDR, RuleGeosite},
 		Formats:       []string{FormatTextRegex, FormatEDTJSON, FormatProxyIPJSON, FormatPlainList, FormatJSONArray},
 		Strategies:    []string{StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed, StrategyScore},
+		CheckURL:      s.store.CheckURL(),
 	}
 }
 
@@ -284,6 +287,33 @@ func (s *StatusServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 func (s *StatusServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	TriggerRefresh()
 	writeJSON(w, map[string]string{"status": "refresh triggered"})
+}
+
+// handleCheckURL gets or sets the health-check target URL - the sole
+// criterion for whether a node counts as alive (see checker.go checkURL).
+// A successful POST triggers an immediate refresh so the new criterion
+// takes effect right away instead of waiting for the next scrape cycle.
+func (s *StatusServer) handleCheckURL(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]string{"url": s.store.CheckURL()})
+	case http.MethodPost:
+		var in struct {
+			URL string `json:"url"`
+		}
+		if err := decodeJSON(r, &in); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.SetCheckURL(in.URL); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		TriggerRefresh()
+		writeJSON(w, map[string]string{"status": "ok", "url": s.store.CheckURL()})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 // ---- handlers: nodes ----
@@ -344,7 +374,7 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	const timeout = 10 * time.Second
 	prevExitIP, prevCountry := px.ExitIP, px.Country
 
-	reachable := checkGoogle(px, timeout)
+	reachable := checkURL(px, s.store.CheckURL(), timeout)
 	exitIP := probeExitIP(px, timeout)
 	country, city, continent := "", "", ""
 	if exitIP != "" {

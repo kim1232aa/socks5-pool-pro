@@ -71,6 +71,8 @@ tr.unavail{opacity:0.5}
 .copy-btn{cursor:pointer;color:#64748b;margin-left:6px;font-size:0.7rem}
 .copy-btn:hover{color:#38bdf8}
 .preset-bar{background:#1e293b;border-radius:8px;padding:12px 14px;margin:12px 0;font-size:0.82rem;color:#94a3b8;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.checkurl-bar{background:#1e293b;border-radius:8px;padding:10px 14px;margin:10px 0 0;font-size:0.82rem;color:#94a3b8;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.checkurl-label{white-space:nowrap;font-weight:bold;color:#e2e8f0}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%}
 form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
 input,select{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:0.8rem}
@@ -104,6 +106,14 @@ summary{cursor:pointer;color:#94a3b8;font-size:0.85rem}
   <div class="stat-item">下次刷新: <span id="stat-next">{{if .NextScrape}}{{.NextScrape}}{{else}}N/A{{end}}</span></div>
   <button class="btn" onclick="doRefresh(this)">刷新代理池</button>
 </div>
+
+<div class="checkurl-bar">
+  <span class="checkurl-label">🎯 可用性判定标准</span>
+  <input id="check-url-input" type="text" value="{{.CheckURL}}" placeholder="http://www.google.com/generate_204" style="flex:1;min-width:220px">
+  <button class="btn-sm" onclick="saveCheckURL()">保存并立即重新检测</button>
+  <span id="check-url-status" class="small"></span>
+</div>
+<p class="note">节点是否"可用"只看一件事:能不能真的拨号访问这个网址(拿到任意 HTTP 响应即算通过,不要求 200)。改成你自己在意的网址(比如你的 App 首页、某个流媒体域名)后点保存,会立刻按新标准重新检测一遍,不用等下一次定时刷新。</p>
 
 <div class="tabs">
   <a href="#nodes" class="tab-link" data-tab="nodes">节点</a>
@@ -647,6 +657,20 @@ function doRefresh(btn) {
   fetch('/api/refresh').then(function(){
     setTimeout(function(){ location.reload(); }, 15000);
   }).catch(function(){ btn.disabled = false; btn.textContent = orig; });
+}
+
+function saveCheckURL() {
+  var input = document.getElementById('check-url-input');
+  var statusEl = document.getElementById('check-url-status');
+  var url = (input.value || '').trim();
+  if (!url) { alert('请输入一个 http:// 或 https:// 开头的网址'); return; }
+  postJSON('/api/settings/check-url', {url: url}, function(err) {
+    if (err) { alert(err); return; }
+    if (statusEl) {
+      statusEl.textContent = '已保存,正在按新标准重新检测全部节点...';
+      setTimeout(function(){ statusEl.textContent = ''; }, 8000);
+    }
+  });
 }
 
 function runSpeedtest(btn) {

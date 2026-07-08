@@ -4,11 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
+
+// defaultCheckURL is the health-check target used until the user sets
+// their own via the dashboard - Google's connectivity-check endpoint,
+// chosen because it's free of the rate limits a heavier destination (or
+// one the user later points at, e.g. an app's own homepage) might impose
+// under hundreds of concurrent probes.
+const defaultCheckURL = "http://www.google.com/generate_204"
 
 // Node-list source formats.
 const (
@@ -35,12 +44,19 @@ type Source struct {
 	Note     string `json:"note,omitempty"`
 }
 
-// PoolConfig is the full persisted state: sources, routing rules, and
-// custom groups.
+// PoolConfig is the full persisted state: sources, routing rules, custom
+// groups, and the health-check target URL.
 type PoolConfig struct {
 	Sources []Source `json:"sources"`
 	Rules   []Rule   `json:"rules"`
 	Groups  []Group  `json:"groups"`
+	// CheckURL is the sole criterion for "is this node alive": every
+	// candidate is dialed through and this URL is fetched - a node is
+	// alive if it gets any HTTP response back. Empty means defaultCheckURL
+	// (see CheckURL()). User-settable from the dashboard so "alive" can
+	// mean whatever the user actually cares about reaching (their own
+	// app's URL, a specific streaming service, etc.), not just Google.
+	CheckURL string `json:"check_url,omitempty"`
 }
 
 // ConfigStore persists PoolConfig to a JSON file on disk, guarding all
@@ -290,6 +306,35 @@ func (cs *ConfigStore) ToggleSource(id string, enabled bool) error {
 			}
 		}
 		return fmt.Errorf("source not found: %s", id)
+	})
+}
+
+// CheckURL returns the currently configured health-check target,
+// defaulting to defaultCheckURL if the user hasn't set one.
+func (cs *ConfigStore) CheckURL() string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.CheckURL == "" {
+		return defaultCheckURL
+	}
+	return cs.cfg.CheckURL
+}
+
+// SetCheckURL changes the health-check target. Takes effect on the next
+// check cycle - callers typically follow this with TriggerRefresh so it
+// applies immediately rather than waiting for the next scheduled scrape.
+func (cs *ConfigStore) SetCheckURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Errorf("url is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("invalid url: must be a full http:// or https:// address")
+	}
+	return cs.mutate(func(c *PoolConfig) error {
+		c.CheckURL = raw
+		return nil
 	})
 }
 
