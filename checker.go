@@ -12,16 +12,6 @@ import (
 	"time"
 )
 
-// Blocked countries: China mainland + Hong Kong (can't reach Google).
-// Keyed by both ISO code and full name so it works whichever a source
-// supplies (LookupGeo now normalizes to ISO codes, but source feeds vary).
-var blockedCountries = map[string]bool{
-	"cn":        true,
-	"hk":        true,
-	"china":     true,
-	"hong kong": true,
-}
-
 // CheckProxies concurrently verifies a list of candidate proxies.
 // Forwarding-capable proxies (socks5/http/https) are verified via a real
 // Google connectivity round-trip through DialUpstream, and their latency
@@ -33,12 +23,20 @@ var blockedCountries = map[string]bool{
 // blow straight through ip-api.com's ~45 req/min free-tier limit, and the
 // 429 responses used to get misparsed into garbage "country" values.
 //
+// The only bar for "alive" is real connectivity (checkGoogle) - there is no
+// additional country-based filter. An earlier version also dropped nodes
+// geolocated to China/Hong Kong on the theory that they "can't reach
+// Google", but that's redundant with checkGoogle itself: if a node genuinely
+// can't reach Google, checkGoogle already rejects it above regardless of
+// where it's geolocated. Keeping a country check afterward only punished
+// nodes that had just proven they DO work.
+//
 // The second return value, unreachable, is the set of addresses (Proxy.Addr())
 // that were actually dialed and genuinely failed to connect - as opposed to
 // ones that connected fine but got excluded from alive for a policy reason
-// (transparent proxy dropped by requireIPChange, or a blocked-country geo).
-// Callers use this distinction to avoid marking a perfectly reachable, just
-// policy-filtered node as "unavailable" (see ProxyPool.Update).
+// (a transparent proxy dropped by requireIPChange). Callers use this
+// distinction to avoid marking a perfectly reachable, just policy-filtered
+// node as "unavailable" (see ProxyPool.Update).
 func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool) (alive []Proxy, unreachable map[string]bool) {
 	var (
 		mu      sync.Mutex
@@ -113,11 +111,6 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, req
 				}
 
 				px.Anonymity = probeAnonymity(px, timeout)
-			}
-
-			if blockedCountries[strings.ToLower(px.Country)] {
-				// Also a policy exclusion, not a connectivity failure.
-				return
 			}
 
 			mu.Lock()
