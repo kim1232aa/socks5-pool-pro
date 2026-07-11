@@ -21,6 +21,13 @@ import (
 type poolCache struct {
 	mu   sync.Mutex
 	path string
+
+	// lastGeneration prevents a snapshot captured earlier from overwriting a
+	// newer one merely because its goroutine reached the filesystem later.
+	// Generations are process-local; the cache file remains backward
+	// compatible and does not need to persist this bookkeeping value.
+	lastGeneration    uint64
+	hasLastGeneration bool
 }
 
 type poolCacheFile struct {
@@ -49,9 +56,12 @@ func (c *poolCache) load() (forwarding, proxyip []Proxy, stats map[string]nodeSt
 	return f.Proxies, f.ProxyIPNodes, f.Stats
 }
 
-func (c *poolCache) save(forwarding, proxyip []Proxy, stats map[string]nodeStats) {
+func (c *poolCache) save(generation uint64, forwarding, proxyip []Proxy, stats map[string]nodeStats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.hasLastGeneration && generation <= c.lastGeneration {
+		return
+	}
 	f := poolCacheFile{Proxies: forwarding, ProxyIPNodes: proxyip, Stats: stats}
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
@@ -59,11 +69,16 @@ func (c *poolCache) save(forwarding, proxyip []Proxy, stats map[string]nodeStats
 		return
 	}
 	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// Pool snapshots can contain upstream credentials, so do not leave them
+	// world-readable on shared hosts or mounted Docker volumes.
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		log.Printf("[cache] write failed: %v", err)
 		return
 	}
 	if err := os.Rename(tmp, c.path); err != nil {
 		log.Printf("[cache] rename failed: %v", err)
+		return
 	}
+	c.lastGeneration = generation
+	c.hasLastGeneration = true
 }

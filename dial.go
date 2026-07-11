@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -11,45 +12,76 @@ import (
 	"time"
 )
 
-// DialUpstream establishes a raw tunnel to target through the given
-// upstream proxy, dispatching on px.Protocol. Once established, the
-// returned conn carries bytes to/from target exactly as if dialed
-// directly - callers don't need to know which protocol was used.
+// DialUpstream establishes a raw tunnel to target through the given upstream
+// proxy. It preserves the historical timeout-only API for callers that do not
+// have a request context.
 func DialUpstream(px Proxy, target string, timeout time.Duration) (net.Conn, error) {
+	return DialUpstreamContext(context.Background(), px, target, timeout)
+}
+
+// DialUpstreamContext is the cancellation-aware form. Context cancellation
+// interrupts both the TCP dial and every blocking SOCKS/HTTP handshake read or
+// write; no detached handshake is left running after this function returns.
+func DialUpstreamContext(parent context.Context, px Proxy, target string, timeout time.Duration) (net.Conn, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
+	defer cancel()
+
 	switch px.Protocol {
 	case "socks5":
-		return dialSOCKS5(px, target, timeout)
+		return dialSOCKS5Context(ctx, px, target)
 	case "http", "https":
-		return dialHTTPConnect(px, target, timeout)
+		return dialHTTPConnectContext(ctx, px, target)
 	default:
 		return nil, fmt.Errorf("protocol %q cannot be used as a forwarding upstream", px.Protocol)
 	}
 }
 
 func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", px.Addr(), timeout)
+	return DialUpstreamContext(context.Background(), px, target, timeout)
+}
+
+func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net.Conn, err error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", px.Addr())
 	if err != nil {
 		return nil, err
 	}
-	conn.SetDeadline(time.Now().Add(timeout))
+	stopCancellationWatch := watchUpstreamHandshake(ctx, conn)
+	watchStopped := false
+	defer func() {
+		if !watchStopped {
+			stopCancellationWatch()
+		}
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+	setUpstreamHandshakeDeadline(ctx, conn)
 
 	methods := []byte{0x00}
 	if px.Username != "" {
 		methods = append(methods, 0x02)
 	}
 	greeting := append([]byte{socks5Version, byte(len(methods))}, methods...)
-	if _, err := conn.Write(greeting); err != nil {
-		conn.Close()
-		return nil, err
+	if _, writeErr := conn.Write(greeting); writeErr != nil {
+		return nil, upstreamHandshakeError(ctx, writeErr)
 	}
 
 	buf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		conn.Close()
-		return nil, err
+	if _, readErr := io.ReadFull(conn, buf); readErr != nil {
+		return nil, upstreamHandshakeError(ctx, readErr)
 	}
 	if buf[0] != socks5Version {
-		conn.Close()
 		return nil, fmt.Errorf("not socks5")
 	}
 
@@ -58,41 +90,36 @@ func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error
 		// no auth required
 	case 0x02:
 		if px.Username == "" {
-			conn.Close()
 			return nil, fmt.Errorf("upstream requires auth, none configured")
 		}
 		authReq := []byte{0x01, byte(len(px.Username))}
 		authReq = append(authReq, []byte(px.Username)...)
 		authReq = append(authReq, byte(len(px.Password)))
 		authReq = append(authReq, []byte(px.Password)...)
-		if _, err := conn.Write(authReq); err != nil {
-			conn.Close()
-			return nil, err
+		if _, writeErr := conn.Write(authReq); writeErr != nil {
+			return nil, upstreamHandshakeError(ctx, writeErr)
 		}
 		authResp := make([]byte, 2)
-		if _, err := io.ReadFull(conn, authResp); err != nil {
-			conn.Close()
-			return nil, err
+		if _, readErr := io.ReadFull(conn, authResp); readErr != nil {
+			return nil, upstreamHandshakeError(ctx, readErr)
 		}
 		if authResp[1] != 0x00 {
-			conn.Close()
 			return nil, fmt.Errorf("upstream rejected auth")
 		}
 	case 0xFF:
-		conn.Close()
 		return nil, fmt.Errorf("upstream has no acceptable auth method")
 	default:
-		conn.Close()
 		return nil, fmt.Errorf("unsupported auth method: %d", buf[1])
 	}
 
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
-		conn.Close()
-		return nil, err
+	host, portStr, splitErr := net.SplitHostPort(target)
+	if splitErr != nil {
+		return nil, splitErr
 	}
 	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	if _, scanErr := fmt.Sscanf(portStr, "%d", &port); scanErr != nil {
+		return nil, scanErr
+	}
 
 	req := []byte{socks5Version, cmdConnect, 0x00}
 	if ip := net.ParseIP(host); ip != nil {
@@ -108,26 +135,18 @@ func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error
 		req = append(req, []byte(host)...)
 	}
 	req = append(req, byte(port>>8), byte(port&0xff))
-
-	if _, err := conn.Write(req); err != nil {
-		conn.Close()
-		return nil, err
+	if _, writeErr := conn.Write(req); writeErr != nil {
+		return nil, upstreamHandshakeError(ctx, writeErr)
 	}
 
-	// The CONNECT reply is VER,REP,RSV,ATYP,BND.ADDR,BND.PORT - its total
-	// length depends on ATYP, and a single conn.Read can legitimately
-	// return the message split across multiple reads (TCP gives no
-	// message-boundary guarantee). Read exactly the fixed 4-byte header
-	// first, then exactly as many address+port bytes as ATYP specifies, so
-	// no trailing reply bytes are ever left unread in the socket buffer to
-	// corrupt the tunnel once relaying starts.
+	// The CONNECT reply length depends on ATYP. Read the fixed header first,
+	// then exactly the advertised address and port so no reply bytes leak into
+	// the returned tunnel.
 	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		conn.Close()
-		return nil, err
+	if _, readErr := io.ReadFull(conn, header); readErr != nil {
+		return nil, upstreamHandshakeError(ctx, readErr)
 	}
 	if header[1] != 0x00 {
-		conn.Close()
 		return nil, fmt.Errorf("upstream connect failed, status: %d", header[1])
 	}
 
@@ -139,21 +158,25 @@ func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error
 		addrLen = net.IPv6len
 	case atypDomain:
 		lenByte := make([]byte, 1)
-		if _, err := io.ReadFull(conn, lenByte); err != nil {
-			conn.Close()
-			return nil, err
+		if _, readErr := io.ReadFull(conn, lenByte); readErr != nil {
+			return nil, upstreamHandshakeError(ctx, readErr)
 		}
 		addrLen = int(lenByte[0])
 	default:
-		conn.Close()
 		return nil, fmt.Errorf("upstream connect reply: unknown address type %d", header[3])
 	}
-	if _, err := io.ReadFull(conn, make([]byte, addrLen+2)); err != nil { // +2 for BND.PORT
-		conn.Close()
-		return nil, err
+	if _, readErr := io.ReadFull(conn, make([]byte, addrLen+2)); readErr != nil {
+		return nil, upstreamHandshakeError(ctx, readErr)
 	}
-
-	conn.SetDeadline(time.Time{})
+	// Stop and join the watcher before the final context check. Once joined,
+	// cancellation cannot race with a successful return and close a tunnel
+	// that we hand to the caller with a nil error.
+	stopCancellationWatch()
+	watchStopped = true
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 
@@ -162,11 +185,25 @@ func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error
 // source list advertised about the proxy's capability, not the wire
 // protocol spoken to reach it (both use plain HTTP CONNECT).
 func dialHTTPConnect(px Proxy, target string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", px.Addr(), timeout)
+	return DialUpstreamContext(context.Background(), px, target, timeout)
+}
+
+func dialHTTPConnectContext(ctx context.Context, px Proxy, target string) (result net.Conn, err error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", px.Addr())
 	if err != nil {
 		return nil, err
 	}
-	conn.SetDeadline(time.Now().Add(timeout))
+	stopCancellationWatch := watchUpstreamHandshake(ctx, conn)
+	watchStopped := false
+	defer func() {
+		if !watchStopped {
+			stopCancellationWatch()
+		}
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+	setUpstreamHandshakeDeadline(ctx, conn)
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
@@ -175,38 +212,68 @@ func dialHTTPConnect(px Proxy, target string, timeout time.Duration) (net.Conn, 
 		fmt.Fprintf(&sb, "Proxy-Authorization: Basic %s\r\n", cred)
 	}
 	sb.WriteString("\r\n")
-
-	if _, err := conn.Write([]byte(sb.String())); err != nil {
-		conn.Close()
-		return nil, err
+	if _, writeErr := conn.Write([]byte(sb.String())); writeErr != nil {
+		return nil, upstreamHandshakeError(ctx, writeErr)
 	}
 
-	// bufio.NewReader may read (and buffer) more from conn than just the
-	// HTTP response headers in one underlying Read - if the upstream
-	// pipelines the first bytes of the tunneled stream right after its
-	// response, those bytes end up sitting in this reader's internal
-	// buffer. Returning bare `conn` afterward would silently drop them.
-	// bufConn keeps draining br first, so nothing already-buffered is lost.
+	// bufio.Reader may buffer tunneled bytes following the CONNECT response.
+	// bufConn keeps draining it first so those bytes are not lost.
 	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		conn.Close()
-		return nil, err
+	resp, readErr := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if readErr != nil {
+		return nil, upstreamHandshakeError(ctx, readErr)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		conn.Close()
+	_ = resp.Body.Close()
+	// RFC 9110 defines any 2xx response as a successful CONNECT tunnel.
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("upstream CONNECT failed: %s", resp.Status)
 	}
-
-	conn.SetDeadline(time.Time{})
+	stopCancellationWatch()
+	watchStopped = true
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	_ = conn.SetDeadline(time.Time{})
 	return &bufConn{Conn: conn, r: br}, nil
 }
 
+// watchUpstreamHandshake actively closes conn when ctx is canceled, which
+// unblocks protocol reads/writes immediately. The returned stop function waits
+// for the watcher to exit; therefore canceling an internal timeout after a
+// successful return cannot race and close the caller-owned tunnel.
+func watchUpstreamHandshake(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
+}
+
+func setUpstreamHandshakeDeadline(ctx context.Context, conn net.Conn) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+}
+
+func upstreamHandshakeError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
 // bufConn is a net.Conn whose reads are served from a bufio.Reader first -
-// used so bytes already buffered while parsing a preceding protocol
-// exchange on the same connection (e.g. the HTTP CONNECT response) aren't
-// lost when the raw conn is handed off to a caller that reads it directly.
+// used so bytes already buffered while parsing a preceding protocol exchange
+// aren't lost when the raw connection is returned.
 type bufConn struct {
 	net.Conn
 	r *bufio.Reader

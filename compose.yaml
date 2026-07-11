@@ -1,0 +1,54 @@
+name: socks5-pool-pro
+
+services:
+  proxy-pool:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: socks5-pool-pro:local
+    container_name: socks5-pool-pro
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${SOCKS_PORT:-1080}:1080"
+      - "127.0.0.1:${DASHBOARD_PORT:-8080}:8080"
+    environment:
+      SOCKS_USER: "${SOCKS_USER:-}"
+      SOCKS_PASS: "${SOCKS_PASS:-}"
+      ADMIN_USER: "${ADMIN_USER:-}"
+      ADMIN_PASS: "${ADMIN_PASS:-}"
+    command:
+      - /app/socks5-pool
+      - -listen
+      - 0.0.0.0:1080
+      - -status
+      - 0.0.0.0:8080
+      - -data-dir
+      - /app/data
+      - -max-concurrent
+      - "${MAX_CONCURRENT:-20}"
+      - -max-candidates
+      - "${MAX_CANDIDATES:-3000}"
+      - -scrape-interval
+      - "${SCRAPE_INTERVAL:-20m}"
+      - -check-timeout
+      - "${CHECK_TIMEOUT:-10s}"
+      - -require-ip-change=${REQUIRE_IP_CHANGE:-true}
+    volumes:
+      - socks5-pool-data:/app/data
+    networks:
+      - socks5-pool
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  socks5-pool-data:
+    name: socks5-pool-pro-data
+
+networks:
+  socks5-pool:
+    name: socks5-pool-pro-net
+    driver: bridge

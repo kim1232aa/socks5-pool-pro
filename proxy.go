@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 )
@@ -15,7 +16,7 @@ type Proxy struct {
 	Password string
 
 	// Protocol is one of "socks5", "http", "https", or "proxyip".
-	// "proxyip" nodes do not speak a generic proxy protocol (see sources.go)
+	// "proxyip" resources do not speak a generic proxy protocol (see parser.go)
 	// and are never selected as an upstream for forwarding.
 	Protocol string
 
@@ -28,6 +29,10 @@ type Proxy struct {
 
 	// SourceName identifies which configured Source produced this entry.
 	SourceName string
+	// SourceNames retains every source that advertised this protocol+address.
+	// SourceName remains the deterministic primary name for older API/UI
+	// consumers; source-aware routing should consult both fields.
+	SourceNames []string `json:"SourceNames,omitempty"`
 
 	// LatencyMs is the round-trip time observed during the last health
 	// check, in milliseconds. Zero if never measured.
@@ -36,6 +41,13 @@ type Proxy struct {
 	// SpeedKbps is the download throughput measured by an on-demand speed
 	// test (see speedtest.go), in kilobits/sec. Zero if never tested.
 	SpeedKbps float64
+	// SpeedTestedAt is the Unix timestamp of the last successful throughput
+	// test. SpeedBytes and SpeedDurationMs describe the sample behind
+	// SpeedKbps so consumers can distinguish a real full-size measurement
+	// from a stale or partial result.
+	SpeedTestedAt   int64
+	SpeedBytes      int64
+	SpeedDurationMs int64
 
 	// ExitIP is the address the outside world actually sees when traffic
 	// is sent through this proxy, measured during the health check by
@@ -48,8 +60,9 @@ type Proxy struct {
 
 	// IPChanged is true when the proxy's exit IP genuinely differs from
 	// our own direct egress - i.e. using it actually changes your public
-	// IP. False for transparent proxies that don't.
-	IPChanged bool
+	// IP. It is meaningful only when IPChangeKnown is true.
+	IPChanged     bool
+	IPChangeKnown bool
 
 	// Anonymity is "elite", "anonymous", "transparent", or "" (unknown),
 	// classified by whether the proxy leaks your real IP / advertises
@@ -66,24 +79,43 @@ type Proxy struct {
 }
 
 func (p Proxy) Addr() string {
-	return p.IP + ":" + p.Port
+	return net.JoinHostPort(p.IP, p.Port)
 }
 
 func (p Proxy) String() string {
+	return p.urlWithScheme(p.Protocol)
+}
+
+// ConsumerURL returns a proxy URL that a standard external client can dial.
+// Internally, the source label "https" means an HTTP proxy that can CONNECT
+// HTTPS destinations; dialHTTPConnect intentionally speaks plain HTTP to both
+// "http" and "https" labels. Exporting https:// for that latter case would
+// incorrectly make standard clients attempt TLS to the proxy itself.
+func (p Proxy) ConsumerURL() string {
 	scheme := p.Protocol
+	if scheme == "https" {
+		scheme = "http"
+	}
+	return p.urlWithScheme(scheme)
+}
+
+func (p Proxy) urlWithScheme(scheme string) string {
 	if scheme == "" {
 		scheme = "socks5"
 	}
-	if p.Username != "" {
-		return fmt.Sprintf("%s://%s:%s@%s", scheme, p.Username, p.Password, p.Addr())
+	u := &url.URL{
+		Scheme: scheme,
+		Host:   net.JoinHostPort(p.IP, p.Port),
 	}
-	return fmt.Sprintf("%s://%s", scheme, p.Addr())
+	if p.Username != "" {
+		u.User = url.UserPassword(p.Username, p.Password)
+	}
+	return u.String()
 }
 
-// Key returns a stable identity for dedup purposes (protocol-agnostic on
-// purpose: the same ip:port showing up under two protocols is still the
-// same physical dedup target for display, but callers that need
-// protocol-specific identity should use Addr()+Protocol directly).
+// Key returns the protocol-aware identity used for validation and pool state.
+// The same ip:port may legitimately support one advertised protocol but not
+// another, so HTTP and SOCKS declarations must never share failure state.
 func (p Proxy) Key() string {
 	return p.Protocol + "://" + p.Addr()
 }

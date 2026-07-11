@@ -3,6 +3,6 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "./socks5-pool -listen 0.0.0.0:$PORT"
-healthcheckPath = "/"
+startCommand = "./socks5-pool -listen 0.0.0.0:1080 -status 0.0.0.0:$PORT"
+healthcheckPath = "/healthz"
 restartPolicyType = "on_failure"

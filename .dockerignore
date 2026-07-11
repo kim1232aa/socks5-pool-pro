@@ -1,0 +1,14 @@
+.git
+.gitignore
+.gitattributes
+data/
+tmp/
+temp/
+*.log
+*.tmp
+*.out
+*.test
+coverage/
+coverage.*
+socks5-pool
+.DS_Store

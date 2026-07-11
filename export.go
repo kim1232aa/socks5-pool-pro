@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
+	"unicode"
 )
 
 // exportNode is a Proxy plus its computed quality stats, used only for
@@ -26,6 +28,8 @@ func (s *StatusServer) collectExport(r *http.Request) []exportNode {
 	country := q.Get("country")
 	protocol := q.Get("protocol")
 	onlyChanged := q.Get("only_changed") == "1"
+	onlyAvailable := q.Get("available") == "1"
+	search := strings.ToLower(strings.TrimSpace(q.Get("search")))
 
 	var out []exportNode
 	for _, px := range s.pool.All() {
@@ -35,7 +39,13 @@ func (s *StatusServer) collectExport(r *http.Request) []exportNode {
 		if protocol != "" && px.Protocol != protocol {
 			continue
 		}
-		if onlyChanged && !px.IPChanged {
+		if onlyChanged && (!px.IPChangeKnown || !px.IPChanged) {
+			continue
+		}
+		if onlyAvailable && !px.Available {
+			continue
+		}
+		if search != "" && !strings.Contains(strings.ToLower(px.Addr()+" "+px.ExitIP), search) {
 			continue
 		}
 		succ, fail := s.pool.StatsOf(px.Key())
@@ -94,18 +104,51 @@ func exportCSV(w http.ResponseWriter, nodes []exportNode) {
 		if anon == "" {
 			anon = "unknown"
 		}
-		changed := "否"
-		if n.IPChanged {
+		changed := "未知"
+		if n.IPChangeKnown && n.IPChanged {
 			changed = "是"
+		} else if n.IPChangeKnown {
+			changed = "否"
 		}
-		cw.Write([]string{
+		sources := n.SourceName
+		if len(n.SourceNames) > 0 {
+			sources = strings.Join(n.SourceNames, ", ")
+		}
+		record := []string{
 			n.Protocol, n.Addr(), n.IP, n.Port, n.Username, n.Password,
 			n.ExitIP, changed, anon, n.Continent, n.Country, n.City,
 			strconv.FormatFloat(n.Score, 'f', 1, 64), latency, speed,
 			strconv.Itoa(n.Successes), strconv.Itoa(n.Failures),
-			n.SourceName, tmeLink(n.Proxy),
-		})
+			sources, tmeLink(n.Proxy),
+		}
+		for i := range record {
+			record[i] = spreadsheetSafeCell(record[i])
+		}
+		cw.Write(record)
 	}
+}
+
+// spreadsheetSafeCell prevents data supplied by third-party proxy feeds from
+// becoming an Excel/LibreOffice formula when the CSV is opened. CSV quoting is
+// not sufficient: spreadsheet applications still evaluate quoted cells that
+// begin with =, +, -, @, tab, or a formula after leading whitespace.
+func spreadsheetSafeCell(value string) string {
+	if value == "" {
+		return value
+	}
+	trimmed := strings.TrimLeftFunc(value, unicode.IsSpace)
+	if trimmed == "" {
+		return value
+	}
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	}
+	switch value[0] {
+	case '\t', '\r', '\n':
+		return "'" + value
+	}
+	return value
 }
 
 // exportTME writes Telegram SOCKS proxy links, one per line. Only socks5

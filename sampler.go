@@ -1,0 +1,269 @@
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+)
+
+// candidateSamplerState is deliberately small: source feeds themselves can
+// contain hundreds of thousands of entries, but a cursor per source/protocol
+// bucket is enough to visit them all across refreshes.  It is kept separate
+// from pool_cache.json because candidates that have not yet passed a health
+// check must not be retained as live proxy state.
+type candidateSamplerState struct {
+	Version    int               `json:"version"`
+	LastBucket string            `json:"last_bucket,omitempty"`
+	Cursors    map[string]string `json:"cursors"`
+}
+
+// candidateSampler selects a bounded, deterministic slice of a much larger
+// source inventory.  Its cursors point at the last *examined* candidate, not
+// merely the last successful one: repeatedly failing new entries therefore do
+// not monopolize every subsequent refresh.
+type candidateSampler struct {
+	path  string
+	state candidateSamplerState
+}
+
+const candidateSamplerStateFile = "candidate_sampler.json"
+
+func newCandidateSampler(dataDir string) *candidateSampler {
+	s := &candidateSampler{
+		state: candidateSamplerState{
+			Version: 2,
+			Cursors: make(map[string]string),
+		},
+	}
+	if dataDir == "" {
+		// Tests and callers that intentionally use an in-memory configuration
+		// still get deterministic rotation for this refresh, just no restart
+		// persistence.
+		return s
+	}
+
+	s.path = filepath.Join(dataDir, candidateSamplerStateFile)
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[sampler] read state failed: %v", err)
+		}
+		return s
+	}
+	var saved candidateSamplerState
+	if err := json.Unmarshal(data, &saved); err != nil {
+		log.Printf("[sampler] parse state failed: %v", err)
+		return s
+	}
+	if saved.Cursors == nil {
+		saved.Cursors = make(map[string]string)
+	}
+	// Version 2 cursor values use allocation-light IP\x00port ordering rather
+	// than Proxy.Key ordering. Old cursors are safe to discard: this only
+	// restarts discovery rotation once and does not affect pool state.
+	if saved.Version != 2 {
+		saved.Version = 2
+		saved.LastBucket = ""
+		saved.Cursors = make(map[string]string)
+	}
+	s.state = saved
+	return s
+}
+
+// selectCandidates returns at most limit candidates. It spends the first slots
+// on unseen entries; already-known nodes are skipped during that pass while
+// still moving the cursor past them. If the inventory has fewer unseen entries
+// than the cap, a second pass fills the spare slots with known ones so a
+// refresh does not leave useful checking capacity idle. Buckets are
+// source+protocol scoped and chosen round-robin, so a large feed cannot starve
+// smaller feeds and a limit smaller than the number of buckets remains fair
+// across refreshes.
+func (s *candidateSampler) selectCandidates(candidates []Proxy, known map[string]bool, limit int) []Proxy {
+	if limit <= 0 || len(candidates) == 0 {
+		return nil
+	}
+
+	buckets := make(map[string][]int)
+	bucketKeyCache := make(map[string]map[string]string)
+	for i, px := range candidates {
+		name := px.SourceName
+		if name == "" {
+			name = "unknown"
+		}
+		byProtocol := bucketKeyCache[name]
+		if byProtocol == nil {
+			byProtocol = make(map[string]string)
+			bucketKeyCache[name] = byProtocol
+		}
+		key, ok := byProtocol[px.Protocol]
+		if !ok {
+			key = name + "\x00" + px.Protocol
+			byProtocol[px.Protocol] = key
+		}
+		buckets[key] = append(buckets[key], i)
+	}
+	keys := make([]string, 0, len(buckets))
+	for key, bucket := range buckets {
+		if !sort.SliceIsSorted(bucket, func(i, j int) bool {
+			return candidateCursorLess(candidates[bucket[i]], candidates[bucket[j]])
+		}) {
+			sort.Slice(bucket, func(i, j int) bool {
+				return candidateCursorLess(candidates[bucket[i]], candidates[bucket[j]])
+			})
+		}
+		buckets[key] = bucket
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	s.pruneCursors(keys)
+
+	selected := make(map[string]bool, limit)
+	out := make([]Proxy, 0, limit)
+	s.selectPhase(candidates, keys, buckets, known, selected, limit, false, make(map[string]bool, len(keys)), &out)
+	// Keep the original "unseen first" behavior without wasting capacity
+	// when a feed is almost entirely already represented in the pool.
+	s.selectPhase(candidates, keys, buckets, known, selected, limit, true, make(map[string]bool, len(keys)), &out)
+
+	if err := s.save(); err != nil {
+		log.Printf("[sampler] save state failed: %v", err)
+	}
+	return out
+}
+
+// selectPhase does one round-robin pass category at a time. knownPhase=false
+// selects only candidates absent from known; knownPhase=true selects only
+// already-known candidates after discovery has exhausted all unseen choices.
+func (s *candidateSampler) selectPhase(candidates []Proxy, keys []string, buckets map[string][]int, known, selected map[string]bool, limit int, knownPhase bool, exhausted map[string]bool, out *[]Proxy) {
+	// A bucket that has no candidate for this phase stays empty until the
+	// next refresh. Remember that fact locally: otherwise a 100k-entry bucket
+	// full of already-known nodes would be walked again for every slot filled
+	// from another bucket (O(limit*n) work).
+	for len(*out) < limit {
+		start := firstBucketAfter(keys, s.state.LastBucket)
+		picked := false
+		for offset := 0; offset < len(keys); offset++ {
+			bucketKey := keys[(start+offset)%len(keys)]
+			if exhausted[bucketKey] {
+				continue
+			}
+			px, ok := s.nextMatching(candidates, bucketKey, buckets[bucketKey], known, selected, knownPhase)
+			if !ok {
+				exhausted[bucketKey] = true
+				continue
+			}
+			*out = append(*out, px)
+			selected[px.Key()] = true
+			s.state.LastBucket = bucketKey
+			picked = true
+			break
+		}
+		if !picked {
+			return
+		}
+	}
+}
+
+func candidateCursorLess(a, b Proxy) bool {
+	if a.IP != b.IP {
+		return a.IP < b.IP
+	}
+	return a.Port < b.Port
+}
+
+func candidateCursorKey(px Proxy) string { return px.IP + "\x00" + px.Port }
+
+func candidateBucketKey(px Proxy) string {
+	name := px.SourceName
+	if name == "" {
+		name = "unknown"
+	}
+	return name + "\x00" + px.Protocol
+}
+
+func firstBucketAfter(keys []string, last string) int {
+	if len(keys) == 0 {
+		return 0
+	}
+	idx := sort.Search(len(keys), func(i int) bool { return keys[i] > last })
+	if idx == len(keys) {
+		return 0
+	}
+	return idx
+}
+
+// nextMatching starts strictly after the saved cursor and advances the cursor
+// for every entry it examines. selected prevents the same failing-but-unseen
+// node from being selected twice in a single refresh.
+func (s *candidateSampler) nextMatching(candidates []Proxy, bucketKey string, bucket []int, known, selected map[string]bool, knownPhase bool) (Proxy, bool) {
+	if len(bucket) == 0 {
+		return Proxy{}, false
+	}
+	start := sort.Search(len(bucket), func(i int) bool {
+		return candidateCursorKey(candidates[bucket[i]]) > s.state.Cursors[bucketKey]
+	})
+	if start == len(bucket) {
+		start = 0
+	}
+	for i := 0; i < len(bucket); i++ {
+		px := candidates[bucket[(start+i)%len(bucket)]]
+		key := px.Key()
+		s.state.Cursors[bucketKey] = candidateCursorKey(px)
+		if selected[key] || known[key] != knownPhase {
+			continue
+		}
+		return px, true
+	}
+	return Proxy{}, false
+}
+
+func (s *candidateSampler) pruneCursors(keys []string) {
+	if len(s.state.Cursors) == 0 {
+		return
+	}
+	active := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		active[key] = true
+	}
+	for key := range s.state.Cursors {
+		if !active[key] {
+			delete(s.state.Cursors, key)
+		}
+	}
+}
+
+func (s *candidateSampler) save() error {
+	if s.path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(s.state)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".candidate_sampler-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, s.path)
+}

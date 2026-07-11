@@ -2,3 +2,6 @@
 socks5-pool
 /data/
 Dockerfile.local
+.env
+.env.*
+!.env.example

@@ -19,6 +19,19 @@ import (
 // under hundreds of concurrent probes.
 const defaultCheckURL = "http://www.google.com/generate_204"
 
+const (
+	builtinProxyIPSourceID = "builtin-proxyip"
+	maxConfiguredSources   = 64
+	maxSourceNameBytes     = 256
+	maxSourceURLBytes      = 8 << 10
+
+	legacyProxyIPSourceName = "ProxyIP (Cloudflare edge)"
+	legacyProxyIPSourceNote = "这些是 Cloudflare 边缘优选 IP，用于 Worker/VLESS/Trojan 类隧道脚本的反代地址，不支持通用 SOCKS5/HTTP 协议，不会参与本地转发，仅供查看和导出使用"
+
+	currentProxyIPSourceName = "ProxyIP (Cloudflare Worker reverse proxy)"
+	currentProxyIPSourceNote = "这些是供 Cloudflare Worker/VLESS/Trojan 类隧道使用的外部反代跳板，不是 Cloudflare 边缘 IP，也不支持通用 SOCKS5/HTTP 协议；不会参与本地转发，仅供目录查看和复制"
+)
+
 // Node-list source formats.
 const (
 	FormatTextRegex   = "text-regex"   // "scheme://ip:port" occurrences in free text
@@ -40,8 +53,12 @@ type Source struct {
 	// themselves; ignored for other formats (they carry their own).
 	Protocol string `json:"protocol,omitempty"`
 	Enabled  bool   `json:"enabled"`
-	Builtin  bool   `json:"builtin"`
-	Note     string `json:"note,omitempty"`
+	// AllowPrivate is an explicit escape hatch for trusted LAN-hosted feeds.
+	// It affects only the source download URL; proxy endpoints advertised by a
+	// feed are not removed or rewritten by this setting.
+	AllowPrivate bool   `json:"allow_private,omitempty"`
+	Builtin      bool   `json:"builtin"`
+	Note         string `json:"note,omitempty"`
 }
 
 // PoolConfig is the full persisted state: sources, routing rules, custom
@@ -68,7 +85,7 @@ type ConfigStore struct {
 }
 
 func NewConfigStore(dataDir string) (*ConfigStore, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	cs := &ConfigStore{path: filepath.Join(dataDir, "pool_config.json")}
@@ -90,7 +107,41 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cs.cfg = cfg
+	if migrateProxyIPSourceMetadata(&cs.cfg) {
+		if err := cs.writeLocked(); err != nil {
+			return nil, fmt.Errorf("persist source metadata migration: %w", err)
+		}
+	}
 	return cs, nil
+}
+
+// migrateProxyIPSourceMetadata updates only the two obsolete, known metadata
+// strings written by older releases. It intentionally does not reconcile the
+// persisted source list with defaultPoolConfig: operators may delete built-ins,
+// change their URL/format/enabled state, or give them custom labels. A legacy
+// record that predates the Builtin flag is still safe to migrate when one of
+// its metadata fields exactly matches the old value.
+func migrateProxyIPSourceMetadata(cfg *PoolConfig) bool {
+	changed := false
+	for i := range cfg.Sources {
+		source := &cfg.Sources[i]
+		if source.ID != builtinProxyIPSourceID {
+			continue
+		}
+		knownLegacyMetadata := source.Name == legacyProxyIPSourceName || source.Note == legacyProxyIPSourceNote
+		if !source.Builtin && !knownLegacyMetadata {
+			continue
+		}
+		if source.Name == legacyProxyIPSourceName {
+			source.Name = currentProxyIPSourceName
+			changed = true
+		}
+		if source.Note == legacyProxyIPSourceNote {
+			source.Note = currentProxyIPSourceNote
+			changed = true
+		}
+	}
+	return changed
 }
 
 func defaultPoolConfig() PoolConfig {
@@ -190,13 +241,13 @@ func defaultPoolConfig() PoolConfig {
 				Builtin:  true,
 			},
 			{
-				ID:      "builtin-proxyip",
-				Name:    "ProxyIP (Cloudflare edge)",
+				ID:      builtinProxyIPSourceID,
+				Name:    currentProxyIPSourceName,
 				URL:     "https://zip.cm.edu.kg/all.json",
 				Format:  FormatProxyIPJSON,
 				Enabled: false,
 				Builtin: true,
-				Note:    "这些是 Cloudflare 边缘优选 IP，用于 Worker/VLESS/Trojan 类隧道脚本的反代地址，不支持通用 SOCKS5/HTTP 协议，不会参与本地转发，仅供查看和导出使用",
+				Note:    currentProxyIPSourceNote,
 			},
 		},
 		Rules: []Rule{
@@ -212,7 +263,9 @@ func (cs *ConfigStore) writeLocked() error {
 		return err
 	}
 	tmp := cs.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// Source definitions and future custom upstreams can include credentials;
+	// keep the persisted configuration private to the service account.
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, cs.path)
@@ -250,6 +303,10 @@ func (cs *ConfigStore) EnabledSources() []Source {
 	var out []Source
 	for _, s := range cs.Sources() {
 		if s.Enabled {
+			// refreshPool also logs the display name on fetch failure. Sanitize a
+			// copied value here so legacy config written before AddSource validation
+			// cannot inject control lines or an unbounded label into logs.
+			s.Name = safeLogLabel(s.Name)
 			out = append(out, s)
 		}
 	}
@@ -257,14 +314,26 @@ func (cs *ConfigStore) EnabledSources() []Source {
 }
 
 func (cs *ConfigStore) AddSource(s Source) (Source, error) {
+	s.Name = strings.TrimSpace(s.Name)
+	s.URL = strings.TrimSpace(s.URL)
+	s.Protocol = strings.ToLower(strings.TrimSpace(s.Protocol))
 	if s.Name == "" || s.URL == "" {
 		return Source{}, fmt.Errorf("name and url are required")
+	}
+	if len(s.Name) > maxSourceNameBytes || hasLogControlCharacters(s.Name) {
+		return Source{}, fmt.Errorf("source name must be at most %d bytes and contain no control characters", maxSourceNameBytes)
+	}
+	if len(s.URL) > maxSourceURLBytes {
+		return Source{}, fmt.Errorf("source url exceeds %d bytes", maxSourceURLBytes)
+	}
+	if _, err := validateSourceURL(s.URL, s.AllowPrivate); err != nil {
+		return Source{}, err
 	}
 	switch s.Format {
 	case FormatTextRegex, FormatEDTJSON, FormatProxyIPJSON:
 	case FormatPlainList, FormatJSONArray:
-		if s.Protocol == "" {
-			return Source{}, fmt.Errorf("protocol is required for format %q", s.Format)
+		if !isForwardingProtocol(s.Protocol) {
+			return Source{}, fmt.Errorf("format %q requires protocol socks5, http, or https", s.Format)
 		}
 	default:
 		return Source{}, fmt.Errorf("unknown format: %q", s.Format)
@@ -274,6 +343,9 @@ func (cs *ConfigStore) AddSource(s Source) (Source, error) {
 	s.Enabled = true // a source you just added is one you want to use now
 
 	err := cs.mutate(func(c *PoolConfig) error {
+		if len(c.Sources) >= maxConfiguredSources {
+			return fmt.Errorf("source limit reached: at most %d sources are allowed", maxConfiguredSources)
+		}
 		for _, existing := range c.Sources {
 			if existing.URL == s.URL {
 				return fmt.Errorf("source with this URL already exists: %s", existing.Name)
@@ -328,14 +400,36 @@ func (cs *ConfigStore) SetCheckURL(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("url is required")
 	}
+	if len(raw) > maxSourceURLBytes {
+		return fmt.Errorf("url exceeds %d bytes", maxSourceURLBytes)
+	}
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("invalid url: must be a full http:// or https:// address")
+	}
+	// Health checks are sent through untrusted public proxies and the configured
+	// target is mentioned in operational diagnostics. Do not accept credentials
+	// in userinfo or a never-transmitted fragment where they are easy to leak or
+	// misunderstand. Query parameters remain supported for compatibility.
+	if u.User != nil {
+		return fmt.Errorf("invalid url: embedded username/password is not allowed")
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("invalid url: fragments are not allowed")
 	}
 	return cs.mutate(func(c *PoolConfig) error {
 		c.CheckURL = raw
 		return nil
 	})
+}
+
+func hasLogControlCharacters(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func generateID(prefix string) string {
