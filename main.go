@@ -106,6 +106,16 @@ func main() {
 	log.Printf("  scrape:   every %s", cfg.ScrapeInterval)
 
 	pool := NewProxyPool()
+	candidateCache := newCandidateCatalogCache(cfg.DataDir)
+	pool.candidates.SetDiskCache(candidateCache)
+	if loaded, loadErr := pool.candidates.LoadDiskCache(); loadErr != nil {
+		log.Printf("[candidate-cache] load failed, continuing with an empty catalog: %v", loadErr)
+	} else if loaded {
+		snapshot := pool.candidates.snapshot.Load()
+		snapshot.mu.RLock()
+		log.Printf("[candidate-cache] restored %d candidates (generation=%d revision=%d phase=%s)", len(snapshot.records), snapshot.generation, snapshot.revision, snapshot.phase)
+		snapshot.mu.RUnlock()
+	}
 
 	// Seed from the on-disk cache so the pool is usable immediately, then
 	// enable write-back so every refresh keeps the cache fresh.

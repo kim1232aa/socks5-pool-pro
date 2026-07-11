@@ -25,12 +25,15 @@ var proxyURLRegex = regexp.MustCompile(`(?i)(?:socks5|https?)://[^\s<>"']+`)
 const maxFetchBytes = 64 << 20 // 64MB safety cap for source downloads
 
 const (
-	sourceFetchAttempts        = 3
-	sourceFetchAttemptTimeout  = 12 * time.Second
-	sourceFetchTotalTimeout    = 30 * time.Second
+	sourceFetchAttempts = 3
+	// The bundled Fyvri archives are several MiB and can take 30-40 seconds to
+	// stream from their upstream host even after headers arrive. Bound every
+	// attempt, but leave enough body-read time for those known-good feeds.
+	sourceFetchAttemptTimeout  = 45 * time.Second
+	sourceFetchTotalTimeout    = 140 * time.Second
 	sourceFetchRetryDelay      = 250 * time.Millisecond
 	maxConcurrentSourceFetches = 4
-	sourceFetchQueueTimeout    = 2 * time.Minute
+	sourceFetchQueueTimeout    = 5 * time.Minute
 )
 
 // refreshPool intentionally starts one goroutine per configured source so a
@@ -327,7 +330,10 @@ func downloadSourceAttempt(ctx context.Context, client *http.Client, sourceURL s
 }
 
 func isRetryableSourceStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+	// Archive hosts occasionally return a transient 404 while an updated object
+	// propagates. It is still bounded by sourceFetchAttempts, so truly
+	// missing feeds fail after the same finite three attempts.
+	return status == http.StatusNotFound || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
 }
 
 func isRetryableNetworkError(err error) bool {

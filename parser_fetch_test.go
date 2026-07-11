@@ -70,19 +70,47 @@ func TestFetchSourceDoesNotRetryPermanent4xx(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts.Add(1)
-		http.Error(w, "not found", http.StatusNotFound)
+		http.Error(w, "forbidden", http.StatusForbidden)
 	}))
 	defer server.Close()
 
 	_, err := fetchSourceWithClient(testPlainListSource(server.URL), server.Client(), testSourceFetchPolicy(5))
 	if err == nil {
-		t.Fatal("fetchSourceWithClient() error = nil, want permanent 404 failure")
+		t.Fatal("fetchSourceWithClient() error = nil, want permanent 403 failure")
 	}
 	if got := attempts.Load(); got != 1 {
-		t.Fatalf("attempts = %d, want no retry for 404", got)
+		t.Fatalf("attempts = %d, want no retry for 403", got)
 	}
-	if !strings.Contains(err.Error(), "unexpected status: 404") {
-		t.Fatalf("error = %q, want 404 status", err)
+	if !strings.Contains(err.Error(), "unexpected status: 403") {
+		t.Fatalf("error = %q, want 403 status", err)
+	}
+}
+
+func TestFetchSourceRetriesTransientFyvriArchive404ThenSucceeds(t *testing.T) {
+	var attempts atomic.Int32
+	const fyvriArchivePath = "/fyvri/fresh-proxy-list/archive/storage/classic/http.json"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != fyvriArchivePath {
+			http.Error(w, "unexpected archive path", http.StatusBadRequest)
+			return
+		}
+		if attempts.Add(1) == 1 {
+			http.Error(w, "archive edge has not propagated", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("198.51.100.11:8080\n"))
+	}))
+	defer server.Close()
+
+	proxies, err := fetchSourceWithClient(testPlainListSource(server.URL+fyvriArchivePath), server.Client(), testSourceFetchPolicy(3))
+	if err != nil {
+		t.Fatalf("fetchSourceWithClient() error = %v", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want one bounded retry", got)
+	}
+	if len(proxies) != 1 || proxies[0].Addr() != "198.51.100.11:8080" {
+		t.Fatalf("proxies = %#v, want successful retry result", proxies)
 	}
 }
 
@@ -138,15 +166,61 @@ func TestFetchSourceClosesEveryRetryResponseBody(t *testing.T) {
 }
 
 func TestRetryableSourceStatuses(t *testing.T) {
-	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+	for _, status := range []int{http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		if !isRetryableSourceStatus(status) {
 			t.Errorf("status %d should be retryable", status)
 		}
 	}
-	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity} {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusUnprocessableEntity} {
 		if isRetryableSourceStatus(status) {
 			t.Errorf("status %d should not be retryable", status)
 		}
+	}
+}
+
+func TestProductionSourceFetchBudgetsCoverSlowArchiveBodies(t *testing.T) {
+	if sourceFetchAttemptTimeout < 45*time.Second {
+		t.Fatalf("attempt timeout = %s, want at least 45s for multi-MiB archive bodies", sourceFetchAttemptTimeout)
+	}
+	retryBudget := time.Duration(0)
+	for attempt := 1; attempt < sourceFetchAttempts; attempt++ {
+		retryBudget += sourceFetchRetryDelay * time.Duration(1<<(attempt-1))
+	}
+	minimumTotal := time.Duration(sourceFetchAttempts)*sourceFetchAttemptTimeout + retryBudget
+	if sourceFetchTotalTimeout < minimumTotal {
+		t.Fatalf("total timeout = %s, cannot cover three %s attempts plus retry backoff", sourceFetchTotalTimeout, sourceFetchAttemptTimeout)
+	}
+	if sourceFetchQueueTimeout < 5*time.Minute {
+		t.Fatalf("queue timeout = %s, want at least 5m behind four bounded slots", sourceFetchQueueTimeout)
+	}
+	if maxConcurrentSourceFetches != 4 || maxFetchBytes != 64<<20 {
+		t.Fatalf("resource bounds changed: concurrency=%d max-bytes=%d", maxConcurrentSourceFetches, maxFetchBytes)
+	}
+}
+
+func TestFetchSourceAllowsSlowResponseBodyWithinAttemptBudget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(80 * time.Millisecond)
+		_, _ = w.Write([]byte("198.51.100.13:8080\n"))
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	client.Timeout = 500 * time.Millisecond
+	proxies, err := fetchSourceWithClient(testPlainListSource(server.URL), client, sourceFetchPolicy{
+		Attempts:     1,
+		TotalTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("slow response body should complete within the attempt budget: %v", err)
+	}
+	if len(proxies) != 1 {
+		t.Fatalf("proxies = %#v, want one parsed response", proxies)
 	}
 }
 

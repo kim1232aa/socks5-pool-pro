@@ -43,7 +43,7 @@ func (s CandidateStatus) String() string {
 	}
 }
 
-// candidateRecord is intentionally compact. At roughly 32 bytes plus the
+// candidateRecord is intentionally compact. At roughly 56 bytes on amd64 plus the
 // address string, 500k records remain comfortably below the memory cost of
 // retaining 500k full Proxy values (which contain many strings and a slice).
 // Repeated source/protocol/country/city values are interned in snapshot-level
@@ -93,6 +93,9 @@ type candidateSnapshot struct {
 type CandidateCatalog struct {
 	nextGeneration atomic.Uint64
 	snapshot       atomic.Pointer[candidateSnapshot]
+	cacheMu        sync.RWMutex
+	cache          *candidateCatalogCache
+	persistMu      sync.Mutex
 }
 
 func (c *CandidateCatalog) protocolTotal(protocol string) (int, bool) {
@@ -376,25 +379,33 @@ func rebuildCandidateSourceFacets(snapshot *candidateSnapshot) {
 	totals := make(map[string]int, len(snapshot.sources))
 	displays := make(map[string]string, len(snapshot.sources))
 	foldedSources := make([]string, len(snapshot.sources))
+	foldedIDs := make([]uint32, len(snapshot.sources))
+	foldedIndex := make(map[string]uint32, len(snapshot.sources))
 	for i, display := range snapshot.sources {
-		foldedSources[i] = strings.ToLower(display)
+		folded := strings.ToLower(display)
+		foldedSources[i] = folded
+		id, ok := foldedIndex[folded]
+		if !ok {
+			id = uint32(len(foldedIndex))
+			foldedIndex[folded] = id
+		}
+		foldedIDs[i] = id
 	}
-	for _, record := range snapshot.records {
+	// A source display may occur more than once on one candidate (for example,
+	// two separately configured feeds with the same name). Epoch markers keep
+	// that per-record de-duplication linear without allocating a map per row.
+	seenFolded := make([]uint32, len(foldedIndex))
+	for recordIndex, record := range snapshot.records {
+		epoch := uint32(recordIndex + 1)
 		for i := uint32(0); i < uint32(record.sourceCount); i++ {
 			ref := snapshot.sourceRefs[record.sourceOffset+i]
 			display := snapshot.sources[ref]
 			folded := foldedSources[ref]
-			duplicate := false
-			for j := uint32(0); j < i; j++ {
-				priorRef := snapshot.sourceRefs[record.sourceOffset+j]
-				if foldedSources[priorRef] == folded {
-					duplicate = true
-					break
-				}
-			}
-			if duplicate {
+			foldedID := foldedIDs[ref]
+			if seenFolded[foldedID] == epoch {
 				continue
 			}
+			seenFolded[foldedID] = epoch
 			totals[folded]++
 			if previous := displays[folded]; previous == "" || display < previous {
 				displays[folded] = display
@@ -752,8 +763,8 @@ func (c *CandidateCatalog) complete(refresh candidateRefresh, checked, alive []P
 		return
 	}
 	current.mu.Lock()
-	defer current.mu.Unlock()
 	if current.generation != refresh.generation {
+		current.mu.Unlock()
 		return
 	}
 	checkedAt := time.Now().Unix()
@@ -789,6 +800,12 @@ func (c *CandidateCatalog) complete(refresh candidateRefresh, checked, alive []P
 		current.phase = "complete"
 	}
 	current.revision++
+	current.mu.Unlock()
+
+	// Disk compression may take noticeable time for a 500k-row inventory. Keep
+	// it outside the snapshot write lock so API readers never wait on filesystem
+	// IO; the cache takes its own RLock while encoding one consistent image.
+	c.persistCompletedSnapshot(current)
 }
 
 func (s *candidateSnapshot) find(protocol, addr string) int {
