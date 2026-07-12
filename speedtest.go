@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -98,11 +97,16 @@ func SpeedTest(px Proxy, timeout time.Duration) (SpeedTestResult, error) {
 // from starting, so abandoned browser requests do not occupy a global slot for
 // the rest of the 42-second operation budget.
 func SpeedTestContext(parent context.Context, px Proxy, timeout time.Duration) (SpeedTestResult, error) {
+	result, _, err := speedTestCredentialCandidatesContext(parent, px, timeout)
+	return result, err
+}
+
+func speedTestCredentialCandidatesContext(parent context.Context, px Proxy, timeout time.Duration) (SpeedTestResult, Proxy, error) {
 	if px.Protocol != "socks5" && px.Protocol != "http" && px.Protocol != "https" {
-		return SpeedTestResult{}, fmt.Errorf("protocol %q does not support forwarding", px.Protocol)
+		return SpeedTestResult{}, px, fmt.Errorf("protocol %q does not support forwarding", px.Protocol)
 	}
 	if timeout <= 0 {
-		return SpeedTestResult{}, fmt.Errorf("测速超时预算必须大于 0")
+		return SpeedTestResult{}, px, fmt.Errorf("测速超时预算必须大于 0")
 	}
 
 	if parent == nil {
@@ -120,43 +124,58 @@ func SpeedTestContext(parent context.Context, px Proxy, timeout time.Duration) (
 		primaryBudget = speedTestPrimaryMaxBudget
 	}
 	primary := speedTestEndpoint{Name: "Cloudflare", URL: speedTestURL}
-	result, primaryErr := runSpeedTestEndpoint(ctx, px, primary, primaryBudget)
+	result, primaryVerified, primaryCredentialAccepted, primaryErr := runSpeedTestEndpoint(ctx, px, primary, primaryBudget)
+	working := px
+	if primaryCredentialAccepted {
+		working = primaryVerified
+	}
 	if primaryErr == nil {
-		return result, nil
+		return result, working, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return SpeedTestResult{}, &speedTestStoppedError{Primary: primaryErr, Cause: ctxErr}
+		return SpeedTestResult{}, working, &speedTestStoppedError{Primary: primaryErr, Cause: ctxErr}
 	}
 
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return SpeedTestResult{}, &speedTestStoppedError{Primary: primaryErr, Cause: context.DeadlineExceeded}
+		return SpeedTestResult{}, working, &speedTestStoppedError{Primary: primaryErr, Cause: context.DeadlineExceeded}
 	}
 	fallbackBudget := remaining
 	if fallbackBudget > speedTestFallbackMaxBudget {
 		fallbackBudget = speedTestFallbackMaxBudget
 	}
 	fallback := speedTestEndpoint{Name: "Hetzner", URL: speedTestFallbackURL, RequireRange: true}
-	result, fallbackErr := runSpeedTestEndpoint(ctx, px, fallback, fallbackBudget)
+	result, fallbackVerified, fallbackCredentialAccepted, fallbackErr := runSpeedTestEndpoint(ctx, working, fallback, fallbackBudget)
+	if fallbackCredentialAccepted {
+		working = fallbackVerified
+	}
 	if fallbackErr == nil {
-		return result, nil
+		return result, working, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return SpeedTestResult{}, &speedTestStoppedError{Primary: primaryErr, Fallback: fallbackErr, Cause: ctxErr}
+		return SpeedTestResult{}, working, &speedTestStoppedError{Primary: primaryErr, Fallback: fallbackErr, Cause: ctxErr}
 	}
-	return SpeedTestResult{}, &speedTestCombinedError{Primary: primaryErr, Fallback: fallbackErr}
+	return SpeedTestResult{}, working, &speedTestCombinedError{Primary: primaryErr, Fallback: fallbackErr}
 }
 
-func runSpeedTestEndpoint(parent context.Context, px Proxy, endpoint speedTestEndpoint, budget time.Duration) (SpeedTestResult, error) {
+func runSpeedTestEndpoint(parent context.Context, px Proxy, endpoint speedTestEndpoint, budget time.Duration) (result SpeedTestResult, verified Proxy, credentialAccepted bool, returnErr error) {
+	verified = px
 	if budget <= 0 {
-		return SpeedTestResult{}, fmt.Errorf("%s 测速预算已耗尽", endpoint.Name)
+		return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速预算已耗尽", endpoint.Name)
 	}
 	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
+	dialer := newCredentialCandidateDialer(px, budget)
+	defer func() {
+		if candidate, ok := dialer.Verified(); ok {
+			verified = candidate
+			credentialAccepted = true
+		}
+	}()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.URL, nil)
 	if err != nil {
-		return SpeedTestResult{}, fmt.Errorf("%s 测速请求无效: %w", endpoint.Name, err)
+		return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速请求无效: %w", endpoint.Name, err)
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 	if endpoint.RequireRange {
@@ -164,9 +183,7 @@ func runSpeedTestEndpoint(parent context.Context, px Proxy, endpoint speedTestEn
 	}
 
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return DialUpstreamContext(ctx, px, addr, budget)
-		},
+		DialContext:        dialer.DialContext,
 		DisableKeepAlives:  true,
 		DisableCompression: true,
 	}
@@ -181,26 +198,26 @@ func runSpeedTestEndpoint(parent context.Context, px Proxy, endpoint speedTestEn
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return SpeedTestResult{}, fmt.Errorf("%s 请求失败: %w", endpoint.Name, err)
+		return SpeedTestResult{}, verified, false, fmt.Errorf("%s 请求失败: %w", endpoint.Name, err)
 	}
 	defer resp.Body.Close()
 
 	if endpoint.RequireRange {
 		if resp.StatusCode != http.StatusPartialContent {
-			return SpeedTestResult{}, fmt.Errorf("%s Range 测速站返回异常状态:%s", endpoint.Name, resp.Status)
+			return SpeedTestResult{}, verified, false, fmt.Errorf("%s Range 测速站返回异常状态:%s", endpoint.Name, resp.Status)
 		}
 		if !validSpeedTestContentRange(resp.Header.Get("Content-Range")) {
-			return SpeedTestResult{}, fmt.Errorf("%s Range 响应范围无效:%q", endpoint.Name, resp.Header.Get("Content-Range"))
+			return SpeedTestResult{}, verified, false, fmt.Errorf("%s Range 响应范围无效:%q", endpoint.Name, resp.Header.Get("Content-Range"))
 		}
 		if resp.ContentLength >= 0 && resp.ContentLength != speedTestMaxBytes {
-			return SpeedTestResult{}, fmt.Errorf("%s Range 响应声明 %d 字节,需要 %d 字节", endpoint.Name, resp.ContentLength, speedTestMaxBytes)
+			return SpeedTestResult{}, verified, false, fmt.Errorf("%s Range 响应声明 %d 字节,需要 %d 字节", endpoint.Name, resp.ContentLength, speedTestMaxBytes)
 		}
 	} else {
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			return SpeedTestResult{}, fmt.Errorf("%s 测速站返回异常状态:%s", endpoint.Name, resp.Status)
+			return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速站返回异常状态:%s", endpoint.Name, resp.Status)
 		}
 		if resp.ContentLength >= 0 && resp.ContentLength < speedTestMaxBytes {
-			return SpeedTestResult{}, fmt.Errorf("%s 测速站仅声明返回 %d 字节,不足 %d 字节", endpoint.Name, resp.ContentLength, speedTestMaxBytes)
+			return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速站仅声明返回 %d 字节,不足 %d 字节", endpoint.Name, resp.ContentLength, speedTestMaxBytes)
 		}
 	}
 
@@ -208,13 +225,13 @@ func runSpeedTestEndpoint(parent context.Context, px Proxy, endpoint speedTestEn
 	n, copyErr := io.CopyN(io.Discard, resp.Body, speedTestMaxBytes)
 	elapsed := time.Since(start)
 	if copyErr != nil {
-		return SpeedTestResult{}, fmt.Errorf("%s 测速下载不完整:%d/%d 字节: %w", endpoint.Name, n, speedTestMaxBytes, copyErr)
+		return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速下载不完整:%d/%d 字节: %w", endpoint.Name, n, speedTestMaxBytes, copyErr)
 	}
 	if n != speedTestMaxBytes {
-		return SpeedTestResult{}, fmt.Errorf("%s 测速下载不完整:%d/%d 字节", endpoint.Name, n, speedTestMaxBytes)
+		return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速下载不完整:%d/%d 字节", endpoint.Name, n, speedTestMaxBytes)
 	}
 	if elapsed <= 0 {
-		return SpeedTestResult{}, fmt.Errorf("%s 测速耗时无效", endpoint.Name)
+		return SpeedTestResult{}, verified, false, fmt.Errorf("%s 测速耗时无效", endpoint.Name)
 	}
 
 	durationMs := elapsed.Milliseconds()
@@ -225,7 +242,7 @@ func runSpeedTestEndpoint(parent context.Context, px Proxy, endpoint speedTestEn
 		Kbps:       float64(n) * 8 / 1000 / elapsed.Seconds(),
 		Bytes:      n,
 		DurationMs: durationMs,
-	}, nil
+	}, verified, false, nil
 }
 
 func validSpeedTestContentRange(value string) bool {

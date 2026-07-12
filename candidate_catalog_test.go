@@ -96,6 +96,47 @@ func TestCandidateCatalogPageClassificationFilteringAndRedaction(t *testing.T) {
 	assertCandidateStatus(t, updatedByKey, available.Key(), "known_unavailable")
 }
 
+func TestCandidateCatalogResetHealthOutcomesRetainsInventoryAndResources(t *testing.T) {
+	failed := Proxy{IP: "192.0.2.51", Port: "8080", Protocol: "http", SourceName: "feed"}
+	policy := Proxy{IP: "192.0.2.52", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	resource := Proxy{IP: "198.51.100.52", Port: "443", Protocol: "proxyip", SourceName: "resource"}
+	pool := NewProxyPool()
+	refresh := pool.candidates.begin([]Proxy{failed, policy, resource}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{failed, policy}, nil, map[string]bool{policy.Key(): true})
+
+	if reset := pool.candidates.ResetHealthOutcomes(); reset != 2 {
+		t.Fatalf("reset=%d, want 2", reset)
+	}
+	page := NewStatusServer(pool, &ConfigStore{}).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
+	if page.CandidateTotal != 3 || page.Phase != "restored" {
+		t.Fatalf("reset page = %#v", page)
+	}
+	byKey := make(map[string]CandidateView)
+	for _, candidate := range page.Candidates {
+		byKey[candidate.Key] = candidate
+	}
+	assertCandidateStatus(t, byKey, failed.Key(), "deferred")
+	assertCandidateStatus(t, byKey, policy.Key(), "deferred")
+	assertCandidateStatus(t, byKey, resource.Key(), "resource")
+	if byKey[failed.Key()].LastChecked != "" || byKey[policy.Key()].LastChecked != "" {
+		t.Fatalf("criterion-dependent timestamps survived reset: %#v", byKey)
+	}
+}
+
+func TestCandidateCatalogHasAuthIncludesAlternateCredentials(t *testing.T) {
+	px := Proxy{
+		IP: "192.0.2.53", Port: "1080", Protocol: "socks5", SourceName: "feed",
+		CredentialAlternates: []ProxyCredential{{Username: "alternate", Password: "secret"}},
+	}
+	pool := NewProxyPool()
+	refresh := pool.candidates.begin([]Proxy{px}, nil, nil, 0)
+	pool.candidates.complete(refresh, nil, nil, nil)
+	page := NewStatusServer(pool, &ConfigStore{}).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page", nil))
+	if len(page.Candidates) != 1 || !page.Candidates[0].HasAuth {
+		t.Fatalf("alternate credential auth marker = %#v", page.Candidates)
+	}
+}
+
 func TestCandidateCatalogPartialSourceCycleUnionsInsteadOfDeleting(t *testing.T) {
 	pool := NewProxyPool()
 	oldA := Proxy{IP: "192.0.2.10", Port: "80", Protocol: "http", SourceName: "source-a", Country: "US"}

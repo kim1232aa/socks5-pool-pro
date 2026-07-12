@@ -25,7 +25,7 @@ func TestCandidateCatalogCacheRoundTripRedactsCredentialsAndRestoresReadiness(t 
 	)
 	labels := map[string]string{"source-a-id": "Source A"}
 	proxy := Proxy{
-		IP: "192.0.2.44", Port: "8080", Protocol: "http",
+		IP: "8.8.8.44", Port: "8080", Protocol: "http",
 		Country: "JP", City: "Tokyo", Continent: "AS",
 		SourceName: "source-a-id", SourceNames: []string{"source-a-id"},
 		Username: secretUser, Password: secretPass,
@@ -91,9 +91,9 @@ func TestCandidateCatalogCacheRoundTripRedactsCredentialsAndRestoresReadiness(t 
 func TestCandidateCatalogCacheRetainsOnlyFailedSourcesAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 	labels := map[string]string{"source-a-id": "Source A", "source-b-id": "Source B"}
-	oldA := candidateFromSource("192.0.2.60", "source-a-id", "Source A")
-	oldB := candidateFromSource("192.0.2.61", "source-b-id", "Source B")
-	newB := candidateFromSource("192.0.2.62", "source-b-id", "Source B")
+	oldA := candidateFromSource("8.8.8.60", "source-a-id", "Source A")
+	oldB := candidateFromSource("8.8.8.61", "source-b-id", "Source B")
+	newB := candidateFromSource("8.8.8.62", "source-b-id", "Source B")
 
 	first := &CandidateCatalog{}
 	first.SetDiskCache(newCandidateCatalogCache(dir))
@@ -124,6 +124,40 @@ func TestCandidateCatalogCacheRetainsOnlyFailedSourcesAcrossRestart(t *testing.T
 	}
 	if candidateFacetTotal(page.Sources, "Source A") != 1 || candidateFacetTotal(page.Sources, "Source B") != 1 {
 		t.Fatalf("restored source facets = %#v", page.Sources)
+	}
+}
+
+func TestCandidateCatalogCacheDropsNonPublicLiteralsWithoutLosingPublicOrHostnameRows(t *testing.T) {
+	dir := t.TempDir()
+	cache := newCandidateCatalogCache(dir)
+	labels := map[string]string{"source-a-id": "Source A"}
+	candidates := []Proxy{
+		candidateFromSource("0.103.177.131", "source-a-id", "Source A"),
+		candidateFromSource("10.0.0.1", "source-a-id", "Source A"),
+		candidateFromSource("192.0.2.1", "source-a-id", "Source A"),
+		candidateFromSource("8.8.8.8", "source-a-id", "Source A"),
+		candidateFromSource("proxy.example.test", "source-a-id", "Source A"),
+		{IP: "203.0.113.1", Port: "443", Protocol: "proxyip", SourceName: "source-a-id", SourceNames: []string{"source-a-id"}},
+		{IP: "1.1.1.1", Port: "443", Protocol: "proxyip", SourceName: "source-a-id", SourceNames: []string{"source-a-id"}},
+	}
+	snapshot := buildCandidateSnapshot(candidates, labels)
+	snapshot.generation = 1
+	snapshot.revision = 1
+	snapshot.phase = "complete"
+	if err := cache.save(snapshot); err != nil {
+		t.Fatalf("save legacy candidate cache: %v", err)
+	}
+
+	restored, err := cache.load()
+	if err != nil {
+		t.Fatalf("load legacy candidate cache: %v", err)
+	}
+	got := make(map[string]bool, len(restored.records))
+	for _, record := range restored.records {
+		got[restored.protocols[record.protocolID]+"://"+record.addr] = true
+	}
+	if len(got) != 3 || !got["http://8.8.8.8:8080"] || !got["http://proxy.example.test:8080"] || !got["proxyip://1.1.1.1:443"] {
+		t.Fatalf("restored filtered records = %v, want public literal, hostname and public ProxyIP only", got)
 	}
 }
 
@@ -186,7 +220,7 @@ func TestCandidateCacheDecoderRejectsOversizedCountBeforeAllocation(t *testing.T
 }
 
 func TestCandidateCatalogCacheRejectsGenerationThatWouldWrap(t *testing.T) {
-	snapshot := buildCandidateSnapshot([]Proxy{candidateFromSource("192.0.2.70", "source-a-id", "Source A")}, map[string]string{"source-a-id": "Source A"})
+	snapshot := buildCandidateSnapshot([]Proxy{candidateFromSource("8.8.8.70", "source-a-id", "Source A")}, map[string]string{"source-a-id": "Source A"})
 	snapshot.generation = ^uint64(0)
 	snapshot.revision = 1
 	snapshot.phase = "complete"
@@ -199,7 +233,7 @@ func TestCandidateCatalogCacheNormalizesPersistedGenerationAndKeepsSaving(t *tes
 	dir := t.TempDir()
 	cache := newCandidateCatalogCache(dir)
 	labels := map[string]string{"source-a-id": "Source A"}
-	proxy := candidateFromSource("192.0.2.71", "source-a-id", "Source A")
+	proxy := candidateFromSource("8.8.8.71", "source-a-id", "Source A")
 	snapshot := buildCandidateSnapshot([]Proxy{proxy}, labels)
 	snapshot.generation = ^uint64(0) - 1
 	snapshot.revision = 1
@@ -235,7 +269,7 @@ func TestCandidateCatalogCacheNormalizesPersistedGenerationAndKeepsSaving(t *tes
 }
 
 func TestCandidateCatalogCacheRejectsDuplicateSourceReferences(t *testing.T) {
-	proxy := candidateFromSource("192.0.2.72", "source-a-id", "Source A")
+	proxy := candidateFromSource("8.8.8.72", "source-a-id", "Source A")
 	proxy.SourceNames = []string{"source-a-id", "source-b-id"}
 	snapshot := buildCandidateSnapshot([]Proxy{proxy}, map[string]string{"source-a-id": "Source A", "source-b-id": "Source B"})
 	snapshot.generation = 1
@@ -248,7 +282,7 @@ func TestCandidateCatalogCacheRejectsDuplicateSourceReferences(t *testing.T) {
 }
 
 func TestCandidateCatalogCacheRejectsUnsortedSourceReferences(t *testing.T) {
-	proxy := candidateFromSource("192.0.2.73", "source-a-id", "Source A")
+	proxy := candidateFromSource("8.8.8.73", "source-a-id", "Source A")
 	proxy.SourceNames = []string{"source-a-id", "source-b-id"}
 	snapshot := buildCandidateSnapshot([]Proxy{proxy}, map[string]string{"source-a-id": "Source A", "source-b-id": "Source B"})
 	snapshot.generation = 1

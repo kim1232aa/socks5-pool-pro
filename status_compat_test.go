@@ -19,6 +19,9 @@ func TestStatusSummaryKeepsIPPoolCompatibilityContract(t *testing.T) {
 		},
 		{IP: "198.51.100.11", Port: "8080", Protocol: "http", Available: true},
 		{IP: "198.51.100.12", Port: "1080", Protocol: "socks5", Available: false},
+		// Defensive fixture: contradictory cache bits must fail closed rather
+		// than leaking a hard-retired node through the extraction contract.
+		{IP: "198.51.100.13", Port: "1080", Protocol: "socks5", Available: true, SourceRetired: true},
 	}, nil)
 	store := &ConfigStore{cfg: PoolConfig{
 		Rules: []Rule{{Type: RuleMatch, Group: GroupAny}},

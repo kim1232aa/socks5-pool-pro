@@ -459,6 +459,83 @@ func TestUnavailableStickyNodeFallsBackToHealthyPeer(t *testing.T) {
 	}
 }
 
+func TestForceStickyRejectsCurrentlyUnavailableTarget(t *testing.T) {
+	p := NewProxyPool()
+	unavailable := testProxy("socks5", "192.0.2.23", "1080", false)
+	healthy := testProxy("socks5", "192.0.2.24", "1080", true)
+	p.Prime([]Proxy{unavailable, healthy}, nil)
+
+	if result := p.forceSticky(GroupAny, unavailable.Key()); result != forceStickyUnavailable {
+		t.Fatalf("forceSticky(unavailable) = %v, want forceStickyUnavailable", result)
+	}
+	if p.IsPinned(GroupAny) {
+		t.Fatal("rejected unavailable node left ANY falsely pinned")
+	}
+	if p.ForceSticky(GroupAny, unavailable.Key()) {
+		t.Fatal("ForceSticky reported success for an unavailable node")
+	}
+	if !p.ForceSticky(GroupAny, healthy.Key()) || !p.IsPinned(GroupAny) {
+		t.Fatal("healthy target no longer supports explicit sticky selection")
+	}
+}
+
+func TestCurrentGenerationFailureClearsWaitingForRecheckWithoutReviving(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.27", "1080", true)
+	px.PolicyExcluded = true // stale policy annotation from the former criterion
+	p.Prime([]Proxy{px}, nil)
+	p.SetHealthCriterion(defaultCheckURL)
+	p.InvalidateHealth("https://example.com/new-health")
+	generation := p.HealthGeneration()
+
+	if !p.ObserveHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation) {
+		t.Fatal("current-generation failure was not observed")
+	}
+	got, ok := p.Find(px.Key())
+	if !ok || got.Available || got.HealthInvalidated || got.PolicyExcluded {
+		t.Fatalf("failed current-generation result = %+v, found=%v; want ordinary unavailable", got, ok)
+	}
+	_, failures := p.StatsOf(px.Key())
+	if failures != 1 {
+		t.Fatalf("failure count = %d, want 1", failures)
+	}
+}
+
+func TestUpdateWithEnabledSourcesAndPolicyMakesHardExclusionWin(t *testing.T) {
+	p := NewProxyPool()
+	p.SetHealthCriterion(defaultCheckURL)
+	source := Source{ID: "source-a", Name: "Source A", Enabled: true}
+	filtered := testProxy("socks5", "192.0.2.25", "1080", true)
+	filtered.SourceIDs = []string{source.ID}
+	filtered.SourceNames = []string{source.Name}
+	healthy := testProxy("socks5", "192.0.2.26", "1080", true)
+	healthy.SourceIDs = []string{source.ID}
+	healthy.SourceNames = []string{source.Name}
+	p.Prime([]Proxy{filtered, healthy}, nil)
+
+	// Supplying the filtered key in freshlyAlive is deliberately defensive: even
+	// under inconsistent inputs, the hard policy result must win in the one
+	// published pool generation rather than briefly reviving the node.
+	if !p.UpdateWithEnabledSourcesAndPolicy(
+		[]Proxy{filtered, healthy}, nil, map[string]bool{filtered.Key(): true},
+		[]Source{source}, p.HealthGeneration(),
+	) {
+		t.Fatal("current-generation refresh was rejected")
+	}
+	got, ok := p.Find(filtered.Key())
+	if !ok || got.Available || !got.PolicyExcluded || got.HealthInvalidated {
+		t.Fatalf("policy-filtered retained node = %+v, ok=%v", got, ok)
+	}
+	selected, ok, direct := p.Pick(GroupAny, nil)
+	if !ok || direct || selected.Key() != healthy.Key() {
+		t.Fatalf("selection after atomic policy publication = %+v, ok=%v direct=%v; want healthy peer", selected, ok, direct)
+	}
+	views := apiPoolProxiesFrom(p.All())
+	if len(views) != 1 || views[0].ProxyURL != healthy.ConsumerURL() {
+		t.Fatalf("healthy compatibility views after atomic policy publication = %#v", views)
+	}
+}
+
 func TestRecheckCandidatesRotatesBoundedKnownPool(t *testing.T) {
 	p := NewProxyPool()
 	all := []Proxy{
@@ -489,6 +566,209 @@ func TestRecheckCandidatesRotatesBoundedKnownPool(t *testing.T) {
 	}
 	if second[0].Key() == first[0].Key() {
 		t.Fatalf("second bounded recheck restarted at the first node: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestInvalidateHealthRetainsNodesAndAllowsImmediateRecovery(t *testing.T) {
+	p := NewProxyPool()
+	a := Proxy{Protocol: "socks5", IP: "192.0.2.10", Port: "1080", Available: true}
+	b := Proxy{Protocol: "http", IP: "192.0.2.20", Port: "8080", Available: true}
+	p.Update([]Proxy{a, b}, nil)
+
+	if changed := p.InvalidateHealth(); changed != 2 {
+		t.Fatalf("InvalidateHealth() changed %d nodes, want 2", changed)
+	}
+	if got := p.Size(); got != 2 {
+		t.Fatalf("pool size after invalidation = %d, want 2", got)
+	}
+	for _, px := range p.All() {
+		if px.Available {
+			t.Fatalf("node %s remained available after invalidation", px.Key())
+		}
+	}
+	if got, ok, _ := p.Pick(GroupAny, nil); ok {
+		t.Fatalf("criterion-invalid node remained routable through fallback: %+v", got)
+	}
+
+	if !p.ObserveHealthResult(a.Key(), true, 12) {
+		t.Fatal("ObserveHealthResult() did not find retained node")
+	}
+	recovered, ok := p.Find(a.Key())
+	if !ok || !recovered.Available {
+		t.Fatalf("retained node did not recover: ok=%v proxy=%+v", ok, recovered)
+	}
+}
+
+func TestHealthGenerationRejectsStaleAsynchronousResults(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.19", "1080", true)
+	p.Prime([]Proxy{px}, nil)
+	oldGeneration := p.HealthGeneration()
+	p.InvalidateHealth()
+
+	if p.ObserveHealthResultAtGeneration(px.Key(), true, 8, oldGeneration) {
+		t.Fatal("stale health observation was applied")
+	}
+	if got, _ := p.Find(px.Key()); got.Available {
+		t.Fatal("stale health observation restored availability")
+	}
+	if p.Update([]Proxy{px}, nil, oldGeneration) {
+		t.Fatal("stale refresh update was applied")
+	}
+
+	currentGeneration := p.HealthGeneration()
+	if !p.ObserveHealthResultAtGeneration(px.Key(), true, 8, currentGeneration) {
+		t.Fatal("current health observation was not applied")
+	}
+	if got, _ := p.Find(px.Key()); !got.Available {
+		t.Fatal("current health observation did not restore availability")
+	}
+}
+
+func TestInvalidateHealthCancelsActiveGenerationWork(t *testing.T) {
+	p := NewProxyPool()
+	p.SetHealthCriterion(defaultCheckURL)
+	ctx, finish, ok := p.BeginHealthWork(p.HealthGeneration())
+	if !ok {
+		t.Fatal("failed to start current health work")
+	}
+	defer finish()
+	p.InvalidateHealth("https://example.com/new-health")
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("criterion invalidation did not cancel active work")
+	}
+}
+
+func TestReachablePolicyFilteredObservationStaysUnavailable(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.27", "1080", false)
+	p.Prime([]Proxy{px}, nil)
+	if !p.ObserveHealthOutcomeAtGeneration(px.Key(), true, false, 11, p.HealthGeneration()) {
+		t.Fatal("policy-filtered observation did not find node")
+	}
+	got, _ := p.Find(px.Key())
+	if got.Available || got.LatencyMs != 11 {
+		t.Fatalf("policy-filtered node = %+v", got)
+	}
+	if selected, ok, _ := p.Pick(GroupAny, nil); ok {
+		t.Fatalf("policy-excluded node remained routable: %+v", selected)
+	}
+	successes, failures := p.StatsOf(px.Key())
+	if successes != 1 || failures != 0 {
+		t.Fatalf("policy reachability stats = %d/%d", successes, failures)
+	}
+}
+
+func TestUpdateVerifiedCredentialsPromotesWorkingAlternative(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.29", "1080", true)
+	px.Username, px.Password = "old", "wrong"
+	px.CredentialAlternates = []ProxyCredential{{Username: "new", Password: "working"}}
+	p.Prime([]Proxy{px}, nil)
+	verified := px.promoteCredential(Proxy{Username: "new", Password: "working", CredentialAlternates: px.CredentialAlternates})
+
+	if !p.UpdateVerifiedCredentialsAtGeneration(px.Key(), verified, p.HealthGeneration()) {
+		t.Fatal("known node credentials were not updated")
+	}
+	got, _ := p.Find(px.Key())
+	if got.Username != "new" || got.Password != "working" {
+		t.Fatalf("primary credential = %q/%q, want promoted working pair", got.Username, got.Password)
+	}
+	if len(got.CredentialAlternates) != 1 || got.CredentialAlternates[0].Username != "old" {
+		t.Fatalf("credential alternatives = %#v, want old primary retained", got.CredentialAlternates)
+	}
+}
+
+func TestApplyEnabledSourcesRetiresOnlyOrphanedProvenance(t *testing.T) {
+	p := NewProxyPool()
+	onlyDisabled := testProxy("socks5", "192.0.2.31", "1080", true)
+	onlyDisabled.SourceName = "private"
+	onlyDisabled.SourceNames = []string{"private"}
+	onlyDisabled.SourceIDs = []string{"src-private"}
+	shared := testProxy("http", "192.0.2.32", "8080", true)
+	shared.SourceName = "private"
+	shared.SourceNames = []string{"private", "public"}
+	shared.SourceIDs = []string{"src-private", "src-public"}
+	legacy := testProxy("http", "192.0.2.33", "8080", true)
+	legacy.SourceName = "public"
+	p.Prime([]Proxy{onlyDisabled, shared, legacy}, nil)
+
+	sources := []Source{
+		{ID: "src-private", Name: "private", Enabled: false},
+		{ID: "src-public", Name: "public", Enabled: true},
+	}
+	if retired := p.ApplyEnabledSources(sources); retired != 2 {
+		t.Fatalf("ApplyEnabledSources() retired %d nodes, want 2", retired)
+	}
+	for _, tt := range []struct {
+		key       string
+		available bool
+		retired   bool
+	}{
+		{onlyDisabled.Key(), false, true},
+		// Credentials are endpoint-level, so a node merged from enabled and
+		// disabled feeds remains conservatively retired until a new refresh
+		// reconstructs it solely from enabled provenance.
+		{shared.Key(), false, true},
+		{legacy.Key(), true, false},
+	} {
+		px, ok := p.Find(tt.key)
+		if !ok || px.Available != tt.available || px.SourceRetired != tt.retired {
+			t.Fatalf("node %s = %+v, ok=%v; want available=%v retired=%v", tt.key, px, ok, tt.available, tt.retired)
+		}
+	}
+	for _, px := range p.RecheckCandidates(10) {
+		if px.Key() == onlyDisabled.Key() || px.Key() == shared.Key() {
+			t.Fatalf("source-retired node %s was scheduled for background recheck", px.Key())
+		}
+	}
+	if !p.ObserveHealthResult(onlyDisabled.Key(), true, 5) {
+		t.Fatal("retired node disappeared instead of being retained")
+	}
+	if px, _ := p.Find(onlyDisabled.Key()); px.Available {
+		t.Fatal("health success bypassed source retirement")
+	}
+	got, ok, direct := p.Pick(GroupAny, nil)
+	if !ok || direct || got.Key() != legacy.Key() {
+		t.Fatalf("ANY selection = %+v, ok=%v direct=%v; want active legacy node", got, ok, direct)
+	}
+}
+
+func TestSourceRetiredNodeIsNeverUsedAsUnavailableFallback(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.44", "1080", true)
+	px.SourceIDs = []string{"removed-source"}
+	px.SourceNames = []string{"removed"}
+	p.Prime([]Proxy{px}, nil)
+	if retired := p.ApplyEnabledSources(nil); retired != 1 {
+		t.Fatalf("retired=%d, want 1", retired)
+	}
+	if got, ok, direct := p.Pick(GroupAny, nil); ok || direct {
+		t.Fatalf("Pick returned retired node %+v, ok=%v direct=%v", got, ok, direct)
+	}
+	if got, ok := p.RotateSticky(GroupAny); ok {
+		t.Fatalf("RotateSticky returned retired node %+v", got)
+	}
+	if got, ok, _ := p.EffectiveCurrent(GroupAny, nil); ok {
+		t.Fatalf("EffectiveCurrent returned retired node %+v", got)
+	}
+	// Merely re-enabling the source does not prove that the cached credentials
+	// are still valid. The node stays retired until a successful refresh installs
+	// a fresh declaration/health result.
+	p.ApplyEnabledSources([]Source{{ID: "removed-source", Name: "removed", Enabled: true}})
+	if got, ok, _ := p.Pick(GroupAny, nil); ok {
+		t.Fatalf("re-enabled but unverified source became routable: %+v", got)
+	}
+	fresh := px
+	fresh.SourceRetired = false
+	if !p.Update([]Proxy{fresh}, nil, p.HealthGeneration()) {
+		t.Fatal("fresh source result was not installed")
+	}
+	p.ApplyEnabledSources([]Source{{ID: "removed-source", Name: "removed", Enabled: true}})
+	if got, ok, direct := p.Pick(GroupAny, nil); !ok || direct || got.Key() != px.Key() {
+		t.Fatalf("freshly verified source did not recover: %+v, ok=%v direct=%v", got, ok, direct)
 	}
 }
 
@@ -586,7 +866,7 @@ func TestImportantMutationsArePersistedInBatch(t *testing.T) {
 	cache := newPoolCache(dir)
 	p := NewProxyPool()
 	p.persistDebounce = 5 * time.Millisecond
-	px := testProxy("socks5", "192.0.2.50", "1080", true)
+	px := testProxy("socks5", "8.8.8.50", "1080", true)
 	p.Prime([]Proxy{px}, nil)
 	p.SetCache(cache)
 
@@ -622,4 +902,89 @@ func TestImportantMutationsArePersistedInBatch(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func TestOptimisticPickRevisionTracksRoutingAndScoreInputs(t *testing.T) {
+	p := NewProxyPool()
+	first := testProxy("socks5", "192.0.2.60", "1080", true)
+	first.Country = "JP"
+	p.Prime([]Proxy{first}, nil)
+
+	routing := p.routingRevision
+	stats := p.statsRevision
+	p.RecordResult(first.Key(), true, 12)
+	if p.routingRevision != routing {
+		t.Fatalf("stats-only observation changed routing revision: got %d want %d", p.routingRevision, routing)
+	}
+	if p.statsRevision == stats {
+		t.Fatal("score revision did not change after RecordResult")
+	}
+
+	routing = p.routingRevision
+	p.SetAvailable(first.Key(), false)
+	if p.routingRevision == routing {
+		t.Fatal("availability mutation did not change routing revision")
+	}
+	routing = p.routingRevision
+	if !p.UpdateGeo(first.Key(), "203.0.113.60", "US", "Seattle", "NA", true, true) {
+		t.Fatal("UpdateGeo did not find node")
+	}
+	if p.routingRevision == routing {
+		t.Fatal("group-membership metadata mutation did not change routing revision")
+	}
+	routing = p.routingRevision
+	if !p.UpdateSpeed(first.Key(), 900, 3_000_000, 1000) {
+		t.Fatal("UpdateSpeed did not find node")
+	}
+	if p.routingRevision == routing {
+		t.Fatal("strategy metric mutation did not change routing revision")
+	}
+}
+
+func TestOptimisticPickCommitRejectsChangedEligibilityAndMembership(t *testing.T) {
+	p := NewProxyPool()
+	stale := testProxy("socks5", "192.0.2.70", "1080", false)
+	stale.Country = "JP"
+	healthy := testProxy("socks5", "192.0.2.71", "1080", false)
+	healthy.Country = "JP"
+	p.Prime([]Proxy{stale, healthy}, nil)
+	selector := newPoolGroupSelector("COUNTRY:JP", nil)
+
+	p.mu.RLock()
+	chosen, _, found := p.selectProxyLocked(selector, groupCursor{}, nil)
+	revision := p.routingRevision
+	p.mu.RUnlock()
+	if !found || chosen.Key() != stale.Key() {
+		t.Fatalf("initial all-unavailable selection = %+v, found=%v", chosen, found)
+	}
+	p.SetAvailable(healthy.Key(), true)
+	p.mu.Lock()
+	if p.routingRevision == revision {
+		t.Fatal("concurrent availability change was invisible to optimistic picker")
+	}
+	if p.proxySelectableAtCommitLocked(chosen, selector, nil) {
+		t.Fatal("stale unavailable choice remained committable after a healthy peer appeared")
+	}
+	p.mu.Unlock()
+
+	p.SetAvailable(stale.Key(), true)
+	p.mu.RLock()
+	chosen, _, found = p.selectProxyLocked(selector, groupCursor{}, map[string]bool{healthy.Key(): true})
+	revision = p.routingRevision
+	p.mu.RUnlock()
+	if !found || chosen.Key() != stale.Key() {
+		t.Fatalf("country selection before geo change = %+v, found=%v", chosen, found)
+	}
+	if !p.UpdateGeo(stale.Key(), "203.0.113.70", "US", "Portland", "NA", true, true) {
+		t.Fatal("UpdateGeo did not find selected node")
+	}
+	p.mu.Lock()
+	if p.routingRevision == revision {
+		t.Fatal("concurrent membership change was invisible to optimistic picker")
+	}
+	index, ok := p.proxyIndexLookupLocked(stale.Key())
+	if !ok || p.proxySelectableAtCommitLocked(p.proxies[index], selector, nil) {
+		t.Fatal("node that left COUNTRY:JP remained committable")
+	}
+	p.mu.Unlock()
 }

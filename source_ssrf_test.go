@@ -26,8 +26,9 @@ func TestSourceIPPolicyRejectsPrivateAndReservedRanges(t *testing.T) {
 	for _, raw := range []string{
 		"0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.169.254",
 		"172.16.0.1", "192.0.2.1", "192.168.1.1", "198.18.0.1", "198.51.100.1",
-		"203.0.113.1", "224.0.0.1", "255.255.255.255", "::", "::1", "100::1",
-		"2001:db8::1", "fc00::1", "fe80::1", "ff02::1",
+		"192.31.196.1", "192.52.193.1", "192.175.48.1", "203.0.113.1", "224.0.0.1",
+		"255.255.255.255", "::", "::1", "64:ff9b::1", "64:ff9b:1::1", "100::1",
+		"2001:db8::1", "2002:c000:0204::1", "2620:4f:8000::1", "fc00::1", "fe80::1", "ff02::1",
 	} {
 		if ip := net.ParseIP(raw); ip == nil || !isDisallowedSourceIP(ip) {
 			t.Errorf("address %q was not rejected", raw)
@@ -94,7 +95,7 @@ func TestSourceRedirectPolicyRejectsPrivateTargetAndCapsChain(t *testing.T) {
 
 func TestProductionFetchBlocksPrivateURLUnlessExplicitlyAllowed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("10.0.0.7:8080\n"))
+		_, _ = w.Write([]byte("10.0.0.7:8080\n8.8.8.8:8080\nproxy.example.test:8080\n"))
 	}))
 	defer server.Close()
 
@@ -107,8 +108,8 @@ func TestProductionFetchBlocksPrivateURLUnlessExplicitlyAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchSource explicit private source error = %v", err)
 	}
-	if len(proxies) != 1 || proxies[0].IP != "10.0.0.7" {
-		t.Fatalf("private proxy advertised by trusted feed was removed: %#v", proxies)
+	if len(proxies) != 2 || proxies[0].IP != "8.8.8.8" || proxies[1].IP != "proxy.example.test" {
+		t.Fatalf("trusted feed endpoint filtering = %#v, want public literal and unchanged hostname", proxies)
 	}
 }
 

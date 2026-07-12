@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -176,6 +180,56 @@ func TestReadConnectRequestValidatesHeader(t *testing.T) {
 	}
 }
 
+func TestReadConnectRequestRejectsUnsafeDomainsAndZeroPorts(t *testing.T) {
+	longLabel := strings.Repeat("a", 64) + ".example"
+	tooLongDomain := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62)
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "CRLF", frame: testSOCKSDomainFrame("example.com\r\nX-Test: injected", 443)},
+		{name: "NUL", frame: testSOCKSDomainFrame("example.com\x00", 443)},
+		{name: "space", frame: testSOCKSDomainFrame("example .com", 443)},
+		{name: "colon", frame: testSOCKSDomainFrame("example.com:80", 443)},
+		{name: "brackets", frame: testSOCKSDomainFrame("[example.com]", 443)},
+		{name: "slash", frame: testSOCKSDomainFrame("example.com/path", 443)},
+		{name: "backslash", frame: testSOCKSDomainFrame(`example.com\path`, 443)},
+		{name: "userinfo", frame: testSOCKSDomainFrame("user@example.com", 443)},
+		{name: "query", frame: testSOCKSDomainFrame("example.com?x", 443)},
+		{name: "fragment", frame: testSOCKSDomainFrame("example.com#x", 443)},
+		{name: "empty label", frame: testSOCKSDomainFrame("example..com", 443)},
+		{name: "long label", frame: testSOCKSDomainFrame(longLabel, 443)},
+		{name: "domain over 253 bytes", frame: testSOCKSDomainFrame(tooLongDomain, 443)},
+		{name: "domain port zero", frame: testSOCKSDomainFrame("example.com", 0)},
+		{name: "IPv4 port zero", frame: []byte{socks5Version, cmdConnect, 0, atypIPv4, 192, 0, 2, 1, 0, 0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, status, err := readConnectRequest(bytes.NewReader(test.frame)); err == nil || status != replyHostUnreachable {
+				t.Fatalf("readConnectRequest() status=%d error=%v, want host-unreachable rejection", status, err)
+			}
+		})
+	}
+}
+
+func TestReadConnectRequestAcceptsStrictDNSBoundaries(t *testing.T) {
+	maxDomain := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	for _, domain := range []string{"Example.COM", "xn--bcher-kva.example", maxDomain} {
+		t.Run(domain[:min(len(domain), 24)], func(t *testing.T) {
+			target, status, err := readConnectRequest(bytes.NewReader(testSOCKSDomainFrame(domain, 65535)))
+			if err != nil || status != replySucceeded || target != net.JoinHostPort(domain, "65535") {
+				t.Fatalf("strict valid domain result = %q status=%d error=%v", target, status, err)
+			}
+		})
+	}
+}
+
+func testSOCKSDomainFrame(domain string, port int) []byte {
+	frame := []byte{socks5Version, cmdConnect, 0, atypDomain, byte(len(domain))}
+	frame = append(frame, domain...)
+	return append(frame, byte(port>>8), byte(port))
+}
+
 type deadlineRecordingConn struct {
 	net.Conn
 	mu        sync.Mutex
@@ -291,6 +345,401 @@ func TestHandleConnAcceptsFragmentedFramesAndRelays(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("target echo server did not stop")
 	}
+}
+
+func TestHandleConnRetriesAuthenticationCandidateAndPromotesIt(t *testing.T) {
+	targetListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetListener.Close()
+	targetDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := targetListener.Accept()
+		if acceptErr != nil {
+			targetDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		_, copyErr := io.Copy(conn, conn)
+		targetDone <- copyErr
+	}()
+
+	upstream, connectAttempts := newSpeedTestConnectProxyWithAuth(t, "working", "secret")
+	upstream.Username, upstream.Password = "old", "wrong"
+	upstream.CredentialAlternates = []ProxyCredential{{Username: "working", Password: "secret"}}
+	upstream.Available = true
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{upstream}, nil)
+	store := &ConfigStore{cfg: PoolConfig{Rules: []Rule{{Type: RuleMatch, Group: GroupAny}}}}
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	handlerDone := make(chan struct{})
+	go func() {
+		NewServer("", pool, store).handleConn(serverSide)
+		close(handlerDone)
+	}()
+
+	_, _ = clientSide.Write([]byte{socks5Version, 1, socks5NoAuth})
+	methodReply := make([]byte, 2)
+	if _, err := io.ReadFull(clientSide, methodReply); err != nil {
+		t.Fatal(err)
+	}
+	target := targetListener.Addr().(*net.TCPAddr)
+	request := []byte{
+		socks5Version, cmdConnect, 0x00, atypIPv4,
+		target.IP[0], target.IP[1], target.IP[2], target.IP[3],
+		byte(target.Port >> 8), byte(target.Port),
+	}
+	_, _ = clientSide.Write(request)
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(clientSide, connectReply); err != nil {
+		t.Fatal(err)
+	}
+	if connectReply[1] != replySucceeded {
+		t.Fatalf("credential retry CONNECT reply = %d", connectReply[1])
+	}
+	const payload = "credential alternate carried this tunnel"
+	_, _ = clientSide.Write([]byte(payload))
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(clientSide, echo); err != nil || string(echo) != payload {
+		t.Fatalf("credential retry relay = %q, %v", echo, err)
+	}
+	if got := connectAttempts.Load(); got != 2 {
+		t.Fatalf("HTTP CONNECT credential attempts = %d, want 2", got)
+	}
+	got, ok := pool.Find(upstream.Key())
+	if !ok || got.Username != "working" || got.Password != "secret" {
+		t.Fatalf("forwarding promotion = %+v found=%v", got, ok)
+	}
+
+	_ = clientSide.Close()
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential retry handler did not stop")
+	}
+	select {
+	case err := <-targetDone:
+		if err != nil {
+			t.Fatalf("credential retry target: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential retry target did not stop")
+	}
+}
+
+func TestHandleConnTargetRefusalDoesNotMarkUpstreamUnavailable(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	upstreamDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			upstreamDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				upstreamDone <- readErr
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, writeErr := conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"))
+		upstreamDone <- writeErr
+	}()
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := Proxy{IP: host, Port: port, Protocol: "http", Available: true}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{upstream}, nil)
+	store := &ConfigStore{cfg: PoolConfig{Rules: []Rule{{Type: RuleMatch, Group: GroupAny}}}}
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	handlerDone := make(chan struct{})
+	go func() {
+		NewServer("", pool, store).handleConn(serverSide)
+		close(handlerDone)
+	}()
+
+	_, _ = clientSide.Write([]byte{socks5Version, 1, socks5NoAuth})
+	methodReply := make([]byte, 2)
+	if _, err := io.ReadFull(clientSide, methodReply); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = clientSide.Write(testSOCKSDomainFrame("example.com", 443))
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(clientSide, connectReply); err != nil {
+		t.Fatal(err)
+	}
+	if connectReply[1] != replyGeneralFailure {
+		t.Fatalf("SOCKS reply = %d, want general failure", connectReply[1])
+	}
+	_ = clientSide.Close()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("SOCKS handler did not finish")
+	}
+	if err := <-upstreamDone; err != nil {
+		t.Fatalf("test upstream error: %v", err)
+	}
+	got, ok := pool.Find(upstream.Key())
+	if !ok || !got.Available {
+		t.Fatalf("target refusal changed upstream health: found=%v proxy=%+v", ok, got)
+	}
+	if successes, failures := pool.StatsOf(upstream.Key()); successes != 0 || failures != 0 {
+		t.Fatalf("target refusal changed global reliability stats: successes=%d failures=%d", successes, failures)
+	}
+}
+
+func TestRelayPropagatesHalfCloseThroughBufferedHTTPConnection(t *testing.T) {
+	client, relayLeft := testTCPConnectionPair(t)
+	relayRight, target := testTCPConnectionPair(t)
+	for _, conn := range []net.Conn{client, relayLeft, relayRight, target} {
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	}
+	defer client.Close()
+	defer target.Close()
+
+	relayDone := make(chan struct{})
+	go func() {
+		relay(relayLeft, &bufConn{Conn: relayRight, r: bufio.NewReader(relayRight)})
+		close(relayDone)
+	}()
+
+	const request, response = "request-until-eof", "response-after-eof"
+	if _, err := client.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := io.ReadAll(target)
+	if err != nil || string(requestBody) != request {
+		t.Fatalf("target read = %q, %v; want propagated EOF after %q", requestBody, err, request)
+	}
+	if _, err := target.Write([]byte(response)); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	responseBody, err := io.ReadAll(client)
+	if err != nil || string(responseBody) != response {
+		t.Fatalf("client read = %q, %v; want %q", responseBody, err, response)
+	}
+	select {
+	case <-relayDone:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not stop after both half-closes")
+	}
+}
+
+func testTCPConnectionPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan *net.TCPConn, 1)
+	go func() {
+		conn, _ := listener.AcceptTCP()
+		accepted <- conn
+	}()
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	server := <-accepted
+	_ = listener.Close()
+	return client, server
+}
+
+func TestServerConnectionLimitRejectsAndReleasesSlots(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServerWithCredentialsAndLimit("", NewProxyPool(), &ConfigStore{}, "", "", 1)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.serve(listener) }()
+
+	first, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForConnectionSlots(t, server, 1)
+	second, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = second.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := second.Read(one[:]); err == nil {
+		t.Fatal("connection above the admission limit remained open")
+	}
+	_ = second.Close()
+	_ = first.Close()
+	waitForConnectionSlots(t, server, 0)
+
+	third, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForConnectionSlots(t, server, 1)
+	_ = third.Close()
+	waitForConnectionSlots(t, server, 0)
+	_ = listener.Close()
+	if err := <-serveDone; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("serve() shutdown error = %v, want net.ErrClosed", err)
+	}
+}
+
+func waitForConnectionSlots(t *testing.T, server *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(server.connSlots) != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(server.connSlots); got != want {
+		t.Fatalf("active connection slots = %d, want %d", got, want)
+	}
+}
+
+type temporaryAcceptTestError struct{}
+
+func (temporaryAcceptTestError) Error() string   { return "temporary accept failure" }
+func (temporaryAcceptTestError) Timeout() bool   { return false }
+func (temporaryAcceptTestError) Temporary() bool { return true }
+
+type temporaryErrorListener struct {
+	remaining atomic.Int32
+	calls     atomic.Int32
+}
+
+func (l *temporaryErrorListener) Accept() (net.Conn, error) {
+	l.calls.Add(1)
+	if l.remaining.Add(-1) >= 0 {
+		return nil, temporaryAcceptTestError{}
+	}
+	return nil, net.ErrClosed
+}
+
+func (l *temporaryErrorListener) Close() error   { return nil }
+func (l *temporaryErrorListener) Addr() net.Addr { return testStaticAddr("temporary-listener") }
+
+type testStaticAddr string
+
+func (a testStaticAddr) Network() string { return "test" }
+func (a testStaticAddr) String() string  { return string(a) }
+
+func TestServerTemporaryAcceptErrorsBackOff(t *testing.T) {
+	listener := &temporaryErrorListener{}
+	listener.remaining.Store(2)
+	server := NewServerWithCredentialsAndLimit("", NewProxyPool(), &ConfigStore{}, "", "", 1)
+	started := time.Now()
+	err := server.serve(listener)
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("serve() error = %v, want net.ErrClosed", err)
+	}
+	if got := listener.calls.Load(); got != 3 {
+		t.Fatalf("Accept calls = %d, want 3", got)
+	}
+	if elapsed := time.Since(started); elapsed < socksAcceptRetryInitialDelay*3 {
+		t.Fatalf("temporary Accept retries spun too quickly: %s", elapsed)
+	}
+}
+
+func TestServerShutdownClosesListenerAndActiveConnections(t *testing.T) {
+	server := NewServerWithCredentialsAndLimit("127.0.0.1:0", NewProxyPool(), &ConfigStore{}, "", "", 2)
+	startDone := make(chan error, 1)
+	go func() { startDone <- server.Start() }()
+
+	addr := waitForServerListener(t, server)
+	client, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	waitForConnectionSlots(t, server, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := server.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown() with active long-lived client = %v, want deadline exceeded", err)
+	}
+	if err := <-startDone; err != nil {
+		t.Fatalf("Start() after graceful shutdown = %v, want nil", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := client.Read(one[:]); err == nil {
+		t.Fatal("active client remained open after Shutdown")
+	}
+	waitForConnectionSlots(t, server, 0)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	if err := server.Shutdown(ctx2); err != nil {
+		t.Fatalf("Shutdown() after forced clients exited = %v", err)
+	}
+}
+
+func TestServerShutdownHonorsContextDeadline(t *testing.T) {
+	server := NewServerWithCredentialsAndLimit("", NewProxyPool(), &ConfigStore{}, "", "", 1)
+	tracked, peer := net.Pipe()
+	defer peer.Close()
+	if !server.registerActiveConnection(tracked) {
+		t.Fatal("failed to register test connection")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := server.Shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("Shutdown ignored context deadline: %s", elapsed)
+	}
+
+	// Complete the synthetic handler registration so the waiter spawned by
+	// Shutdown can exit; a real serve goroutine does this in its defer path.
+	server.unregisterActiveConnection(tracked)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	if err := server.Shutdown(ctx2); err != nil {
+		t.Fatalf("second Shutdown after active handler exit = %v", err)
+	}
+}
+
+func waitForServerListener(t *testing.T, server *Server) string {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		server.stateMu.Lock()
+		listener := server.listener
+		server.stateMu.Unlock()
+		if listener != nil {
+			return listener.Addr().String()
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("server listener did not start")
+	return ""
 }
 
 func TestNegotiateUsernamePasswordReadsFragmentedAuthentication(t *testing.T) {

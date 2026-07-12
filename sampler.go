@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // candidateSamplerState is deliberately small: source feeds themselves can
@@ -30,6 +33,11 @@ type candidateSampler struct {
 
 const candidateSamplerStateFile = "candidate_sampler.json"
 
+const (
+	maxCandidateSamplerBytes   = 1 << 20
+	maxCandidateSamplerCursors = 1024
+)
+
 func newCandidateSampler(dataDir string) *candidateSampler {
 	s := &candidateSampler{
 		state: candidateSamplerState{
@@ -45,15 +53,15 @@ func newCandidateSampler(dataDir string) *candidateSampler {
 	}
 
 	s.path = filepath.Join(dataDir, candidateSamplerStateFile)
-	data, err := os.ReadFile(s.path)
+	data, err := readPrivateRegularFile(s.path, maxCandidateSamplerBytes)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("[sampler] read state failed: %v", err)
 		}
 		return s
 	}
-	var saved candidateSamplerState
-	if err := json.Unmarshal(data, &saved); err != nil {
+	saved, err := decodeCandidateSamplerState(data)
+	if err != nil {
 		log.Printf("[sampler] parse state failed: %v", err)
 		return s
 	}
@@ -237,33 +245,153 @@ func (s *candidateSampler) save() error {
 	if s.path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	if err := validateCandidateSamplerState(s.state); err != nil {
 		return err
 	}
 	data, err := json.Marshal(s.state)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".candidate_sampler-*.tmp")
+	if len(data) > maxCandidateSamplerBytes {
+		return fmt.Errorf("sampler state exceeds %d bytes", maxCandidateSamplerBytes)
+	}
+	return writePrivateFileAtomic(s.path, data)
+}
+
+func decodeCandidateSamplerState(data []byte) (candidateSamplerState, error) {
+	state := candidateSamplerState{Cursors: make(map[string]string)}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
 	if err != nil {
-		return err
+		return state, err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return state, fmt.Errorf("expected an object")
 	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+	seenFields := make(map[string]bool, 3)
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return state, err
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return state, fmt.Errorf("field name is not a string")
+		}
+		if seenFields[field] {
+			return state, fmt.Errorf("duplicate field %q", field)
+		}
+		seenFields[field] = true
+		switch field {
+		case "version":
+			err = decoder.Decode(&state.Version)
+		case "last_bucket":
+			err = decoder.Decode(&state.LastBucket)
+		case "cursors":
+			state.Cursors, err = decodeCandidateSamplerCursors(decoder)
+		default:
+			err = skipJSONValue(decoder)
+		}
+		if err != nil {
+			return state, fmt.Errorf("field %q: %w", field, err)
+		}
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
+	if _, err := decoder.Token(); err != nil {
+		return state, err
 	}
-	if err := tmp.Close(); err != nil {
-		return err
+	if err := requireJSONEOF(decoder); err != nil {
+		return state, err
 	}
-	return os.Rename(tmpName, s.path)
+	if state.Cursors == nil {
+		state.Cursors = make(map[string]string)
+	}
+	if err := validateCandidateSamplerState(state); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+func decodeCandidateSamplerCursors(decoder *json.Decoder) (map[string]string, error) {
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if opening == nil {
+		return make(map[string]string), nil
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("expected an object")
+	}
+	out := make(map[string]string)
+	records := 0
+	for decoder.More() {
+		records++
+		if records > maxCandidateSamplerCursors {
+			return nil, fmt.Errorf("cursor count exceeds %d", maxCandidateSamplerCursors)
+		}
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("cursor key is not a string")
+		}
+		var value string
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if _, exists := out[key]; exists {
+			return nil, fmt.Errorf("duplicate cursor %q", key)
+		}
+		out[key] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func validateCandidateSamplerState(state candidateSamplerState) error {
+	if len(state.Cursors) > maxCandidateSamplerCursors {
+		return fmt.Errorf("cursor count exceeds %d", maxCandidateSamplerCursors)
+	}
+	if state.LastBucket != "" {
+		_, protocol, ok := splitSamplerComposite(state.LastBucket, maxSourceNameBytes, 32)
+		if !ok || !isProxyProtocol(protocol) {
+			return fmt.Errorf("invalid last bucket")
+		}
+	}
+	for bucket, cursor := range state.Cursors {
+		_, protocol, ok := splitSamplerComposite(bucket, maxSourceNameBytes, 32)
+		if !ok || !isProxyProtocol(protocol) {
+			return fmt.Errorf("invalid cursor bucket")
+		}
+		host, port, ok := splitSamplerComposite(cursor, maxSourceAddressBytes, maxSourcePortBytes)
+		if !ok {
+			return fmt.Errorf("invalid cursor value")
+		}
+		if _, valid := normalizeProxy(Proxy{IP: host, Port: port, Protocol: protocol}); !valid {
+			return fmt.Errorf("invalid cursor address")
+		}
+	}
+	return nil
+}
+
+func splitSamplerComposite(value string, maxLeft, maxRight int) (string, string, bool) {
+	if strings.Count(value, "\x00") != 1 {
+		return "", "", false
+	}
+	left, right, _ := strings.Cut(value, "\x00")
+	if left == "" || right == "" || len(left) > maxLeft || len(right) > maxRight {
+		return "", "", false
+	}
+	for _, part := range []string{left, right} {
+		for _, r := range part {
+			if r < 0x20 || r == 0x7f {
+				return "", "", false
+			}
+		}
+	}
+	return left, right, true
 }

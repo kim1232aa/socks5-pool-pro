@@ -9,6 +9,7 @@ services:
     container_name: socks5-pool-pro
     restart: unless-stopped
     init: true
+    stop_grace_period: 45s
     ports:
       - "127.0.0.1:${SOCKS_PORT:-1080}:1080"
       - "127.0.0.1:${DASHBOARD_PORT:-8080}:8080"
@@ -17,18 +18,24 @@ services:
       SOCKS_PASS: "${SOCKS_PASS:-}"
       ADMIN_USER: "${ADMIN_USER:-}"
       ADMIN_PASS: "${ADMIN_PASS:-}"
+      GOMEMLIMIT: "${GOMEMLIMIT:-1200MiB}"
+      GOGC: "${GOGC:-75}"
     command:
       - /app/socks5-pool
       - -listen
       - 0.0.0.0:1080
       - -status
       - 0.0.0.0:8080
+      - -trusted-management-proxy
+      - 172.30.250.1
       - -data-dir
       - /app/data
+      - -max-client-connections
+      - "${MAX_CLIENT_CONNECTIONS:-512}"
       - -max-concurrent
-      - "${MAX_CONCURRENT:-20}"
+      - "${MAX_CONCURRENT:-50}"
       - -max-candidates
-      - "${MAX_CANDIDATES:-3000}"
+      - "${MAX_CANDIDATES:-1500}"
       - -scrape-interval
       - "${SCRAPE_INTERVAL:-20m}"
       - -check-timeout
@@ -39,10 +46,31 @@ services:
     networks:
       - socks5-pool
     read_only: true
+    mem_limit: 1536m
+    mem_reservation: 512m
+    pids_limit: 512
+    cpus: "4.0"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
 volumes:
   socks5-pool-data:
@@ -52,3 +80,7 @@ networks:
   socks5-pool:
     name: socks5-pool-pro-net
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24
+          gateway: 172.30.250.1

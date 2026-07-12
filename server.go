@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -31,6 +34,10 @@ const (
 	replyAddressTypeNotSupported = 0x08
 
 	socks5HandshakeTimeout = 10 * time.Second
+
+	defaultSOCKSMaxClientConnections = 512
+	socksAcceptRetryInitialDelay     = 5 * time.Millisecond
+	socksAcceptRetryMaxDelay         = time.Second
 )
 
 // Server is the local SOCKS5 endpoint that clients connect to. Every
@@ -42,6 +49,14 @@ type Server struct {
 	store      *ConfigStore
 	socksUser  string
 	socksPass  string
+	connSlots  chan struct{}
+
+	stateMu      sync.Mutex
+	listener     net.Listener
+	activeConns  map[net.Conn]struct{}
+	activeWG     sync.WaitGroup
+	shuttingDown bool
+	shutdownCh   chan struct{}
 }
 
 func NewServer(listenAddr string, pool *ProxyPool, store *ConfigStore) *Server {
@@ -53,29 +68,217 @@ func NewServer(listenAddr string, pool *ProxyPool, store *ConfigStore) *Server {
 // neither; Config.Validate enforces that for the command-line server. Keeping
 // NewServer above preserves the no-auth constructor used by existing callers.
 func NewServerWithCredentials(listenAddr string, pool *ProxyPool, store *ConfigStore, socksUser, socksPass string) *Server {
+	return NewServerWithCredentialsAndLimit(listenAddr, pool, store, socksUser, socksPass, defaultSOCKSMaxClientConnections)
+}
+
+// NewServerWithCredentialsAndLimit preserves the existing constructors while
+// allowing the process configuration to set an explicit admission limit. A
+// non-positive direct-call value falls back to the safe default.
+func NewServerWithCredentialsAndLimit(listenAddr string, pool *ProxyPool, store *ConfigStore, socksUser, socksPass string, maxConnections int) *Server {
+	if maxConnections <= 0 {
+		maxConnections = defaultSOCKSMaxClientConnections
+	}
 	return &Server{
-		listenAddr: listenAddr,
-		pool:       pool,
-		store:      store,
-		socksUser:  socksUser,
-		socksPass:  socksPass,
+		listenAddr:  listenAddr,
+		pool:        pool,
+		store:       store,
+		socksUser:   socksUser,
+		socksPass:   socksPass,
+		connSlots:   make(chan struct{}, maxConnections),
+		activeConns: make(map[net.Conn]struct{}),
+		shutdownCh:  make(chan struct{}),
 	}
 }
 
 func (s *Server) Start() error {
+	s.stateMu.Lock()
+	if s.shuttingDown {
+		s.stateMu.Unlock()
+		return nil
+	}
+	if s.listener != nil {
+		s.stateMu.Unlock()
+		return fmt.Errorf("SOCKS5 server is already running")
+	}
+	s.stateMu.Unlock()
+
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen failed: %w", err)
 	}
-	log.Printf("[server] SOCKS5 proxy listening on %s", s.listenAddr)
+	defer ln.Close()
 
+	s.stateMu.Lock()
+	if s.shuttingDown {
+		s.stateMu.Unlock()
+		return nil
+	}
+	if s.listener != nil {
+		s.stateMu.Unlock()
+		return fmt.Errorf("SOCKS5 server is already running")
+	}
+	s.listener = ln
+	s.stateMu.Unlock()
+	defer func() {
+		s.stateMu.Lock()
+		if s.listener == ln {
+			s.listener = nil
+		}
+		s.stateMu.Unlock()
+	}()
+
+	log.Printf("[server] SOCKS5 proxy listening on %s", s.listenAddr)
+	err = s.serve(ln)
+	if errors.Is(err, net.ErrClosed) && s.isShuttingDown() {
+		return nil
+	}
+	return err
+}
+
+// Shutdown stops admission and gives active handshakes/relays until ctx's
+// deadline to finish naturally. At the deadline it force-closes every tracked
+// client and upstream connection, so an uncooperative peer can never extend
+// shutdown beyond the caller's budget.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.stateMu.Lock()
+	if !s.shuttingDown {
+		s.shuttingDown = true
+		if s.shutdownCh != nil {
+			close(s.shutdownCh)
+		}
+	}
+	ln := s.listener
+	s.stateMu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.activeWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.closeActiveConnections()
+		return ctx.Err()
+	}
+}
+
+func (s *Server) closeActiveConnections() {
+	s.stateMu.Lock()
+	connections := make([]net.Conn, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		connections = append(connections, conn)
+	}
+	s.stateMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) isShuttingDown() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.shuttingDown
+}
+
+func (s *Server) registerActiveConnection(conn net.Conn) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	if s.activeConns == nil {
+		s.activeConns = make(map[net.Conn]struct{})
+	}
+	if _, exists := s.activeConns[conn]; exists {
+		return true
+	}
+	s.activeConns[conn] = struct{}{}
+	s.activeWG.Add(1)
+	return true
+}
+
+func (s *Server) unregisterActiveConnection(conn net.Conn) {
+	s.stateMu.Lock()
+	if _, exists := s.activeConns[conn]; !exists {
+		s.stateMu.Unlock()
+		return
+	}
+	delete(s.activeConns, conn)
+	s.stateMu.Unlock()
+	s.activeWG.Done()
+}
+
+func (s *Server) relay(client, remote net.Conn) {
+	if !s.registerActiveConnection(remote) {
+		_ = remote.Close()
+		return
+	}
+	defer s.unregisterActiveConnection(remote)
+	relay(client, remote)
+}
+
+func (s *Server) serve(ln net.Listener) error {
+	var temporaryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("[server] accept error: %v", err)
-			continue
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+				if temporaryDelay == 0 {
+					temporaryDelay = socksAcceptRetryInitialDelay
+				} else {
+					temporaryDelay *= 2
+					if temporaryDelay > socksAcceptRetryMaxDelay {
+						temporaryDelay = socksAcceptRetryMaxDelay
+					}
+				}
+				log.Printf("[server] temporary accept error: %v; retrying in %s", err, temporaryDelay)
+				timer := time.NewTimer(temporaryDelay)
+				select {
+				case <-timer.C:
+				case <-s.shutdownCh:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return net.ErrClosed
+				}
+				continue
+			}
+			return fmt.Errorf("accept failed: %w", err)
 		}
-		go s.handleConn(conn)
+		temporaryDelay = 0
+		select {
+		case s.connSlots <- struct{}{}:
+			if !s.registerActiveConnection(conn) {
+				<-s.connSlots
+				_ = conn.Close()
+				continue
+			}
+			go func() {
+				defer s.unregisterActiveConnection(conn)
+				defer func() { <-s.connSlots }()
+				s.handleConn(conn)
+			}()
+		default:
+			// Reject before authentication without allocating another goroutine.
+			// Logging each rejection would itself become a denial-of-service vector.
+			_ = conn.Close()
+		}
 	}
 }
 
@@ -130,7 +333,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 		log.Printf("[route] %s -> DIRECT", host)
 		s.sendReply(conn, replySucceeded)
-		relay(conn, remote)
+		s.relay(conn, remote)
 		return
 	}
 
@@ -162,26 +365,29 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 
 		dialStart := time.Now()
-		remote, err := DialUpstream(upstream, targetAddr, 10*time.Second)
+		healthGeneration := s.pool.HealthGeneration()
+		remote, verified, err := DialUpstreamCredentialCandidatesContext(context.Background(), upstream, targetAddr, 10*time.Second)
 		if err != nil {
 			log.Printf("[server] upstream %s (group %s) failed: %v, switching...", upstream.Addr(), groupName, err)
-			s.pool.RecordResult(upstream.Key(), false, 0)
-			// A sticky group otherwise keeps selecting this same upstream for
-			// every later client connection until the periodic re-check runs.
-			// Make a failed live dial immediately ineligible; a later successful
-			// health check will restore it, so transient free proxies can still
-			// self-heal without repeatedly stalling users in the meantime.
-			s.pool.SetAvailable(upstream.Key(), false)
+			if upstreamFailureAffectsHealth(err) {
+				s.pool.RecordResult(upstream.Key(), false, 0)
+				// Failures connecting/authenticating/speaking to the upstream itself
+				// make it immediately ineligible. A target-specific CONNECT refusal is
+				// excluded only from this request and must not poison global health.
+				s.pool.SetAvailable(upstream.Key(), false)
+			}
 			exclude[upstream.Key()] = true
 			continue
 		}
+		s.pool.UpdateVerifiedCredentialsAtGeneration(upstream.Key(), verified, healthGeneration)
+		upstream = verified
 		s.pool.RecordResult(upstream.Key(), true, time.Since(dialStart).Milliseconds())
 
 		// Success - log which upstream carried this target, so it's
 		// visible which node each domain actually used.
 		log.Printf("[route] %s -> group %s -> %s://%s", host, groupName, upstream.Protocol, upstream.Addr())
 		s.sendReply(conn, replySucceeded)
-		relay(conn, remote)
+		s.relay(conn, remote)
 		return
 	}
 
@@ -427,6 +633,9 @@ func parseTarget(buf []byte) (string, error) {
 			return "", fmt.Errorf("domain request too short")
 		}
 		host = string(buf[5 : 5+domainLen])
+		if !validProxyHostname(host) {
+			return "", fmt.Errorf("invalid domain target")
+		}
 		portOffset = 5 + domainLen
 	case atypIPv6:
 		if len(buf) < 22 {
@@ -440,6 +649,9 @@ func parseTarget(buf []byte) (string, error) {
 	}
 
 	port := int(buf[portOffset])<<8 | int(buf[portOffset+1])
+	if port == 0 {
+		return "", fmt.Errorf("target port must be between 1 and 65535")
+	}
 	// net.JoinHostPort brackets IPv6 literals (e.g. "[::1]:443"); plain
 	// fmt.Sprintf("%s:%d", ...) does not, which made net.SplitHostPort
 	// reject every IPv6 target downstream in handleConn ("too many colons
@@ -454,9 +666,12 @@ func relay(left, right net.Conn) {
 
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
-		io.Copy(dst, src)
-		if tc, ok := dst.(*net.TCPConn); ok {
-			tc.CloseWrite()
+		_, _ = io.Copy(dst, src)
+		if writer, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = writer.CloseWrite()
+		}
+		if reader, ok := src.(interface{ CloseRead() error }); ok {
+			_ = reader.CloseRead()
 		}
 		done <- struct{}{}
 	}

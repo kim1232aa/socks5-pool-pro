@@ -23,11 +23,13 @@ const (
 )
 
 type manualNodeVerifyCheckFunc func(context.Context, Proxy, string, time.Duration) (bool, time.Duration)
+type manualNodeVerifyCredentialCheckFunc func(context.Context, Proxy, string, time.Duration) (Proxy, bool, time.Duration, error)
 
 type manualNodeVerifyOperations struct {
-	checkURL    manualNodeVerifyCheckFunc
-	probeExitIP func(context.Context, Proxy, time.Duration) string
-	lookupGeo   func(context.Context, string, time.Duration) (string, string, string)
+	checkURL            manualNodeVerifyCheckFunc
+	checkURLCredentials manualNodeVerifyCredentialCheckFunc
+	probeExitIP         func(context.Context, Proxy, time.Duration) string
+	lookupGeo           func(context.Context, string, time.Duration) (string, string, string)
 }
 
 func defaultManualNodeVerifyOperations() manualNodeVerifyOperations {
@@ -35,6 +37,11 @@ func defaultManualNodeVerifyOperations() manualNodeVerifyOperations {
 		checkURL: func(ctx context.Context, px Proxy, target string, timeout time.Duration) (bool, time.Duration) {
 			started := time.Now()
 			return checkURLContext(ctx, px, target, timeout), time.Since(started)
+		},
+		checkURLCredentials: func(ctx context.Context, px Proxy, target string, timeout time.Duration) (Proxy, bool, time.Duration, error) {
+			started := time.Now()
+			verified, ok, err := checkURLCredentialCandidatesContext(ctx, px, target, timeout)
+			return verified, ok, time.Since(started), err
 		},
 		probeExitIP: probeExitIPContext,
 		lookupGeo:   LookupGeoContext,
@@ -68,24 +75,38 @@ func (s *StatusServer) endManualNodeVerify(key string) {
 	s.nodeVerifyMu.Unlock()
 }
 
-func runManualNodeVerifyChecks(ctx context.Context, check manualNodeVerifyCheckFunc, px Proxy, target string) (reachable bool, attempts int, latencyMs int64, err error) {
+func runManualNodeVerifyChecks(ctx context.Context, operations manualNodeVerifyOperations, px Proxy, target string) (verified Proxy, reachable bool, attempts int, latencyMs int64, err error) {
+	verified = px
 	for attempts < manualNodeVerifyMaxAttempts {
 		if err := ctx.Err(); err != nil {
-			return false, attempts, 0, err
+			return verified, false, attempts, 0, err
 		}
 		attemptTimeout := manualNodeVerifyAttemptTimeout(attempts)
 		attempts++
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		ok, latency := check(attemptCtx, px, target, attemptTimeout)
+		checked := verified
+		var ok bool
+		var latency time.Duration
+		if operations.checkURLCredentials != nil {
+			checked, ok, latency, _ = operations.checkURLCredentials(attemptCtx, verified, target, attemptTimeout)
+		} else if operations.checkURL != nil {
+			ok, latency = operations.checkURL(attemptCtx, verified, target, attemptTimeout)
+		}
 		cancel()
 		if err := ctx.Err(); err != nil {
-			return false, attempts, 0, err
+			return verified, false, attempts, 0, err
+		}
+		// A tunnel can prove a credential before the target itself returns an
+		// unacceptable response. Carry that declaration into the next ordinary
+		// retry so we do not start again from a credential already rejected.
+		if checked.Username != verified.Username || checked.Password != verified.Password || !credentialsEqual(checked.CredentialAlternates, verified.CredentialAlternates) {
+			verified = checked
 		}
 		if ok {
 			if latency < 0 {
 				latency = 0
 			}
-			return true, attempts, latency.Milliseconds(), nil
+			return verified, true, attempts, latency.Milliseconds(), nil
 		}
 		if attempts < manualNodeVerifyMaxAttempts {
 			backoff := manualNodeVerifyRetryBackoff(attempts)
@@ -94,11 +115,11 @@ func runManualNodeVerifyChecks(ctx context.Context, check manualNodeVerifyCheckF
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
-				return false, attempts, 0, ctx.Err()
+				return verified, false, attempts, 0, ctx.Err()
 			}
 		}
 	}
-	return false, attempts, 0, nil
+	return verified, false, attempts, 0, nil
 }
 
 func manualNodeVerifyAttemptTimeout(attemptIndex int) time.Duration {

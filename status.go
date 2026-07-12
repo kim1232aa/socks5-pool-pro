@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -28,6 +29,8 @@ type StatusServer struct {
 	adminAuthEnabled     bool
 	adminUserHash        [sha256.Size]byte
 	adminPassHash        [sha256.Size]byte
+	serverMu             sync.Mutex
+	server               *http.Server
 	speedMu              sync.Mutex
 	speedRunning         map[string]struct{}
 	speedSlots           chan struct{}
@@ -38,6 +41,10 @@ type StatusServer struct {
 	nodeVerifyRunning    map[string]struct{}
 	nodeVerifySlots      chan struct{}
 	nodeVerifyOps        manualNodeVerifyOperations
+	// trustedManagementProxies is an explicit, exact-IP allowlist for a local
+	// reverse proxy or container bridge. It never accepts CIDRs and is consulted
+	// only when admin authentication is disabled.
+	trustedManagementProxies map[string]struct{}
 }
 
 // apiBootNonce prevents generation counters that restart at zero from making a
@@ -74,8 +81,28 @@ func formatV1ProxySnapshotIDWithBoot(boot string, proxies []V1ProxyView) string 
 	return fmt.Sprintf("proxies:%s:%s", boot, hex.EncodeToString(digest[:12]))
 }
 
+func formatV1ProxyPickSnapshotIDWithBoot(boot string, proxies []V1ProxyView) string {
+	encoded, _ := json.Marshal(proxies)
+	hash := sha256.New()
+	_, _ = hash.Write(encoded)
+	// Score is intentionally absent from page rows so reliability observations
+	// do not invalidate key-sorted pagination. /pick does use it, so that
+	// endpoint gets a distinct score-aware token and can never return a
+	// different best node under the same snapshot identity.
+	for _, proxy := range proxies {
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(strconv.AppendFloat(nil, proxy.score, 'g', -1, 64))
+	}
+	digest := hash.Sum(nil)
+	return fmt.Sprintf("proxy-pick:%s:%s", boot, hex.EncodeToString(digest[:12]))
+}
+
 func formatV1ProxySnapshotID(proxies []V1ProxyView) string {
 	return formatV1ProxySnapshotIDWithBoot(apiBootNonce, proxies)
+}
+
+func formatV1ProxyPickSnapshotID(proxies []V1ProxyView) string {
+	return formatV1ProxyPickSnapshotIDWithBoot(apiBootNonce, proxies)
 }
 
 // NewStatusServer preserves the historical no-auth status endpoint behavior.
@@ -100,12 +127,36 @@ func NewStatusServerWithAdminCredentials(pool *ProxyPool, store *ConfigStore, us
 		nodeVerifySlots:      make(chan struct{}, maxManualNodeVerifyConcurrent),
 		nodeVerifyOps:        defaultManualNodeVerifyOperations(),
 	}
+	if pool != nil && store != nil {
+		_, criterion := pool.HealthCriterion()
+		if criterion == "" {
+			pool.SetHealthCriterion(store.CheckURL())
+		}
+	}
 	if user != "" || password != "" {
 		s.adminAuthEnabled = true
 		s.adminUserHash = sha256.Sum256([]byte(user))
 		s.adminPassHash = sha256.Sum256([]byte(password))
 	}
 	return s
+}
+
+// SetTrustedManagementProxies permits unauthenticated management traffic from
+// exact reverse-proxy peer IPs while retaining the loopback Host requirement.
+// Call it during startup, before handler/Start is used. CIDRs, hostnames, ports,
+// and malformed values are rejected rather than broadened implicitly.
+func (s *StatusServer) SetTrustedManagementProxies(addresses []string) error {
+	trusted := make(map[string]struct{}, len(addresses))
+	for _, raw := range addresses {
+		value := strings.TrimSpace(raw)
+		ip := net.ParseIP(value)
+		if value == "" || ip == nil {
+			return fmt.Errorf("trusted management proxy %q must be an exact IP address", raw)
+		}
+		trusted[ip.String()] = struct{}{}
+	}
+	s.trustedManagementProxies = trusted
+	return nil
 }
 
 // requirePost rejects any request that isn't a POST with 405, before the
@@ -142,11 +193,14 @@ func requireGet(h http.HandlerFunc) http.HandlerFunc {
 func (s *StatusServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
+	mux.HandleFunc("/assets/dashboard.css", requireGet(embeddedDashboardAsset("text/css; charset=utf-8", dashboardCSS)))
+	mux.HandleFunc("/assets/dashboard.js", requireGet(embeddedDashboardAsset("text/javascript; charset=utf-8", dashboardJS)))
 	mux.HandleFunc("/api/status", requireGet(s.handleAPIStatus))
 	mux.HandleFunc("/api/v1/proxies", requireGet(s.handleV1Proxies))
 	mux.HandleFunc("/api/v1/proxies/pick", requireGet(s.handleV1ProxyPick))
 	mux.HandleFunc("/api/refresh", requirePost(s.handleRefresh))
 	mux.HandleFunc("/api/refresh/status", requireGet(s.handleRefreshStatus))
+	mux.HandleFunc("/api/health-recheck/status", requireGet(s.handleHealthRecheckStatus))
 	mux.HandleFunc("/api/settings/check-url", s.handleCheckURL)
 
 	mux.HandleFunc("/api/nodes", requireGet(s.handleNodes))
@@ -194,8 +248,8 @@ func (s *StatusServer) handler() http.Handler {
 			s.handleReadyz(w, r)
 			return
 		}
-		if !s.adminAuthEnabled && !isLoopbackManagementHost(r.Host) {
-			writeErrCode(w, http.StatusForbidden, "untrusted_host", fmt.Errorf("management API requires a loopback Host when admin authentication is disabled"))
+		if !s.adminAuthEnabled && (!isLoopbackManagementHost(r.Host) || !s.isTrustedManagementRemote(r.RemoteAddr)) {
+			writeErrCode(w, http.StatusForbidden, "untrusted_client", fmt.Errorf("management API requires a loopback Host and loopback client address when admin authentication is disabled"))
 			return
 		}
 		protected.ServeHTTP(w, r)
@@ -211,6 +265,27 @@ func isLoopbackManagementHost(authority string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// The Host header is controlled by the client and is therefore insufficient
+// to prove that an unauthenticated management request originated locally. The
+// TCP peer recorded by net/http is the trust boundary; forwarded headers are
+// deliberately ignored because an authenticated reverse proxy is required for
+// non-loopback deployments.
+func (s *StatusServer) isTrustedManagementRemote(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	_, trusted := s.trustedManagementProxies[ip.String()]
+	return trusted
 }
 
 // protectStateChangingRequests blocks browser cross-site writes while
@@ -268,7 +343,37 @@ func (s *StatusServer) Start(addr string) error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 	}
-	return server.ListenAndServe()
+
+	s.serverMu.Lock()
+	if s.server != nil {
+		s.serverMu.Unlock()
+		return fmt.Errorf("status server is already running")
+	}
+	s.server = server
+	s.serverMu.Unlock()
+
+	err := server.ListenAndServe()
+	s.serverMu.Lock()
+	if s.server == server {
+		s.server = nil
+	}
+	s.serverMu.Unlock()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// Shutdown gracefully stops the management HTTP server. It is safe to call
+// before Start or after the server has already exited.
+func (s *StatusServer) Shutdown(ctx context.Context) error {
+	s.serverMu.Lock()
+	server := s.server
+	s.serverMu.Unlock()
+	if server == nil {
+		return nil
+	}
+	return server.Shutdown(ctx)
 }
 
 // requireAdminAuth authenticates with fixed-size SHA-256 digests and
@@ -336,27 +441,30 @@ func (s *StatusServer) handleReadyz(w http.ResponseWriter, r *http.Request) {
 // ---- view models ----
 
 type NodeView struct {
-	Key             string  `json:"key"`
-	Addr            string  `json:"addr"`
-	Protocol        string  `json:"protocol"`
-	Country         string  `json:"country"`
-	City            string  `json:"city"`
-	Continent       string  `json:"continent"` // AS/NA/EU/AF/SA/OC/AN - groups the dashboard's country filter
-	Source          string  `json:"source"`
-	ExitIP          string  `json:"exit_ip"`
-	IPChanged       bool    `json:"ip_changed"`
-	IPChangeKnown   bool    `json:"ip_change_known"`
-	Anonymity       string  `json:"anonymity"`
-	LatencyMs       int64   `json:"latency_ms"`
-	SpeedKbps       float64 `json:"speed_kbps"`
-	SpeedTestedAt   int64   `json:"speed_tested_at,omitempty"`
-	SpeedBytes      int64   `json:"speed_bytes,omitempty"`
-	SpeedDurationMs int64   `json:"speed_duration_ms,omitempty"`
-	Score           float64 `json:"score"`
-	Successes       int     `json:"successes"`
-	Failures        int     `json:"failures"`
-	Active          bool    `json:"active"`    // this node is the ANY group's current upstream
-	Available       bool    `json:"available"` // false = last check failed; kept in the pool, hidden by default
+	Key               string  `json:"key"`
+	Addr              string  `json:"addr"`
+	Protocol          string  `json:"protocol"`
+	Country           string  `json:"country"`
+	City              string  `json:"city"`
+	Continent         string  `json:"continent"` // AS/NA/EU/AF/SA/OC/AN - groups the dashboard's country filter
+	Source            string  `json:"source"`
+	ExitIP            string  `json:"exit_ip"`
+	IPChanged         bool    `json:"ip_changed"`
+	IPChangeKnown     bool    `json:"ip_change_known"`
+	Anonymity         string  `json:"anonymity"`
+	LatencyMs         int64   `json:"latency_ms"`
+	SpeedKbps         float64 `json:"speed_kbps"`
+	SpeedTestedAt     int64   `json:"speed_tested_at,omitempty"`
+	SpeedBytes        int64   `json:"speed_bytes,omitempty"`
+	SpeedDurationMs   int64   `json:"speed_duration_ms,omitempty"`
+	Score             float64 `json:"score"`
+	Successes         int     `json:"successes"`
+	Failures          int     `json:"failures"`
+	Active            bool    `json:"active"`    // this node is the ANY group's current upstream
+	Available         bool    `json:"available"` // false = last check failed; kept in the pool, hidden by default
+	SourceRetired     bool    `json:"source_retired,omitempty"`
+	HealthInvalidated bool    `json:"health_invalidated,omitempty"`
+	PolicyExcluded    bool    `json:"policy_excluded,omitempty"`
 }
 
 // NodeCountrySummary is the small, pool-wide country index used by the
@@ -409,14 +517,17 @@ type StatusSummary struct {
 	ProxyIPTotal int         `json:"proxyip_total"`
 	LastScrape   string      `json:"last_scrape"`
 	NextScrape   string      `json:"next_scrape"`
+	LastScrapeAt string      `json:"last_scrape_at,omitempty"`
+	NextScrapeAt string      `json:"next_scrape_at,omitempty"`
 	Groups       []GroupView `json:"groups"`
 	// Keep active_proxy present even when the pool has no healthy selection.
 	// Registration clients depend on a stable top-level extraction shape.
-	ActiveProxy      string         `json:"active_proxy"`
-	Proxies          []PoolAPIProxy `json:"proxies"`
-	AvailableTotal   int            `json:"available_total"`
-	UnavailableTotal int            `json:"unavailable_total"`
-	Scrape           ScrapeInfo     `json:"scrape"`
+	ActiveProxy          string         `json:"active_proxy"`
+	Proxies              []PoolAPIProxy `json:"proxies"`
+	AvailableTotal       int            `json:"available_total"`
+	UnavailableTotal     int            `json:"unavailable_total"`
+	HealthRecheckPending bool           `json:"health_recheck_pending"`
+	Scrape               ScrapeInfo     `json:"scrape"`
 }
 
 // PoolAPIProxy is a connection-ready, healthy upstream for consumers that
@@ -460,12 +571,12 @@ type V1ProxyPickResponse struct {
 	Proxy      V1ProxyView `json:"proxy"`
 }
 
-func (s *StatusServer) buildGroupViews() []GroupView {
-	all := s.pool.All()
-	groups := s.store.Groups()
-
+func buildGroupViewsFromSnapshot(state statusPoolSnapshot, groups []Group) []GroupView {
+	all := state.Proxies
 	views := []GroupView{}
-	anyCurrent, anyOK, anyDynamic := s.pool.EffectiveCurrent(GroupAny, groups)
+	anyCandidates, anyStrategy := resolveGroup(all, GroupAny, groups)
+	anyCursor := state.GroupState[GroupAny]
+	anyCurrent, anyOK, anyDynamic := effectiveCurrentFromSnapshot(anyCandidates, anyStrategy, anyCursor, state.Stats)
 	anyAddr := ""
 	if anyOK {
 		anyAddr = anyCurrent.Addr()
@@ -473,12 +584,12 @@ func (s *StatusServer) buildGroupViews() []GroupView {
 	views = append(views, GroupView{
 		Name: GroupAny, Strategy: StrategySticky, Count: len(all),
 		Current: anyAddr, Dynamic: anyDynamic, Builtin: true,
-		Pinned: s.pool.IsPinned(GroupAny),
+		Pinned: anyCursor != nil && anyCursor.pinned,
 	})
 
 	for _, g := range groups {
 		candidates, strategy := resolveGroup(all, g.Name, groups)
-		cur, ok, dynamic := s.pool.EffectiveCurrent(g.Name, groups)
+		cur, ok, dynamic := effectiveCurrentFromSnapshot(candidates, strategy, state.GroupState[g.Name], state.Stats)
 		current := ""
 		if ok {
 			current = cur.Addr()
@@ -490,6 +601,254 @@ func (s *StatusServer) buildGroupViews() []GroupView {
 		})
 	}
 	return views
+}
+
+func effectiveCurrentFromSnapshot(candidates []Proxy, strategy string, cursor *groupCursor, stats map[string]nodeStats) (Proxy, bool, bool) {
+	if len(candidates) == 0 {
+		return Proxy{}, false, false
+	}
+	stickyKey, lastPicked := "", ""
+	if cursor != nil {
+		stickyKey, lastPicked = cursor.stickyKey, cursor.lastPicked
+	}
+	find := func(key string) (Proxy, bool) {
+		for _, candidate := range candidates {
+			if candidate.Key() == key {
+				return candidate, true
+			}
+		}
+		return Proxy{}, false
+	}
+	switch strategy {
+	case StrategyLatency:
+		return bestBy(candidates, func(candidate Proxy) float64 { return float64(candidate.LatencyMs) }, false), true, false
+	case StrategySpeed:
+		return bestBy(candidates, func(candidate Proxy) float64 { return candidate.SpeedKbps }, true), true, false
+	case StrategyScore:
+		return bestBy(candidates, func(candidate Proxy) float64 {
+			stat, ok := stats[candidate.Key()]
+			if !ok {
+				return scoreWithStats(candidate, nil)
+			}
+			return scoreWithStats(candidate, &stat)
+		}, true), true, false
+	case StrategyRoundRobin, StrategyRandom:
+		if candidate, ok := find(lastPicked); ok {
+			return candidate, true, true
+		}
+		return candidates[0], true, true
+	default:
+		if candidate, ok := find(stickyKey); ok {
+			return candidate, true, false
+		}
+		return candidates[0], true, false
+	}
+}
+
+// compactStatusPoolSnapshot contains exactly the pool-wide values needed by
+// dashboard and compact-status polling. Unlike statusPoolSnapshot it never
+// owns a detached copy of the proxy inventory.
+type compactStatusPoolSnapshot struct {
+	Total              int
+	ProxyIPFallback    int
+	AvailableTotal     int
+	Groups             []GroupView
+	Active             Proxy
+	ActiveOK           bool
+	HealthCheckPending bool
+}
+
+// streamingStatusSelection reproduces effectiveCurrentFromSnapshot while a
+// caller walks matching proxies one at a time. Keeping both an all-routable
+// and an available-only instance lets the caller apply resolveGroup's legacy
+// "prefer healthy, otherwise use a soft-unavailable fallback" rule without
+// ever materializing either candidate slice.
+type streamingStatusSelection struct {
+	count         int
+	current       Proxy
+	metric        float64
+	cursorMatched bool
+}
+
+func (selection *streamingStatusSelection) observe(px Proxy, strategy string, cursor *groupCursor, score float64) {
+	first := selection.count == 0
+	selection.count++
+
+	switch strategy {
+	case StrategyLatency, StrategySpeed, StrategyScore:
+		metric, higher := float64(px.LatencyMs), false
+		if strategy == StrategySpeed {
+			metric, higher = px.SpeedKbps, true
+		} else if strategy == StrategyScore {
+			metric, higher = score, true
+		}
+		if first || metric != 0 && (selection.metric == 0 || higher && metric > selection.metric || !higher && metric < selection.metric) {
+			selection.current = px
+			selection.metric = metric
+		}
+	case StrategyRoundRobin, StrategyRandom:
+		if first {
+			selection.current = px
+		}
+		lastPicked := ""
+		if cursor != nil {
+			lastPicked = cursor.lastPicked
+		}
+		if !selection.cursorMatched && statusProxyHasKey(px, lastPicked) {
+			selection.current = px
+			selection.cursorMatched = true
+		}
+	default: // sticky, including the historical empty-strategy fallback
+		if first {
+			selection.current = px
+		}
+		stickyKey := ""
+		if cursor != nil {
+			stickyKey = cursor.stickyKey
+		}
+		if !selection.cursorMatched && statusProxyHasKey(px, stickyKey) {
+			selection.current = px
+			selection.cursorMatched = true
+		}
+	}
+}
+
+// statusProxyHasKey compares a cursor identity without allocating a fresh
+// Proxy.Key string for every proxy on every dashboard poll. The fallback
+// retains exact historical behavior for malformed legacy values.
+func statusProxyHasKey(px Proxy, key string) bool {
+	prefixLen := len(px.Protocol) + len("://")
+	if len(key) < prefixLen || key[:len(px.Protocol)] != px.Protocol || key[len(px.Protocol):prefixLen] != "://" {
+		return false
+	}
+	host, port, err := net.SplitHostPort(key[prefixLen:])
+	if err != nil {
+		return px.Key() == key
+	}
+	return host == px.IP && port == px.Port
+}
+
+type streamingStatusGroup struct {
+	group     Group
+	strategy  string
+	cursor    *groupCursor
+	routable  streamingStatusSelection
+	available streamingStatusSelection
+}
+
+func (group *streamingStatusGroup) observe(px Proxy, score float64) {
+	group.routable.observe(px, group.strategy, group.cursor, score)
+	if px.Available {
+		group.available.observe(px, group.strategy, group.cursor, score)
+	}
+}
+
+func (group *streamingStatusGroup) preferred() streamingStatusSelection {
+	if group.available.count > 0 {
+		return group.available
+	}
+	return group.routable
+}
+
+func statusProxyMatchesGroup(px Proxy, group Group) bool {
+	if len(group.Nodes) > 0 && !groupMatchesNode(group.Nodes, px) {
+		return false
+	}
+	if len(group.Countries) > 0 && !containsFold(group.Countries, px.Country) {
+		return false
+	}
+	if len(group.Protocols) > 0 && !containsFold(group.Protocols, px.Protocol) {
+		return false
+	}
+	return len(group.Sources) == 0 || proxyMatchesSources(px, group.Sources)
+}
+
+// captureCompactStatusPoolSnapshot performs one read-locked streaming pass
+// across the live pool. Its retained memory is O(number of configured groups),
+// not O(pool size) or O(pool size * groups): each group keeps only two running
+// selections and counters.
+func (s *StatusServer) captureCompactStatusPoolSnapshot(groups []Group) compactStatusPoolSnapshot {
+	groupStates := make([]streamingStatusGroup, len(groups))
+	for i, group := range groups {
+		strategy := group.Strategy
+		if strategy == "" {
+			strategy = StrategySticky
+		}
+		groupStates[i] = streamingStatusGroup{group: group, strategy: strategy}
+	}
+
+	views := make([]GroupView, 0, len(groups)+1)
+	s.pool.mu.RLock()
+	defer s.pool.mu.RUnlock()
+
+	any := streamingStatusGroup{strategy: StrategySticky, cursor: s.pool.groupState[GroupAny]}
+	for i := range groupStates {
+		groupStates[i].cursor = s.pool.groupState[groupStates[i].group.Name]
+	}
+
+	availableTotal := 0
+	for _, px := range s.pool.proxies {
+		// Hard routing exclusions win even if a legacy/corrupt cache contains an
+		// inconsistent Available=true bit.
+		if px.Available && proxyHardRoutable(px) {
+			switch px.Protocol {
+			case "socks5", "http", "https":
+				availableTotal++
+			}
+		}
+		if !proxyHardRoutable(px) {
+			continue
+		}
+
+		any.observe(px, 0)
+		score, scoreReady := 0.0, false
+		for i := range groupStates {
+			group := &groupStates[i]
+			if !statusProxyMatchesGroup(px, group.group) {
+				continue
+			}
+			if group.strategy == StrategyScore && !scoreReady {
+				score = s.pool.scoreLocked(px)
+				scoreReady = true
+			}
+			group.observe(px, score)
+		}
+	}
+
+	anyPreferred := any.preferred()
+	anyCurrent, anyOK := Proxy{}, anyPreferred.count > 0
+	if anyOK {
+		anyCurrent = anyPreferred.current
+	}
+	views = append(views, GroupView{
+		Name: GroupAny, Strategy: StrategySticky, Count: len(s.pool.proxies),
+		Current: statusSelectionAddr(anyPreferred), Builtin: true,
+		Pinned: any.cursor != nil && any.cursor.pinned,
+	})
+	for i := range groupStates {
+		group := &groupStates[i]
+		preferred := group.preferred()
+		dynamic := preferred.count > 0 && (group.strategy == StrategyRoundRobin || group.strategy == StrategyRandom)
+		views = append(views, GroupView{
+			ID: group.group.ID, Name: group.group.Name, Strategy: group.strategy, Count: preferred.count,
+			Current: statusSelectionAddr(preferred), Dynamic: dynamic,
+			Countries: group.group.Countries, Protocols: group.group.Protocols,
+			Sources: group.group.Sources, Nodes: group.group.Nodes,
+		})
+	}
+
+	return compactStatusPoolSnapshot{
+		Total: len(s.pool.proxies), ProxyIPFallback: len(s.pool.proxyIPNodes),
+		AvailableTotal: availableTotal, Groups: views, Active: anyCurrent, ActiveOK: anyOK,
+		HealthCheckPending: s.pool.healthRecheckPending,
+	}
+}
+
+func statusSelectionAddr(selection streamingStatusSelection) string {
+	if selection.count == 0 {
+		return ""
+	}
+	return selection.current.Addr()
 }
 
 // anyCurrentKey returns the protocol-aware identity of the node the ANY group
@@ -518,15 +877,46 @@ func (s *StatusServer) buildSummaryWithProxies(includeProxies bool) StatusSummar
 		nextStr = next.In(beijingLoc).Format("2006-01-02 15:04:05")
 	}
 
-	poolState := s.captureStatusPoolSnapshot()
-	availableTotal := countAPIPoolProxies(poolState.Proxies)
-	var proxies []PoolAPIProxy
-	if includeProxies {
-		proxies = apiPoolProxiesFrom(poolState.Proxies)
-		availableTotal = len(proxies)
+	groups := s.store.Groups()
+	if !includeProxies {
+		poolState := s.captureCompactStatusPoolSnapshot(groups)
+		activeProxy := ""
+		if poolState.ActiveOK && poolState.Active.Available {
+			activeProxy = poolState.Active.ConsumerURL()
+		}
+		proxyIPTotal := poolState.ProxyIPFallback
+		if catalogTotal, loaded := s.pool.candidates.protocolTotal("proxyip"); loaded {
+			proxyIPTotal = catalogTotal
+		}
+		return StatusSummary{
+			Total:                poolState.Total,
+			ProxyIPTotal:         proxyIPTotal,
+			LastScrape:           lastStr,
+			NextScrape:           nextStr,
+			LastScrapeAt:         formatRFC3339UTC(last),
+			NextScrapeAt:         formatRFC3339UTC(next),
+			Groups:               poolState.Groups,
+			ActiveProxy:          activeProxy,
+			AvailableTotal:       poolState.AvailableTotal,
+			UnavailableTotal:     poolState.Total - poolState.AvailableTotal,
+			HealthRecheckPending: poolState.HealthCheckPending,
+			Scrape:               scrapeState.Info,
+		}
 	}
+
+	includeStats := false
+	for _, group := range groups {
+		if group.Strategy == StrategyScore {
+			includeStats = true
+			break
+		}
+	}
+	poolState := s.captureStatusPoolSnapshot(includeStats)
+	availableTotal := countAPIPoolProxies(poolState.Proxies)
+	proxies := apiPoolProxiesFrom(poolState.Proxies)
+	availableTotal = len(proxies)
 	activeProxy := ""
-	if poolState.ActiveOK && poolState.Active.Available {
+	if poolState.ActiveOK && poolState.Active.Available && proxyHardRoutable(poolState.Active) {
 		activeProxy = poolState.Active.ConsumerURL()
 	}
 
@@ -537,18 +927,28 @@ func (s *StatusServer) buildSummaryWithProxies(includeProxies bool) StatusSummar
 		proxyIPTotal = s.pool.ProxyIPCount()
 	}
 	summary := StatusSummary{
-		Total:            len(poolState.Proxies),
-		ProxyIPTotal:     proxyIPTotal,
-		LastScrape:       lastStr,
-		NextScrape:       nextStr,
-		Groups:           s.buildGroupViews(),
-		ActiveProxy:      activeProxy,
-		Proxies:          proxies,
-		AvailableTotal:   availableTotal,
-		UnavailableTotal: len(poolState.Proxies) - availableTotal,
-		Scrape:           scrapeState.Info,
+		Total:                len(poolState.Proxies),
+		ProxyIPTotal:         proxyIPTotal,
+		LastScrape:           lastStr,
+		NextScrape:           nextStr,
+		LastScrapeAt:         formatRFC3339UTC(last),
+		NextScrapeAt:         formatRFC3339UTC(next),
+		Groups:               buildGroupViewsFromSnapshot(poolState, groups),
+		ActiveProxy:          activeProxy,
+		Proxies:              proxies,
+		AvailableTotal:       availableTotal,
+		UnavailableTotal:     len(poolState.Proxies) - availableTotal,
+		HealthRecheckPending: s.pool.HealthRecheckPending(),
+		Scrape:               scrapeState.Info,
 	}
 	return summary
+}
+
+func formatRFC3339UTC(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
 }
 
 // apiPoolProxies exposes only nodes that passed the pool's health check.
@@ -562,7 +962,7 @@ func (s *StatusServer) apiPoolProxies() []PoolAPIProxy {
 func apiPoolProxiesFrom(proxies []Proxy) []PoolAPIProxy {
 	out := make([]PoolAPIProxy, 0)
 	for _, px := range proxies {
-		if !px.Available {
+		if !px.Available || !proxyHardRoutable(px) {
 			continue
 		}
 		switch px.Protocol {
@@ -586,7 +986,7 @@ func apiPoolProxiesFrom(proxies []Proxy) []PoolAPIProxy {
 func countAPIPoolProxies(proxies []Proxy) int {
 	count := 0
 	for _, px := range proxies {
-		if !px.Available {
+		if !px.Available || !proxyHardRoutable(px) {
 			continue
 		}
 		switch px.Protocol {
@@ -602,15 +1002,44 @@ type statusPoolSnapshot struct {
 	Generation uint64
 	Active     Proxy
 	ActiveOK   bool
+	GroupState map[string]*groupCursor
+	Stats      map[string]nodeStats
 }
 
-func (s *StatusServer) captureStatusPoolSnapshot() statusPoolSnapshot {
+func (s *StatusServer) captureStatusPoolSnapshot(includeStats bool) statusPoolSnapshot {
 	s.pool.mu.RLock()
 	defer s.pool.mu.RUnlock()
-	proxies := cloneProxySlice(s.pool.proxies)
+	proxies := make([]Proxy, len(s.pool.proxies))
+	for i, proxy := range s.pool.proxies {
+		// The compatibility response needs a detached pool snapshot because it
+		// emits every healthy proxy after releasing the lock. Compact/dashboard
+		// polling uses captureCompactStatusPoolSnapshot and never enters this path.
+		proxy.SourceNames = append([]string(nil), proxy.SourceNames...)
+		proxy.SourceIDs = nil
+		proxy.CredentialAlternates = nil
+		proxies[i] = proxy
+	}
 	active, activeOK := effectiveAnyCurrentLocked(proxies, s.pool.groupState[GroupAny])
+	groupState := make(map[string]*groupCursor, len(s.pool.groupState))
+	for name, cursor := range s.pool.groupState {
+		if cursor == nil {
+			continue
+		}
+		copy := *cursor
+		groupState[name] = &copy
+	}
+	var stats map[string]nodeStats
+	if includeStats {
+		stats = make(map[string]nodeStats, len(s.pool.stats))
+		for key, stat := range s.pool.stats {
+			if stat != nil {
+				stats[key] = *stat
+			}
+		}
+	}
 	return statusPoolSnapshot{
 		Proxies: proxies, Generation: s.pool.cacheGeneration, Active: active, ActiveOK: activeOK,
+		GroupState: groupState, Stats: stats,
 	}
 }
 
@@ -622,8 +1051,16 @@ func effectiveAnyCurrentLocked(proxies []Proxy, cursor *groupCursor) (Proxy, boo
 	if len(proxies) == 0 {
 		return Proxy{}, false
 	}
-	candidates := proxies
-	if available := filterAvailable(proxies); len(available) > 0 {
+	candidates := make([]Proxy, 0, len(proxies))
+	for _, px := range proxies {
+		if proxyHardRoutable(px) {
+			candidates = append(candidates, px)
+		}
+	}
+	if len(candidates) == 0 {
+		return Proxy{}, false
+	}
+	if available := filterAvailable(candidates); len(available) > 0 {
 		candidates = available
 	}
 	stickyKey := ""
@@ -661,8 +1098,9 @@ func nodeViewOf(px Proxy, activeKey string) NodeView {
 		ExitIP: px.ExitIP, IPChanged: px.IPChanged, IPChangeKnown: px.IPChangeKnown, Anonymity: px.Anonymity,
 		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,
 		SpeedTestedAt: px.SpeedTestedAt, SpeedBytes: px.SpeedBytes, SpeedDurationMs: px.SpeedDurationMs,
-		Active:    activeKey != "" && px.Key() == activeKey,
-		Available: px.Available,
+		Active:        activeKey != "" && px.Key() == activeKey,
+		Available:     px.Available && proxyHardRoutable(px),
+		SourceRetired: px.SourceRetired, HealthInvalidated: px.HealthInvalidated, PolicyExcluded: px.PolicyExcluded,
 	}
 }
 
@@ -724,6 +1162,15 @@ func writeJSONStatus(w http.ResponseWriter, status int, v interface{}) {
 
 func writeErr(w http.ResponseWriter, status int, err error) {
 	writeErrCode(w, status, apiCodeForStatus(status), err)
+}
+
+func writeConfigStoreError(w http.ResponseWriter, err error) {
+	var persistenceErr *ConfigPersistenceError
+	if errors.As(err, &persistenceErr) {
+		writeErrCode(w, http.StatusInternalServerError, "config_persistence_failed", err)
+		return
+	}
+	writeErr(w, http.StatusBadRequest, err)
 }
 
 // apiErrorResponse retains the historical top-level error string used by the
@@ -922,12 +1369,17 @@ func (s *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *StatusServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("compact") == "1" {
 		summary := s.buildSummaryWithProxies(false)
+		candidate := s.compactCandidateStatus()
 		writeJSON(w, compactStatusSummary{
 			Total: summary.Total, ProxyIPTotal: summary.ProxyIPTotal,
 			LastScrape: summary.LastScrape, NextScrape: summary.NextScrape,
+			LastScrapeAt: summary.LastScrapeAt, NextScrapeAt: summary.NextScrapeAt,
 			Groups: summary.Groups, ActiveProxy: summary.ActiveProxy,
 			AvailableTotal: summary.AvailableTotal, UnavailableTotal: summary.UnavailableTotal,
-			Scrape: summary.Scrape,
+			HealthRecheckPending: summary.HealthRecheckPending,
+			Scrape:               summary.Scrape,
+			CandidateTotal:       candidate.Total, CandidatePhase: candidate.Phase,
+			CandidateSourceErrors: candidate.SourceErrors, CandidateUpdatedAt: candidate.UpdatedAt,
 		})
 		return
 	}
@@ -991,6 +1443,7 @@ func (s *StatusServer) handleV1ProxyPick(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	all, snapshotID := s.v1HealthyProxySnapshot()
+	snapshotID = formatV1ProxyPickSnapshotID(all)
 	w.Header().Set("X-Snapshot-ID", snapshotID)
 	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != snapshotID {
 		writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
@@ -1014,7 +1467,7 @@ func (s *StatusServer) v1HealthyProxySnapshot() ([]V1ProxyView, string) {
 	s.pool.mu.RLock()
 	views := make([]V1ProxyView, 0, len(s.pool.proxies))
 	for _, px := range s.pool.proxies {
-		if !px.Available {
+		if !px.Available || !proxyHardRoutable(px) {
 			continue
 		}
 		switch px.Protocol {
@@ -1090,20 +1543,49 @@ func filterV1ProxyViews(all []V1ProxyView, protocol string, r *http.Request) []V
 // /api/status response retains the registration-client contract; dashboard
 // polling only needs counters and group state.
 type compactStatusSummary struct {
-	Total            int         `json:"total"`
-	ProxyIPTotal     int         `json:"proxyip_total"`
-	LastScrape       string      `json:"last_scrape"`
-	NextScrape       string      `json:"next_scrape"`
-	Groups           []GroupView `json:"groups"`
-	ActiveProxy      string      `json:"active_proxy"`
-	AvailableTotal   int         `json:"available_total"`
-	UnavailableTotal int         `json:"unavailable_total"`
-	Scrape           ScrapeInfo  `json:"scrape"`
+	Total                 int         `json:"total"`
+	ProxyIPTotal          int         `json:"proxyip_total"`
+	LastScrape            string      `json:"last_scrape"`
+	NextScrape            string      `json:"next_scrape"`
+	LastScrapeAt          string      `json:"last_scrape_at,omitempty"`
+	NextScrapeAt          string      `json:"next_scrape_at,omitempty"`
+	Groups                []GroupView `json:"groups"`
+	ActiveProxy           string      `json:"active_proxy"`
+	AvailableTotal        int         `json:"available_total"`
+	UnavailableTotal      int         `json:"unavailable_total"`
+	HealthRecheckPending  bool        `json:"health_recheck_pending"`
+	Scrape                ScrapeInfo  `json:"scrape"`
+	CandidateTotal        int         `json:"candidate_total"`
+	CandidatePhase        string      `json:"candidate_phase"`
+	CandidateSourceErrors int         `json:"candidate_source_errors"`
+	CandidateUpdatedAt    string      `json:"candidate_updated_at,omitempty"`
+}
+
+type compactCandidateSummary struct {
+	Total        int
+	Phase        string
+	SourceErrors int
+	UpdatedAt    string
+}
+
+func (s *StatusServer) compactCandidateStatus() compactCandidateSummary {
+	if s.pool == nil || s.pool.candidates == nil {
+		return compactCandidateSummary{Phase: "loading"}
+	}
+	snapshot := s.pool.candidates.snapshot.Load()
+	if snapshot == nil {
+		return compactCandidateSummary{Phase: "loading"}
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	return compactCandidateSummary{
+		Total: len(snapshot.records), Phase: snapshot.phase,
+		SourceErrors: snapshot.sourceErrors, UpdatedAt: formatCandidateTime(snapshot.seenAt),
+	}
 }
 
 func (s *StatusServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	operation, accepted := RequestRefresh()
-	TriggerRecheck()
 	w.Header().Set("Location", "/api/refresh/status")
 	writeJSONStatus(w, http.StatusAccepted, struct {
 		RefreshOperation
@@ -1120,10 +1602,15 @@ func (s *StatusServer) handleRefreshStatus(w http.ResponseWriter, _ *http.Reques
 	writeJSON(w, getRefreshOperationStatus())
 }
 
+func (s *StatusServer) handleHealthRecheckStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, getHealthRecheckOperationStatus())
+}
+
 // handleCheckURL gets or sets the health-check target URL - the sole
 // criterion for whether a node counts as alive (see checker.go checkURL).
-// A successful POST triggers an immediate refresh so the new criterion
-// takes effect right away instead of waiting for the next scrape cycle.
+// A successful POST immediately invalidates health learned under the old
+// criterion, then schedules one full retained-pool recheck. Source inventory
+// is unchanged, so a duplicate source scrape would only add load and delay.
 func (s *StatusServer) handleCheckURL(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
@@ -1136,13 +1623,44 @@ func (s *StatusServer) handleCheckURL(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		if err := s.store.SetCheckURL(in.URL); err != nil {
+		requestedURL := strings.TrimSpace(in.URL)
+		if err := validateCheckURL(requestedURL); err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		TriggerRefresh()
-		TriggerRecheck()
-		writeJSON(w, map[string]string{"status": "ok", "url": s.store.CheckURL()})
+		if requestedURL == s.store.CheckURL() {
+			writeJSON(w, struct {
+				Status                 string `json:"status"`
+				URL                    string `json:"url"`
+				Changed                bool   `json:"changed"`
+				InvalidatedTotal       int    `json:"invalidated_total"`
+				CandidateOutcomesReset int    `json:"candidate_outcomes_reset"`
+			}{Status: "ok", URL: requestedURL, Changed: false})
+			return
+		}
+		if err := s.store.SetCheckURL(requestedURL); err != nil {
+			writeConfigStoreError(w, err)
+			return
+		}
+		invalidated := s.pool.InvalidateHealth(s.store.CheckURL())
+		candidateOutcomesReset := s.pool.candidates.ResetHealthOutcomes()
+		s.pool.FlushCache()
+		operation, accepted := TriggerFullRecheck(s.pool)
+		w.Header().Set("Location", "/api/health-recheck/status")
+		writeJSON(w, struct {
+			Status                 string                 `json:"status"`
+			URL                    string                 `json:"url"`
+			Changed                bool                   `json:"changed"`
+			InvalidatedTotal       int                    `json:"invalidated_total"`
+			CandidateOutcomesReset int                    `json:"candidate_outcomes_reset"`
+			HealthRecheck          HealthRecheckOperation `json:"health_recheck"`
+			Accepted               bool                   `json:"accepted"`
+			StatusURL              string                 `json:"status_url"`
+		}{
+			Status: "ok", URL: s.store.CheckURL(), Changed: true,
+			InvalidatedTotal: invalidated, CandidateOutcomesReset: candidateOutcomesReset,
+			HealthRecheck: operation, Accepted: accepted, StatusURL: "/api/health-recheck/status",
+		})
 	default:
 		methodNotAllowed(w, http.MethodGet, http.MethodHead, http.MethodPost)
 	}
@@ -1151,6 +1669,9 @@ func (s *StatusServer) handleCheckURL(w http.ResponseWriter, r *http.Request) {
 // ---- handlers: nodes ----
 
 func (s *StatusServer) handleNodes(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Sunset", "Thu, 31 Dec 2026 23:59:59 GMT")
+	w.Header().Add("Link", `</api/nodes/page>; rel="successor-version"`)
 	writeJSON(w, s.nodeViews())
 }
 
@@ -1171,6 +1692,14 @@ func (s *StatusServer) handleNodesPage(w http.ResponseWriter, r *http.Request) {
 		writeErrCode(w, http.StatusBadRequest, "invalid_country", err)
 		return
 	}
+	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" {
+		current := s.currentNodeSnapshotID()
+		w.Header().Set("X-Snapshot-ID", current)
+		if requested != current {
+			writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
+			return
+		}
+	}
 	page := s.buildNodePage(r)
 	w.Header().Set("X-Snapshot-ID", page.SnapshotID)
 	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != page.SnapshotID {
@@ -1178,6 +1707,13 @@ func (s *StatusServer) handleNodesPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, page)
+}
+
+func (s *StatusServer) currentNodeSnapshotID() string {
+	s.pool.mu.RLock()
+	generation := s.pool.cacheGeneration
+	s.pool.mu.RUnlock()
+	return formatPoolSnapshotID(generation)
 }
 
 func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
@@ -1408,8 +1944,12 @@ func (s *StatusServer) handleNodeSwitch(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if !s.pool.ForceSticky(GroupAny, in.Key) {
+	switch s.pool.forceSticky(GroupAny, in.Key) {
+	case forceStickyNotFound:
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("node not found: %s", in.Key))
+		return
+	case forceStickyUnavailable:
+		writeErrCode(w, http.StatusConflict, "node_unavailable", fmt.Errorf("节点当前不可用，不能手动切换；请先复检并等待节点恢复"))
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok", "pinned": "true"})
@@ -1426,6 +1966,10 @@ func (s *StatusServer) handleNodeAuto(w http.ResponseWriter, r *http.Request) {
 // currently marked unavailable. The pool never does this on its own (see
 // ProxyPool.Update) - it's only ever invoked by a dashboard button click.
 func (s *StatusServer) handleNodesClearUnavailable(w http.ResponseWriter, r *http.Request) {
+	if s.pool.HealthRecheckPending() {
+		writeErrCode(w, http.StatusConflict, "health_recheck_in_progress", fmt.Errorf("健康标准全量复检尚未完成，暂不能永久清理不可用节点"))
+		return
+	}
 	n := s.pool.ClearUnavailable()
 	writeJSON(w, map[string]int{"removed": n})
 }
@@ -1443,6 +1987,11 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	healthGeneration, healthCheckURL := s.pool.HealthCriterion()
+	if healthCheckURL == "" {
+		s.pool.SetHealthCriterion(s.store.CheckURL())
+		healthGeneration, healthCheckURL = s.pool.HealthCriterion()
+	}
 	px, ok := s.pool.Find(in.Key)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("node not found: %s", in.Key))
@@ -1458,8 +2007,8 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	prevExitIP, prevCountry := px.ExitIP, px.Country
 	verifyCtx, cancel := context.WithTimeout(r.Context(), manualNodeVerifyTotalTimeout)
 	defer cancel()
-	reachable, attempts, latencyMs, err := runManualNodeVerifyChecks(
-		verifyCtx, s.nodeVerifyOps.checkURL, px, s.store.CheckURL(),
+	verified, reachable, attempts, latencyMs, err := runManualNodeVerifyChecks(
+		verifyCtx, s.nodeVerifyOps, px, healthCheckURL,
 	)
 	if err != nil {
 		writeManualNodeVerifyCanceled(w, attempts, err)
@@ -1469,6 +2018,7 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	exitIP := ""
 	country, city, continent := "", "", ""
 	if reachable {
+		px = verified
 		exitIP = s.nodeVerifyOps.probeExitIP(verifyCtx, px, manualNodeVerifyExitTimeout)
 	}
 	if reachable && exitIP != "" {
@@ -1485,12 +2035,24 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		writeManualNodeVerifyCanceled(w, attempts, err)
 		return
 	}
+	if reachable {
+		s.pool.UpdateVerifiedCredentialsAtGeneration(in.Key, verified, healthGeneration)
+	}
+
+	baseline := BaselineExitIP()
+	ipChangeKnown := exitIP != "" && baseline != ""
+	ipChanged := ipChangeKnown && exitIP != baseline
+	policyAllowed := !s.pool.RequireIPChangePolicy() || !ipChangeKnown || ipChanged
 
 	// Three transport attempts form one explicit health observation, not three
 	// independent failures. A success revives immediately; a final failure joins
 	// the same three-observation debounce used by background health work so one
 	// unlucky manual click cannot evict an intermittently reachable node.
-	if !s.pool.ObserveHealthResult(in.Key, reachable, latencyMs) {
+	if !s.pool.ObserveHealthOutcomeAtGeneration(in.Key, reachable, policyAllowed, latencyMs, healthGeneration) {
+		if s.pool.HealthGeneration() != healthGeneration {
+			writeErrCode(w, http.StatusConflict, "health_criterion_changed", fmt.Errorf("检测标准已改变，结果未应用"))
+			return
+		}
 		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while verification was running"))
 		return
 	}
@@ -1499,13 +2061,18 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while verification was running"))
 		return
 	}
-	baseline := BaselineExitIP()
-	ipChangeKnown := exitIP != "" && baseline != ""
-	ipChanged := ipChangeKnown && exitIP != baseline
-
 	if exitIP != "" {
 		s.pool.UpdateGeo(in.Key, exitIP, country, city, continent, ipChanged, ipChangeKnown)
 	}
+	reachableKeys := map[string]bool{}
+	policyFiltered := map[string]bool{}
+	if reachable {
+		reachableKeys[in.Key] = true
+	}
+	if reachable && !policyAllowed {
+		policyFiltered[in.Key] = true
+	}
+	s.pool.candidates.ApplyHealthOutcomes([]Proxy{px}, reachableKeys, policyFiltered)
 	labelMatchKnown, labelMatched := manualNodeLabelMatch(country, prevCountry)
 	// Manual verification is an explicit operator action, so make the health
 	// state durable before replying instead of leaving it in the debounce window.
@@ -1522,6 +2089,7 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		"city":                 city,
 		"ip_changed":           ipChanged,
 		"ip_change_known":      ipChangeKnown,
+		"policy_excluded":      reachable && !policyAllowed,
 		"prev_exit_ip":         prevExitIP,
 		"prev_country":         prevCountry,
 		"label_match_known":    labelMatchKnown,
@@ -1538,6 +2106,7 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	healthGeneration := s.pool.HealthGeneration()
 	px, ok := s.pool.Find(in.Key)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("node not found: %s", in.Key))
@@ -1550,11 +2119,12 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 	}
 	defer s.endSpeedTest(in.Key)
 
-	result, err := SpeedTestContext(r.Context(), px, speedTestOperationTimeout)
+	result, verified, err := speedTestCredentialCandidatesContext(r.Context(), px, speedTestOperationTimeout)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
+	s.pool.UpdateVerifiedCredentialsAtGeneration(in.Key, verified, healthGeneration)
 	if !s.pool.UpdateSpeed(in.Key, result.Kbps, result.Bytes, result.DurationMs) {
 		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while speed test was running"))
 		return
@@ -1603,7 +2173,7 @@ func (s *StatusServer) handleSources(w http.ResponseWriter, r *http.Request) {
 		}
 		created, err := s.store.AddSource(in)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeConfigStoreError(w, err)
 			return
 		}
 		TriggerRefresh()
@@ -1622,14 +2192,15 @@ func (s *StatusServer) handleSourceToggle(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	sourceLifecycleMu.Lock()
+	defer sourceLifecycleMu.Unlock()
 	if err := s.store.ToggleSource(in.ID, in.Enabled); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
-	if in.Enabled {
-		TriggerRefresh()
-	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	retired := s.pool.ApplyEnabledSources(s.store.Sources())
+	TriggerRefresh()
+	writeJSON(w, map[string]interface{}{"status": "ok", "retired_total": retired})
 }
 
 func (s *StatusServer) handleSourceDelete(w http.ResponseWriter, r *http.Request) {
@@ -1640,11 +2211,15 @@ func (s *StatusServer) handleSourceDelete(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	sourceLifecycleMu.Lock()
+	defer sourceLifecycleMu.Unlock()
 	if err := s.store.DeleteSource(in.ID); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	retired := s.pool.ApplyEnabledSources(s.store.Sources())
+	TriggerRefresh()
+	writeJSON(w, map[string]interface{}{"status": "ok", "retired_total": retired})
 }
 
 // ---- handlers: rules ----
@@ -1661,7 +2236,7 @@ func (s *StatusServer) handleRules(w http.ResponseWriter, r *http.Request) {
 		}
 		created, err := s.store.AddRule(in)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeConfigStoreError(w, err)
 			return
 		}
 		writeJSON(w, created)
@@ -1679,7 +2254,7 @@ func (s *StatusServer) handleRuleDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.store.DeleteRule(in.ID); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
@@ -1695,7 +2270,7 @@ func (s *StatusServer) handleRuleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.MoveRule(in.ID, in.Delta); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
@@ -1703,7 +2278,7 @@ func (s *StatusServer) handleRuleMove(w http.ResponseWriter, r *http.Request) {
 
 func (s *StatusServer) handleRulePresetGFW(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.InstallGFWPreset(); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
@@ -1718,7 +2293,7 @@ func (s *StatusServer) handleRuleDefault(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.store.SetDefaultGroup(in.Group); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
@@ -1738,7 +2313,7 @@ func (s *StatusServer) handleGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		created, err := s.store.AddGroup(in)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeConfigStoreError(w, err)
 			return
 		}
 		writeJSON(w, created)
@@ -1757,7 +2332,7 @@ func (s *StatusServer) handleGroupStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.store.SetGroupStrategy(in.ID, in.Strategy); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
@@ -1772,7 +2347,7 @@ func (s *StatusServer) handleGroupDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.store.DeleteGroup(in.ID); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeConfigStoreError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})

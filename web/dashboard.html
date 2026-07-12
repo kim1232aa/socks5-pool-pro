@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Proxy Atlas · 代理节点控制台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body>
+<a class="skip-link" href="#main-content">跳到主要内容</a>
+<div class="app-shell">
+<aside class="sidebar" aria-label="主导航">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true">PA</div>
+    <div class="brand-copy"><strong>Proxy Atlas</strong><span>Operations Console</span></div>
+  </div>
+  <div class="nav-label">资源管理</div>
+  <nav class="tabs" role="tablist" aria-label="管理页面">
+    <a id="tab-link-nodes" href="#nodes" class="tab-link" data-tab="nodes" data-icon="◉" role="tab" aria-controls="tab-nodes">转发代理池</a>
+    <a id="tab-link-candidates" href="#candidates" class="tab-link" data-tab="candidates" data-icon="◫" role="tab" aria-controls="tab-candidates">候选库存</a>
+    <a id="tab-link-sources" href="#sources" class="tab-link" data-tab="sources" data-icon="⌁" role="tab" aria-controls="tab-sources">来源订阅</a>
+    <a id="tab-link-rules" href="#rules" class="tab-link" data-tab="rules" data-icon="⑂" role="tab" aria-controls="tab-rules">分流规则</a>
+    <a id="tab-link-groups" href="#groups" class="tab-link" data-tab="groups" data-icon="◇" role="tab" aria-controls="tab-groups">分组策略</a>
+  </nav>
+  <div class="sidebar-foot">
+    <div id="connection-status" class="system-online" data-connection-status data-state="connecting" role="status" aria-live="polite">正在连接管理 API</div>
+    <a class="gh-link" href="https://github.com/kim1232aa/socks5-pool-pro" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>查看项目源码</a>
+  </div>
+</aside>
+
+<main id="main-content" class="main-shell" tabindex="-1">
+<div class="container">
+  <header class="topbar">
+    <div class="topbar-context"><span class="eyebrow">Control plane</span><h1 id="page-title">转发代理池</h1><p id="page-description" class="page-description">健康节点、出口状态与人工复检。</p></div>
+    <div class="topbar-actions">
+      <span class="api-chip" data-connection-status data-state="connecting">管理 API · 连接中</span>
+      <span id="refresh-status" class="small refresh-status" role="status" aria-live="polite"></span>
+      <button id="refresh-btn" type="button" class="btn" onclick="doRefresh(this)" aria-describedby="refresh-status">立即刷新节点</button>
+    </div>
+  </header>
+
+  <div class="content-stage">
+
+<div id="tab-nodes" class="tab-panel" role="tabpanel" aria-labelledby="tab-link-nodes">
+  <div class="view-hero view-hero-routing">
+    <div><span class="panel-kicker">Routable</span><h2>转发代理池</h2><p>只有进入这里的节点才参与 SOCKS/HTTP 转发。</p></div>
+    <nav class="resource-rail" aria-label="代理资源边界">
+      <a class="resource-pill active" href="#nodes"><b>01</b><span>转发池<small>可路由、可操作</small></span></a>
+      <a class="resource-pill" href="#candidates"><b>02</b><span>候选库存<small>完整只读目录</small></span></a>
+      <a class="resource-pill proxyip" href="#candidates" onclick="showCandidateProtocol('proxyip')"><b>03</b><span>ProxyIP<small>Worker 外部资源</small></span></a>
+    </nav>
+  </div>
+
+  <section class="task-metrics" aria-label="转发代理池概览">
+    <div class="task-metric"><span>池内总数</span><strong id="node-total">{{.Total}}</strong></div>
+    <div class="task-metric healthy"><span>健康可用</span><strong id="node-available">加载中</strong></div>
+    <div class="task-metric warning"><span>保留但不可用</span><strong id="node-unavailable">加载中</strong></div>
+    <div class="task-metric"><span>筛选匹配</span><strong id="node-matching">加载中</strong></div>
+  </section>
+
+  <section class="health-workbench" aria-label="检测目标与刷新计划">
+    <div class="checkurl-bar">
+      <div class="field-copy"><span class="step-number">健康标准</span><label class="checkurl-label" for="check-url-input">通过代理可访问的目标 URL</label></div>
+      <input id="check-url-input" type="url" value="{{.CheckURL}}" placeholder="https://www.google.com/generate_204">
+      <button id="check-url-save" type="button" class="btn-sm" onclick="saveCheckURL(this)">保存并全量复检</button>
+      <span class="checkurl-hint">默认 HTTPS 探针必须返回 204；自定义目标必须返回 2xx，重定向不会被当作成功。更改后旧结果立即失效并全池复检。</span>
+      <span id="check-url-status" class="small" role="status" aria-live="polite"></span>
+    </div>
+    <div class="refresh-timeline" aria-label="刷新时间">
+      <div class="timeline-item">最近完成<strong id="timeline-last">{{if .LastScrape}}{{.LastScrape}}{{else}}尚未刷新{{end}}</strong></div>
+      <div class="timeline-item">下次计划<strong id="timeline-next">{{if .NextScrape}}{{.NextScrape}}{{else}}等待调度{{end}}</strong></div>
+    </div>
+  </section>
+
+  <span id="stat-total" class="status-alias" aria-hidden="true">{{.Total}}</span><span id="stat-available" class="status-alias" aria-hidden="true"></span><span id="stat-unavailable" class="status-alias" aria-hidden="true"></span><span id="stat-matching" class="status-alias" aria-hidden="true"></span><span id="stat-proxyip" class="status-alias" aria-hidden="true">{{.ProxyIPTotal}}</span><span id="stat-last" class="status-alias" aria-hidden="true"></span><span id="stat-next" class="status-alias" aria-hidden="true"></span>
+
+  <div id="current-node-banner" class="current-node" aria-live="polite">当前使用节点: <span class="cn-addr">加载中...</span></div>
+
+  <div id="group-cards-container" class="group-cards"></div>
+
+  <p class="inline-guidance"><b>出口国家</b>来自穿过节点的实测；不可用节点默认只隐藏并继续保留，成功后可自动恢复。</p>
+  <div id="scrape-flow" class="scrape-flow" aria-label="最近一轮节点处理链路" hidden>
+    <span class="scrape-step">来源原始 <strong id="scrape-raw">0</strong></span><span class="scrape-arrow">→</span>
+    <span class="scrape-step">去重候选 <strong id="scrape-candidates">0</strong></span><span class="scrape-arrow">→</span>
+    <span class="scrape-step">本轮检测 <strong id="scrape-checked">0</strong></span><span class="scrape-arrow">→</span>
+    <span class="scrape-step">本轮通过 <strong id="scrape-alive">0</strong></span>
+    <span id="scrape-meta" class="scrape-meta"></span>
+  </div>
+
+  <div class="filter-bar">
+    <label class="sr-only" for="f-text">搜索节点 IP 或地址</label>
+    <input id="f-text" placeholder="搜索 IP/地址..." oninput="onFilterChange()" autocomplete="off">
+    <input id="f-country" type="hidden" value="">
+    <button id="f-country-button" type="button" class="country-picker-trigger" onclick="openNodeCountryPicker()" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">🗺️ 全部实测出口国家</button>
+    <label class="sr-only" for="f-proto">按协议筛选</label>
+    <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
+    <label class="sr-only" for="f-sort">节点排序方式</label>
+    <select id="f-sort" onchange="onFilterChange()">
+      <option value="score">按评分↓</option>
+      <option value="latency">按延迟↑</option>
+      <option value="speed">按速度↓</option>
+      <option value="country">按国家</option>
+    </select>
+    <label class="sr-only" for="f-pagesize">每页显示数量</label>
+    <select id="f-pagesize" onchange="onPageSizeChange()">
+      <option value="10">每页10</option>
+      <option value="20">每页20</option>
+      <option value="50">每页50</option>
+      <option value="100">每页100</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="onFilterChange()"> 只看真正改IP的</label>
+    <label class="chk"><input type="checkbox" id="f-hide-unavail" checked onchange="onFilterChange()"> 隐藏不可用</label>
+    <button type="button" class="btn-sm" onclick="exportNodes('csv')" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
+    <button type="button" class="btn-sm" onclick="exportNodes('tme')" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
+    <span id="node-count" class="small" role="status" aria-live="polite"></span>
+  </div>
+  <div id="node-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
+
+  <div class="pager node-pager-top" id="node-pager-top" aria-label="代理池分页（顶部）"></div>
+  <div class="table-scroll node-table-scroll" tabindex="0" aria-label="节点表格，可横向滚动">
+  <table class="node-table">
+  <caption class="sr-only">代理节点状态和操作</caption>
+  <thead><tr><th></th><th>协议</th><th>地址(节点IP)</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th title="健康检查累计成功/失败次数">成功/失败</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="12" class="empty">加载中...</td></tr></tbody>
+  </table>
+  </div>
+  <div class="pager" id="node-pager"></div>
+
+  <details class="danger-zone">
+    <summary>维护与危险操作</summary>
+    <div><p id="clear-unavailable-help">不可用节点默认只隐藏并会在恢复后重新出现。仅在确认不再保留历史节点时执行永久清理。</p><button type="button" class="btn-sm danger" id="clear-unavailable-button" onclick="clearUnavailable()">永久清理全部不可用节点</button></div>
+  </details>
+
+</div>
+
+<div id="tab-candidates" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-candidates">
+  <div class="view-hero view-hero-catalog">
+    <div><span class="panel-kicker">Catalog</span><h2>候选库存</h2><p>按资源类型和来源地区浏览完整去重快照。</p></div>
+    <div class="catalog-boundary"><b>边界说明</b><span>候选是只读库存，不等于健康代理。</span></div>
+  </div>
+
+  <section class="task-metrics task-metrics-candidate" aria-label="候选库存概览">
+    <div class="task-metric"><span>去重候选</span><strong id="candidate-total">加载中</strong></div>
+    <div class="task-metric"><span>当前匹配</span><strong id="candidate-matching">加载中</strong></div>
+    <div class="task-metric healthy"><span>已进入转发池</span><strong id="candidate-known">加载中</strong></div>
+    <div class="task-metric"><span>仍待检测</span><strong id="candidate-deferred">加载中</strong></div>
+    <div class="task-metric warning"><span>来源地区未知</span><strong id="candidate-country-unknown">加载中</strong></div>
+  </section>
+
+  <section class="catalog-workflow" aria-label="按类型和地区浏览候选">
+    <div class="workflow-heading"><span>浏览路径</span><strong>资源类型 → 来源地区 → 节点结果</strong></div>
+    <div class="workflow-step workflow-step-type">
+      <span class="workflow-index">1</span><div class="workflow-copy"><b>选择资源类型</b><small>SOCKS/HTTP 可进入本地转发；ProxyIP 是独立的 Cloudflare 资源。</small></div>
+      <div id="candidate-protocol-cards" class="protocol-quick" aria-label="按协议快速筛选候选"></div>
+    </div>
+    <div class="workflow-step workflow-step-region">
+      <span class="workflow-index">2</span><div class="workflow-copy"><b>选择来源地区</b><small>先选大洲，再从实时数量中选择国家或地区。</small></div>
+      <input id="cf-country" type="hidden" value="">
+      <button id="cf-country-button" type="button" class="country-picker-trigger browse-region-button" onclick="openCandidateCountryPicker()" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">打开地区浏览器</button>
+    </div>
+    <div class="proxyip-rule"><b>Cloudflare ProxyIP</b><span>只接受端口集合含 443 的记录，使用时仅取纯 IP；它不是 <code>host&amp;port=1080&amp;user=...&amp;pass=...</code> 这类 SOCKS/HTTP 链式代理参数。</span></div>
+  </section>
+
+  <div class="filter-bar" aria-label="候选目录筛选">
+    <label class="sr-only" for="cf-text">搜索候选地址或来源</label>
+    <input id="cf-text" placeholder="搜索 IP / 地址 / 来源..." oninput="onCandidateFilterChange()" autocomplete="off">
+    <label class="sr-only" for="cf-source">按来源筛选候选</label>
+    <select id="cf-source" onchange="onCandidateFilterChange()"><option value="">全部来源</option></select>
+    <label class="sr-only" for="cf-proto">按协议筛选候选</label>
+    <select id="cf-proto" onchange="onCandidateFilterChange()"><option value="">全部协议</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https</option><option value="proxyip">proxyip（不参与转发）</option></select>
+    <label class="sr-only" for="cf-status">按检测状态筛选候选</label>
+    <select id="cf-status" onchange="onCandidateFilterChange()">
+      <option value="">全部状态</option>
+      <option value="known_available">池内可用</option>
+      <option value="known_unavailable">池内不可用</option>
+      <option value="checked_failed">最近检测失败</option>
+      <option value="policy_filtered">策略排除</option>
+      <option value="resource">ProxyIP 资源（不路由）</option>
+      <option value="deferred">仍待检测</option>
+    </select>
+    <label class="sr-only" for="cf-pagesize">候选每页显示数量</label>
+    <select id="cf-pagesize" onchange="onCandidatePageSizeChange()">
+      <option value="10">每页10</option>
+      <option value="20">每页20</option>
+      <option value="50" selected>每页50</option>
+      <option value="100">每页100</option>
+    </select>
+    <span id="candidate-count" class="small" role="status" aria-live="polite"></span>
+    <span class="candidate-filter-note">筛选和分页均在服务端执行。ProxyIP 的逐条专用验证只提供外部参考，不改变本地转发池状态。</span>
+  </div>
+  <div id="candidate-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
+
+  <div class="pager candidate-pager-top" id="candidate-pager-top" aria-label="候选分页（顶部）"></div>
+  <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="全部抓取候选表格">
+  <table class="candidate-table">
+  <caption class="sr-only">所有来源抓取到的去重代理候选</caption>
+  <thead><tr><th>状态</th><th>协议</th><th>候选地址</th><th>来源标注地区</th><th>来源</th><th>专用验证</th></tr></thead>
+  <tbody id="candidate-tbody"><tr><td colspan="6" class="empty">切换到本页后加载完整候选目录...</td></tr></tbody>
+  </table>
+  </div>
+  <div class="pager" id="candidate-pager"></div>
+</div>
+
+<div id="tab-sources" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-sources">
+  <div class="panel-heading"><div><span class="panel-kicker">Subscriptions</span><h2>订阅来源</h2><p>控制抓取入口、数据格式及启用状态；内置与自定义来源统一管理。</p></div></div>
+  <div class="scope-intro"><span class="scope-icon" aria-hidden="true">⌁</span><div><strong>来源决定候选目录的边界</strong>停用来源会让相关节点立即退出路由但保留历史库存；下一次刷新按当前启用集合重建候选并重新检测。</div></div>
+  <div class="table-scroll" tabindex="0" aria-label="来源表格，可横向滚动">
+  <table class="management-table">
+  <caption class="sr-only">代理来源管理</caption>
+  <tr><th>名称</th><th>URL</th><th>格式</th><th>类型</th><th>启用</th><th>操作</th></tr>
+  {{range .Sources}}
+  <tr>
+    <td data-label="来源名称">{{.Name}}{{if .AllowPrivate}}<span class="private-source-badge" title="该来源已显式允许访问局域网或保留地址">允许私网</span>{{end}}{{if .AllowEmpty}}<span class="empty-source-badge" title="HTTP 200 空列表会被视为权威结果，并清空该来源的上一版候选">允许空清单</span>{{end}}{{if .Note}}<div class="note-inline">{{.Note}}</div>{{end}}</td>
+    <td data-label="订阅地址" class="mono small">{{.URL}}</td>
+    <td data-label="数据格式" class="small">{{.Format}}{{if .Protocol}} ({{.Protocol}}){{end}}</td>
+    <td data-label="来源类型" class="small">{{if .Builtin}}内置{{else}}自定义{{end}}</td>
+    <td data-label="启用状态">
+      <label class="switch">
+        <input type="checkbox" aria-label="切换来源 {{.Name}}" {{if .Enabled}}checked{{end}} onchange="postJSON('/api/sources/toggle',{id:'{{.ID}}',enabled:this.checked},reloadOrAlert)">
+        <span class="slider"></span>
+      </label>
+    </td>
+    <td data-label="操作"><button type="button" class="btn-sm danger" onclick="if(confirm('删除来源 {{.Name}}?'))postJSON('/api/sources/delete',{id:'{{.ID}}'},reloadOrAlert)">删除</button></td>
+  </tr>
+  {{end}}
+  </table>
+  </div>
+
+  <form class="inline" id="form-add-source">
+    <div class="form-title">添加自定义来源<span>支持纯文本、JSON 与 ProxyIP 专用目录</span></div>
+    <label class="sr-only" for="source-name">来源名称</label>
+    <input id="source-name" name="name" placeholder="名称" required>
+    <label class="sr-only" for="source-url">来源 URL</label>
+    <input id="source-url" name="url" type="url" placeholder="URL" required style="min-width:280px">
+    <label class="sr-only" for="source-format">来源格式</label>
+    <select id="source-format" name="format">{{range .Formats}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <label class="sr-only" for="source-protocol">来源协议</label>
+    <input id="source-protocol" name="protocol" placeholder="协议(仅纯文本/JSON数组格式需要,如 socks5)">
+    <details class="source-advanced">
+      <summary>高级抓取选项</summary>
+      <div class="source-advanced-options">
+        <label class="security-optin" for="source-allow-private"><input id="source-allow-private" name="allow_private" type="checkbox"><span><strong>允许访问私网 / 保留地址（高风险）</strong>仅当订阅服务由你控制并部署在可信局域网时开启。公网来源必须保持关闭，以阻止来源 URL 访问本机、内网和云元数据地址。</span></label>
+        <label class="security-optin destructive-optin" for="source-allow-empty"><input id="source-allow-empty" name="allow_empty" type="checkbox"><span><strong>允许“权威空列表”（可能清空该来源候选）</strong>默认关闭。开启后，HTTP 200 但没有任何有效节点会被视为来源确实为空，不再保留上一版可用候选。只对明确用空列表表达下线的可信来源开启。</span></label>
+      </div>
+    </details>
+    <button class="btn" type="submit">添加来源</button>
+  </form>
+  <p class="note">格式说明: text-regex = 文本中扫描 "scheme://ip:port"; edt-json = EDT-Pages 风格 JSON 数组; proxyip-json = Cloudflare ProxyIP 专用格式; plain-list = 每行一个 "ip:port"(需填协议); json-array = JSON 字符串数组,每项 "ip:port"(需填协议)。</p>
+</div>
+
+<div id="tab-rules" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-rules">
+  <div class="panel-heading"><div><span class="panel-kicker">Traffic Routing</span><h2>分流规则</h2><p>规则自上而下匹配；越具体的域名规则应越靠前。</p></div></div>
+  <div class="preset-bar">
+    <b style="color:#e2e8f0">一键 GFW 分流</b>
+    <span>国内域名/内网 直连(DIRECT),其余走代理(ANY);会覆盖当前规则。</span>
+    <button type="button" class="btn" onclick="if(confirm('用 GFW 分流预设覆盖当前所有规则?'))postJSON('/api/rules/preset-gfw',{},reloadOrAlert)">启用 GFW 分流</button>
+  </div>
+  <div class="table-scroll" tabindex="0" aria-label="规则表格，可横向滚动">
+  <table class="management-table">
+  <caption class="sr-only">分流规则管理</caption>
+  <tr><th>#</th><th>类型</th><th>值</th><th>目标分组</th><th>操作</th></tr>
+  {{range $i, $r := .Rules}}
+  <tr>
+    <td data-label="优先级">{{$i}}</td>
+    <td data-label="规则类型">{{$r.Type}}</td>
+    <td data-label="匹配值" class="mono">{{if eq $r.Type "MATCH"}}*{{else}}{{$r.Value}}{{end}}</td>
+    <td data-label="目标分组">{{$r.Group}}</td>
+    <td data-label="操作">
+      {{if ne $r.Type "MATCH"}}
+      <button type="button" class="btn-sm" aria-label="上移规则" onclick="postJSON('/api/rules/move',{id:'{{$r.ID}}',delta:-1},reloadOrAlert)">↑</button>
+      <button type="button" class="btn-sm" aria-label="下移规则" onclick="postJSON('/api/rules/move',{id:'{{$r.ID}}',delta:1},reloadOrAlert)">↓</button>
+      <button type="button" class="btn-sm danger" onclick="if(confirm('删除规则?'))postJSON('/api/rules/delete',{id:'{{$r.ID}}'},reloadOrAlert)">删除</button>
+      {{else}}
+      <span class="note-inline">兜底规则,不可删除/移动,可在下方修改默认分组</span>
+      {{end}}
+    </td>
+  </tr>
+  {{end}}
+  </table>
+  </div>
+
+  <form class="inline" id="form-add-rule">
+    <div class="form-title">添加分流规则<span>命中后将连接交给指定分组或国家节点</span></div>
+    <label class="sr-only" for="rule-type">规则类型</label>
+    <select id="rule-type" name="type">{{range .RuleTypes}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <label class="sr-only" for="rule-value">规则值</label>
+    <input id="rule-value" name="value" placeholder="值,如 netflix.com / 10.0.0.0/8 / cn / gfw">
+    <label class="sr-only" for="rule-target-select">目标分组</label>
+    <select name="group" id="rule-target-select">{{range .GroupOptions}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <button class="btn" type="submit">添加规则</button>
+  </form>
+  <p class="note">规则按从上到下的顺序匹配目标域名/IP,命中即用对应目标转发;DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD 匹配域名,IP-CIDR 匹配字面 IP 目标,GEOSITE 值填 <b>cn</b>(内置中国常用域名)或 <b>gfw</b>(内置常见被墙域名)。<b>目标可直接选国家</b>(列表里的 <span class="mono">COUNTRY:US</span> / <span class="mono">COUNTRY:JP</span> 等,表示"该国任意节点,自动挑最快的一个"),无需先建分组。例如:<span class="mono">DOMAIN-SUFFIX com → COUNTRY:US</span>,再把 <span class="mono">DOMAIN 111.com → COUNTRY:JP</span> 拖到它上面(越靠上越优先),就能实现"*.com 走美国、111.com 走日本"。若某国当前无可用节点,会自动回退到 ANY。最下面的 MATCH 是兜底规则,始终存在。</p>
+
+  <div class="default-group-editor">
+    <label for="default-group-select">默认(兜底)分组:</label>
+    <select id="default-group-select" data-default="{{.DefaultGroup}}">{{range .GroupOptions}}<option value="{{.}}" {{if eq . $.DefaultGroup}}selected{{end}}>{{.}}</option>{{end}}</select>
+    <button type="button" class="btn-sm" onclick="postJSON('/api/rules/default',{group:document.getElementById('default-group-select').value},reloadOrAlert)">保存</button>
+  </div>
+</div>
+
+<div id="tab-groups" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-groups">
+  <div class="panel-heading"><div><span class="panel-kicker">Routing Groups</span><h2>分组策略</h2><p>组合国家、协议、来源和固定节点，控制连接选择方式。</p></div></div>
+  <div class="scope-intro"><span class="scope-icon" aria-hidden="true">◇</span><div><strong>分组连接规则与可用节点</strong>规则指向分组，分组再按 sticky、延迟、速度、轮询或随机策略选择当前节点。</div></div>
+  <div class="table-scroll" tabindex="0" aria-label="分组表格，可横向滚动">
+  <table class="management-table">
+  <caption class="sr-only">代理分组管理</caption>
+  <tr><th>名称</th><th>类型</th><th>策略</th><th>过滤条件</th><th>成员数/当前</th><th>操作</th></tr>
+  {{range .Groups}}
+  {{if .ID}}
+  <tr>
+    <td data-label="分组名称">{{.Name}}</td>
+    <td data-label="类型" class="small">自定义</td>
+    <td data-label="选择策略">
+      <select aria-label="{{.Name}} 的策略" onchange="postJSON('/api/groups/strategy',{id:'{{.ID}}',strategy:this.value},reloadOrAlert)">
+        {{$cur := .Strategy}}
+        {{range $.Strategies}}<option value="{{.}}" {{if eq . $cur}}selected{{end}}>{{.}}</option>{{end}}
+      </select>
+    </td>
+    <td data-label="过滤条件" class="small">{{if .Nodes}}指定节点: {{range .Nodes}}{{.}} {{end}}<br>{{end}}{{if .Countries}}国家: {{range .Countries}}{{.}} {{end}}<br>{{end}}{{if .Protocols}}协议: {{range .Protocols}}{{.}} {{end}}<br>{{end}}{{if .Sources}}来源: {{range .Sources}}{{.}} {{end}}{{end}}</td>
+    <td data-label="成员 / 当前节点">{{.Count}} / {{if .Current}}{{.Current}}{{if .Dynamic}} (每连接轮换){{end}}{{else}}-{{end}}</td>
+    <td data-label="操作"><button type="button" class="btn-sm danger" onclick="if(confirm('删除分组 {{.Name}}? 若仍有规则引用，请先删除或改写对应规则。'))postJSON('/api/groups/delete',{id:'{{.ID}}'},reloadOrAlert)">删除</button></td>
+  </tr>
+  {{end}}
+  {{end}}
+  </table>
+  </div>
+
+  <form class="inline" id="form-add-group">
+    <div class="form-title">创建路由分组<span>筛选条件可组合；留空代表该维度不限制</span></div>
+    <label class="sr-only" for="group-name">分组名称</label>
+    <input id="group-name" name="name" placeholder="分组名称" required>
+    <label class="sr-only" for="group-strategy">分组策略</label>
+    <select id="group-strategy" name="strategy">{{range .Strategies}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    <label class="sr-only" for="group-nodes">指定节点</label>
+    <input id="group-nodes" name="nodes" placeholder="精确钉死用 protocol://ip:port；ip:port 匹配全部协议，逗号分隔">
+    <label class="sr-only" for="group-countries">国家筛选</label>
+    <input id="group-countries" name="countries" placeholder="国家代码,逗号分隔,如 US,JP (留空=不限)">
+    <label class="sr-only" for="group-protocols">协议筛选</label>
+    <input id="group-protocols" name="protocols" placeholder="协议,逗号分隔,如 socks5,http (留空=不限)">
+    <label class="sr-only" for="group-sources">来源筛选</label>
+    <input id="group-sources" name="sources" placeholder="来源名称,逗号分隔 (留空=不限)">
+    <button class="btn" type="submit">创建分组</button>
+  </form>
+  <p class="note">分组是从代理池里筛出的节点子集,配合分流规则使用。<b>要把某个域名精确固定走一个协议节点</b>:在"指定节点"里填 <code>protocol://ip:port</code>(例如 <code>socks5://1.2.3.4:1080</code>),建一个分组,再在分流规则里把该域名指向这个分组即可。裸 <code>ip:port</code> 是旧兼容写法,会匹配该地址的全部协议变体。筛选条件可组合(指定节点 / 国家 / 协议 / 来源)。策略: sticky=固定直到手动切换或失败, round-robin=每次新连接轮换, random=随机, latency=优先延迟最低, speed=优先测速结果最高(需先手动测速)。</p>
+</div>
+
+</div>
+</div>
+</main>
+</div>
+<div id="candidate-country-modal" class="country-picker-overlay" role="dialog" aria-modal="true" aria-labelledby="candidate-country-title" hidden onclick="candidateCountryBackdrop(event)">
+  <div class="country-picker">
+    <div class="country-picker-head">
+      <div class="modal-step"><span>步骤 2 / 3</span><h2 id="candidate-country-title">选择来源地区</h2></div>
+      <label class="sr-only" for="candidate-country-search">搜索国家代码</label>
+      <input id="candidate-country-search" placeholder="搜索国家代码或名称，如 JP / 日本" oninput="renderCandidateCountryPicker()" autocomplete="off">
+      <button type="button" class="country-picker-close" onclick="closeCandidateCountryPicker()" aria-label="关闭国家筛选">×</button>
+    </div>
+    <div class="country-picker-body">
+      <div class="country-map">
+        <div id="country-picker-map-title" class="country-map-title">先选择大洲</div>
+        <div id="candidate-continent-map" class="country-map-grid"></div>
+        <p id="country-picker-note" class="country-map-note">数量来自当前快照；选中地区后自动返回节点结果。</p>
+      </div>
+      <div class="country-list-pane">
+        <div class="country-list-toolbar">
+          <button id="country-picker-all" type="button" class="btn-sm" onclick="chooseCandidateCountry('')">全部地区</button>
+          <button type="button" class="btn-sm" onclick="chooseCandidateCountry('__unknown__')">国家未知</button>
+          <span id="candidate-country-result-count" class="small"></span>
+        </div>
+        <div id="candidate-country-list" class="country-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="result-overlay" class="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-dialog-title" hidden onclick="resultDialogBackdrop(event)">
+  <div class="result-dialog">
+    <div class="result-dialog-head"><h2 id="result-dialog-title">操作结果</h2><button type="button" class="result-dialog-close" onclick="closeResultDialog()" aria-label="关闭">×</button></div>
+    <div id="result-dialog-body" class="result-dialog-body"></div>
+    <div class="result-dialog-foot"><button type="button" class="btn" onclick="closeResultDialog()">知道了</button></div>
+  </div>
+</div>
+<script src="/assets/dashboard.js" defer></script>
+</body>
+</html>

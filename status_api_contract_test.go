@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAPIRoutesMethodsErrorsAndSecurityHeaders(t *testing.T) {
@@ -52,6 +54,12 @@ func TestAPIRoutesMethodsErrorsAndSecurityHeaders(t *testing.T) {
 	if exportMethod.Code != http.StatusMethodNotAllowed || exportMethod.Header().Get("Allow") != "GET, HEAD" {
 		t.Fatalf("POST export = %d Allow=%q", exportMethod.Code, exportMethod.Header().Get("Allow"))
 	}
+
+	legacyNodes := httptest.NewRecorder()
+	handler.ServeHTTP(legacyNodes, localTestRequest(http.MethodGet, "/api/nodes", nil))
+	if legacyNodes.Code != http.StatusOK || legacyNodes.Header().Get("Deprecation") != "true" || legacyNodes.Header().Get("Sunset") == "" || !strings.Contains(legacyNodes.Header().Get("Link"), "/api/nodes/page") {
+		t.Fatalf("legacy /api/nodes migration headers = %d %v", legacyNodes.Code, legacyNodes.Header())
+	}
 }
 
 func TestGzipNegotiationHonorsExactCodingAndQuality(t *testing.T) {
@@ -91,6 +99,38 @@ func TestManagementJSONRejectsUnknownFields(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "unknown field") {
 		t.Fatalf("unknown management JSON field = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	groupRequest := localTestRequest(http.MethodPost, "/api/groups", strings.NewReader(`{
+		"name":"mistyped-filter",
+		"strategy":"sticky",
+		"countriez":["JP"]
+	}`))
+	groupRequest.Header.Set("Content-Type", "application/json")
+	groupRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(groupRecorder, groupRequest)
+	if groupRecorder.Code != http.StatusBadRequest || !strings.Contains(groupRecorder.Body.String(), "unknown group field") {
+		t.Fatalf("unknown group field = %d %s", groupRecorder.Code, groupRecorder.Body.String())
+	}
+}
+
+func TestConfigPersistenceFailureIsAnInternalAPIError(t *testing.T) {
+	store := &ConfigStore{
+		path: "/proc/socks5-pool-test/pool_config.json",
+		cfg:  defaultPoolConfig(),
+	}
+	handler := NewStatusServer(NewProxyPool(), store).handler()
+	request := localTestRequest(http.MethodPost, "/api/sources", strings.NewReader(`{
+		"name":"persistence failure test",
+		"url":"https://example.com/persistence-test.txt",
+		"format":"plain-list",
+		"protocol":"socks5"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), `"code":"config_persistence_failed"`) {
+		t.Fatalf("config persistence API failure = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -171,12 +211,58 @@ func TestCandidatePaginationSnapshotMetadata(t *testing.T) {
 	}
 }
 
+func TestCompactStatusUsesRetainedCandidateSnapshotMetadata(t *testing.T) {
+	pool := NewProxyPool()
+	labels := map[string]string{"source-a": "Source A", "source-b": "Source B"}
+	oldA := candidateFromSource("192.0.2.31", "source-a", "Source A")
+	oldB := candidateFromSource("192.0.2.32", "source-b", "Source B")
+	first := pool.candidates.begin([]Proxy{oldA, oldB}, labels, nil, 0)
+	pool.candidates.complete(first, nil, nil, nil)
+	partial := pool.candidates.begin([]Proxy{oldB}, labels, map[string]bool{"source-a": true}, 1)
+	pool.candidates.complete(partial, nil, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	NewStatusServer(pool, &ConfigStore{}).handler().ServeHTTP(recorder, localTestRequest(http.MethodGet, "/api/status?compact=1", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("compact status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body compactStatusSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.CandidateTotal != 2 || body.CandidatePhase != "partial" || body.CandidateSourceErrors != 1 || body.CandidateUpdatedAt == "" {
+		t.Fatalf("compact candidate metadata = %#v", body)
+	}
+}
+
+func TestStatusAddsRFC3339UTCTimestampsWithoutRemovingLegacyFields(t *testing.T) {
+	scrapeMu.Lock()
+	previousLast, previousNext := lastScrapeTime, nextScrapeTime
+	lastScrapeTime = time.Date(2026, time.July, 12, 5, 1, 2, 0, time.UTC)
+	nextScrapeTime = time.Date(2026, time.July, 12, 5, 21, 2, 0, time.UTC)
+	scrapeMu.Unlock()
+	t.Cleanup(func() {
+		scrapeMu.Lock()
+		lastScrapeTime, nextScrapeTime = previousLast, previousNext
+		scrapeMu.Unlock()
+	})
+
+	summary := NewStatusServer(NewProxyPool(), &ConfigStore{}).buildSummary()
+	if summary.LastScrape == "" || summary.NextScrape == "" {
+		t.Fatalf("legacy scrape fields were removed: %#v", summary)
+	}
+	if summary.LastScrapeAt != "2026-07-12T05:01:02Z" || summary.NextScrapeAt != "2026-07-12T05:21:02Z" {
+		t.Fatalf("RFC3339 scrape fields = %q %q", summary.LastScrapeAt, summary.NextScrapeAt)
+	}
+}
+
 func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 	pool := NewProxyPool()
 	pool.Prime([]Proxy{
 		{IP: "192.0.2.10", Port: "1080", Protocol: "socks5", Username: "user", Password: "pass", Country: "JP", Available: true, LatencyMs: 20},
 		{IP: "192.0.2.11", Port: "8080", Protocol: "http", Country: "US", Available: true, LatencyMs: 50},
 		{IP: "192.0.2.12", Port: "1080", Protocol: "socks5", Country: "JP", Available: false},
+		{IP: "192.0.2.13", Port: "1080", Protocol: "socks5", Country: "JP", Available: true, HealthInvalidated: true},
 	}, nil)
 	handler := NewStatusServer(pool, &ConfigStore{}).handler()
 
@@ -210,7 +296,7 @@ func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stablePage.SnapshotID != page.SnapshotID || len(stablePage.Proxies) != 1 || stablePage.Proxies[0].Key != page.Proxies[0].Key {
-		t.Fatalf("reliability-only mutation destabilized v1 page: before=%#v after=%#v", page, stablePage)
+		t.Fatalf("hidden score mutation destabilized key-sorted v1 pagination: before=%#v after=%#v", page, stablePage)
 	}
 	if !pool.UpdateSpeed("socks5://192.0.2.10:1080", 1234, 3_000_000, 1000) {
 		t.Fatal("failed to update v1 speed fixture")
@@ -221,8 +307,8 @@ func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 	if err := json.Unmarshal(changedRecorder.Body.Bytes(), &changedPage); err != nil {
 		t.Fatal(err)
 	}
-	if changedPage.SnapshotID == page.SnapshotID {
-		t.Fatalf("output-field speed mutation reused v1 snapshot token %q", page.SnapshotID)
+	if changedPage.SnapshotID == stablePage.SnapshotID {
+		t.Fatalf("output-field speed mutation reused v1 snapshot token %q", stablePage.SnapshotID)
 	}
 
 	pickRecorder := httptest.NewRecorder()
@@ -245,6 +331,44 @@ func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 	handler.ServeHTTP(invalid, localTestRequest(http.MethodGet, "/api/v1/proxies?protocol=proxyip", nil))
 	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), `"code":"invalid_protocol"`) {
 		t.Fatalf("invalid v1 protocol = %d %s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestV1PickSnapshotTracksHiddenScore(t *testing.T) {
+	pool := NewProxyPool()
+	first := Proxy{IP: "192.0.2.30", Port: "1080", Protocol: "socks5", Country: "JP", Available: true, LatencyMs: 20}
+	second := Proxy{IP: "192.0.2.31", Port: "1080", Protocol: "socks5", Country: "JP", Available: true, LatencyMs: 20}
+	pool.Prime([]Proxy{first, second}, nil)
+	handler := NewStatusServer(pool, &ConfigStore{}).handler()
+
+	initialRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(initialRecorder, localTestRequest(http.MethodGet, "/api/v1/proxies/pick?country=JP", nil))
+	if initialRecorder.Code != http.StatusOK {
+		t.Fatalf("initial pick = %d %s", initialRecorder.Code, initialRecorder.Body.String())
+	}
+	var initial V1ProxyPickResponse
+	if err := json.Unmarshal(initialRecorder.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	if initial.Proxy.Key != first.Key() {
+		t.Fatalf("equal-score initial pick = %q, want key-stable %q", initial.Proxy.Key, first.Key())
+	}
+
+	pool.RecordResult(second.Key(), true, 1)
+	staleRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(staleRecorder, localTestRequest(http.MethodGet, "/api/v1/proxies/pick?country=JP&snapshot_id="+initial.SnapshotID, nil))
+	if staleRecorder.Code != http.StatusConflict || !strings.Contains(staleRecorder.Body.String(), `"code":"snapshot_changed"`) {
+		t.Fatalf("score-stale pick = %d %s", staleRecorder.Code, staleRecorder.Body.String())
+	}
+
+	currentRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(currentRecorder, localTestRequest(http.MethodGet, "/api/v1/proxies/pick?country=JP", nil))
+	var current V1ProxyPickResponse
+	if err := json.Unmarshal(currentRecorder.Body.Bytes(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if currentRecorder.Code != http.StatusOK || current.SnapshotID == initial.SnapshotID || current.Proxy.Key != second.Key() {
+		t.Fatalf("score-aware current pick = %d %#v, initial=%#v", currentRecorder.Code, current, initial)
 	}
 }
 
@@ -332,14 +456,14 @@ func TestStateChangingAPIsRejectCrossSiteBrowsersButAllowCompatibleClients(t *te
 	}
 }
 
-func TestUnauthenticatedManagementRequiresLoopbackHost(t *testing.T) {
+func TestUnauthenticatedManagementRequiresLoopbackHostAndRemote(t *testing.T) {
 	handler := NewStatusServer(NewProxyPool(), &ConfigStore{}).handler()
 	for _, host := range []string{"attacker.test", "172.17.0.2:8080"} {
 		request := localTestRequest(http.MethodGet, "/api/status", nil)
 		request.Host = host
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, request)
-		if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), `"code":"untrusted_host"`) {
+		if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), `"code":"untrusted_client"`) {
 			t.Errorf("unauthenticated Host %q = %d %s", host, recorder.Code, recorder.Body.String())
 		}
 	}
@@ -353,9 +477,44 @@ func TestUnauthenticatedManagementRequiresLoopbackHost(t *testing.T) {
 		}
 	}
 
+	for _, remoteAddr := range []string{"203.0.113.9:54321", "[2001:db8::9]:54321", "not-an-address"} {
+		request := localTestRequest(http.MethodGet, "/api/status?compact=1", nil)
+		request.RemoteAddr = remoteAddr
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), `"code":"untrusted_client"`) {
+			t.Errorf("unauthenticated RemoteAddr %q = %d %s", remoteAddr, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	trustedServer := NewStatusServer(NewProxyPool(), &ConfigStore{})
+	if err := trustedServer.SetTrustedManagementProxies([]string{"172.18.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	trustedRequest := localTestRequest(http.MethodGet, "/api/status?compact=1", nil)
+	trustedRequest.RemoteAddr = "172.18.0.1:43210"
+	trustedRecorder := httptest.NewRecorder()
+	trustedServer.handler().ServeHTTP(trustedRecorder, trustedRequest)
+	if trustedRecorder.Code != http.StatusOK {
+		t.Fatalf("exact trusted management proxy = %d %s", trustedRecorder.Code, trustedRecorder.Body.String())
+	}
+	untrustedRequest := localTestRequest(http.MethodGet, "/api/status?compact=1", nil)
+	untrustedRequest.RemoteAddr = "172.18.0.2:43210"
+	untrustedRecorder := httptest.NewRecorder()
+	trustedServer.handler().ServeHTTP(untrustedRecorder, untrustedRequest)
+	if untrustedRecorder.Code != http.StatusForbidden {
+		t.Fatalf("neighbor of trusted management proxy = %d %s", untrustedRecorder.Code, untrustedRecorder.Body.String())
+	}
+	for _, invalid := range []string{"172.18.0.0/16", "proxy.internal", "172.18.0.1:8080"} {
+		if err := trustedServer.SetTrustedManagementProxies([]string{invalid}); err == nil {
+			t.Errorf("trusted management proxy %q unexpectedly accepted", invalid)
+		}
+	}
+
 	authenticated := NewStatusServerWithAdminCredentials(NewProxyPool(), &ConfigStore{}, "admin", "secret").handler()
 	request := localTestRequest(http.MethodGet, "/api/status?compact=1", nil)
 	request.Host = "admin.example"
+	request.RemoteAddr = "203.0.113.20:54321"
 	request.SetBasicAuth("admin", "secret")
 	recorder := httptest.NewRecorder()
 	authenticated.ServeHTTP(recorder, request)
@@ -373,20 +532,293 @@ func resetRefreshOperationsForTest(t *testing.T) {
 		refreshPending = nil
 		refreshLast = nil
 		refreshOpMu.Unlock()
+		healthRecheckOpMu.Lock()
+		healthRecheckOpSeq = 0
+		healthRecheckActive = nil
+		healthRecheckPending = nil
+		healthRecheckLast = nil
+		healthRecheckOpMu.Unlock()
 		for {
+			drained := false
 			select {
 			case <-refreshChan:
+				drained = true
 			default:
-				for {
-					select {
-					case <-recheckChan:
-					default:
-						return
-					}
-				}
+			}
+			select {
+			case <-recheckChan:
+				drained = true
+			default:
+			}
+			select {
+			case <-fullRecheckChan:
+				drained = true
+			default:
+			}
+			if !drained {
+				return
 			}
 		}
 	}
 	reset()
 	t.Cleanup(reset)
+}
+
+func TestCheckURLChangeInvalidatesHealthAndQueuesOnlyFullRecheck(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{{
+		IP: "198.51.100.10", Port: "1080", Protocol: "socks5", Available: true,
+	}}, nil)
+	handler := NewStatusServer(pool, store).handler()
+
+	request := localTestRequest(http.MethodPost, "/api/settings/check-url", strings.NewReader(`{"url":"https://example.com/health"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST check URL = %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Status           string `json:"status"`
+		URL              string `json:"url"`
+		InvalidatedTotal int    `json:"invalidated_total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "ok" || response.URL != "https://example.com/health" || response.InvalidatedTotal != 1 {
+		t.Fatalf("check URL response = %#v", response)
+	}
+	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available {
+		t.Fatalf("pool after check URL change = %#v", nodes)
+	}
+	select {
+	case <-fullRecheckChan:
+	default:
+		t.Fatal("check URL change did not queue a full recheck")
+	}
+	select {
+	case <-refreshChan:
+		t.Fatal("check URL change unexpectedly queued a source refresh")
+	default:
+	}
+	select {
+	case <-recheckChan:
+		t.Fatal("check URL change unexpectedly queued the legacy incremental recheck")
+	default:
+	}
+}
+
+func TestSavingIdenticalCheckURLIsNoOp(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	px := testProxy("http", "198.51.100.11", "8080", true)
+	pool.Prime([]Proxy{px}, nil)
+	handler := NewStatusServer(pool, store).handler()
+
+	request := localTestRequest(http.MethodPost, "/api/settings/check-url", strings.NewReader(fmt.Sprintf(`{"url":%q}`, store.CheckURL())))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"changed":false`) {
+		t.Fatalf("identical check URL = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if got, _ := pool.Find(px.Key()); !got.Available || pool.HealthGeneration() != 0 {
+		t.Fatalf("identical URL invalidated node: %+v generation=%d", got, pool.HealthGeneration())
+	}
+	select {
+	case <-fullRecheckChan:
+		t.Fatal("identical URL queued full recheck")
+	default:
+	}
+}
+
+func TestClearUnavailableBlockedWhileCriterionRecheckPending(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	px := testProxy("http", "198.51.100.12", "8080", true)
+	pool.Prime([]Proxy{px}, nil)
+	generation := pool.HealthGeneration()
+	pool.InvalidateHealth("https://example.com/new-health")
+	handler := NewStatusServer(pool, store).handler()
+
+	blocked := httptest.NewRecorder()
+	handler.ServeHTTP(blocked, localTestRequest(http.MethodPost, "/api/nodes/clear-unavailable", strings.NewReader(`{}`)))
+	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), `"code":"health_recheck_in_progress"`) {
+		t.Fatalf("clear during recheck = %d %s", blocked.Code, blocked.Body.String())
+	}
+	if pool.Size() != 1 {
+		t.Fatal("blocked clear removed retained node")
+	}
+	if pool.CompleteHealthRecheck(generation) {
+		t.Fatal("stale generation cleared recheck guard")
+	}
+	if !pool.CompleteHealthRecheck(pool.HealthGeneration()) {
+		t.Fatal("current generation did not clear recheck guard")
+	}
+	cleared := httptest.NewRecorder()
+	handler.ServeHTTP(cleared, localTestRequest(http.MethodPost, "/api/nodes/clear-unavailable", strings.NewReader(`{}`)))
+	if cleared.Code != http.StatusOK || pool.Size() != 0 {
+		t.Fatalf("clear after recheck = %d %s size=%d", cleared.Code, cleared.Body.String(), pool.Size())
+	}
+}
+
+func TestHealthRecheckOperationReportsProgress(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	pool := NewProxyPool()
+	pool.SetHealthCriterion(defaultCheckURL)
+	operation, accepted := TriggerFullRecheck(pool)
+	if !accepted || operation.Status != "queued" {
+		t.Fatalf("queued operation = %#v accepted=%v", operation, accepted)
+	}
+	running := beginHealthRecheckOperation(pool, 3)
+	recordHealthRecheckOutcome(running.ID, true, false)
+	recordHealthRecheckOutcome(running.ID, true, true)
+	recordHealthRecheckOutcome(running.ID, false, false)
+	state := getHealthRecheckOperationStatus()
+	if state.State != "running" || state.Active == nil || state.Active.Completed != 3 || state.Active.Reachable != 2 || state.Active.Failed != 1 || state.Active.PolicyFiltered != 1 {
+		t.Fatalf("running recheck status = %#v", state)
+	}
+	finishHealthRecheckOperation(running.ID, true)
+	state = getHealthRecheckOperationStatus()
+	if state.State != "idle" || state.Last == nil || state.Last.Status != "complete" || state.Last.ID != operation.ID {
+		t.Fatalf("completed recheck status = %#v", state)
+	}
+}
+
+func TestSourceToggleImmediatelyRetiresItsOnlyRoutingNodeAndQueuesRefresh(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source Source
+	for _, candidate := range store.Sources() {
+		if candidate.Enabled {
+			source = candidate
+			break
+		}
+	}
+	if source.ID == "" {
+		t.Fatal("default config has no enabled source")
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{{
+		IP: "198.51.100.20", Port: "8080", Protocol: "http", Available: true,
+		SourceIDs: []string{source.ID}, SourceNames: []string{source.Name},
+	}}, nil)
+	handler := NewStatusServer(pool, store).handler()
+
+	request := localTestRequest(http.MethodPost, "/api/sources/toggle", strings.NewReader(fmt.Sprintf(`{"id":%q,"enabled":false}`, source.ID)))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"retired_total":1`) {
+		t.Fatalf("toggle source = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available || !nodes[0].SourceRetired {
+		t.Fatalf("pool after source toggle = %#v", nodes)
+	}
+	// A refresh that captured the source before the toggle must not revive it
+	// when its stale successful health result arrives afterwards.
+	stale := pool.All()[0]
+	stale.Available = true
+	stale.SourceRetired = false
+	if !applyRefreshHealthResults(pool, store, []Proxy{stale}, nil, nil, pool.HealthGeneration()) {
+		t.Fatal("stale refresh result was rejected for an unrelated generation")
+	}
+	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available || !nodes[0].SourceRetired {
+		t.Fatalf("stale refresh revived disabled source node: %#v", nodes)
+	}
+	if got, ok, direct := pool.Pick(GroupAny, nil); ok || direct {
+		t.Fatalf("disabled source remained routable: %+v, ok=%v direct=%v", got, ok, direct)
+	}
+	select {
+	case <-refreshChan:
+	default:
+		t.Fatal("source toggle did not queue a refresh")
+	}
+}
+
+func TestNodeSwitchRejectsUnavailableWithoutLeavingFalsePin(t *testing.T) {
+	pool := NewProxyPool()
+	unavailable := Proxy{IP: "198.51.100.21", Port: "1080", Protocol: "socks5", Available: false}
+	healthy := Proxy{IP: "198.51.100.22", Port: "1080", Protocol: "socks5", Available: true}
+	pool.Prime([]Proxy{unavailable, healthy}, nil)
+	handler := NewStatusServer(pool, &ConfigStore{}).handler()
+
+	request := localTestRequest(http.MethodPost, "/api/nodes/switch", strings.NewReader(fmt.Sprintf(`{"key":%q}`, unavailable.Key())))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("switch unavailable status = %d body=%s, want 409", recorder.Code, recorder.Body.String())
+	}
+	var response apiErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode unavailable switch response: %v", err)
+	}
+	if response.Code != "node_unavailable" || response.Error == "" {
+		t.Fatalf("unavailable switch error = %#v", response)
+	}
+	if pool.IsPinned(GroupAny) {
+		t.Fatal("409 unavailable switch left ANY falsely pinned")
+	}
+
+	request = localTestRequest(http.MethodPost, "/api/nodes/switch", strings.NewReader(fmt.Sprintf(`{"key":%q}`, healthy.Key())))
+	request.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"pinned":"true"`) || !pool.IsPinned(GroupAny) {
+		t.Fatalf("switch healthy = %d body=%s pinned=%v", recorder.Code, recorder.Body.String(), pool.IsPinned(GroupAny))
+	}
+}
+
+func TestSourceDeleteImmediatelyRetiresItsOnlyRoutingNodeAndQueuesRefresh(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.AddSource(Source{
+		Name: "test delete source", URL: "https://example.com/test-proxies.txt",
+		Format: FormatPlainList, Protocol: "socks5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{{
+		IP: "198.51.100.30", Port: "1080", Protocol: "socks5", Available: true,
+		SourceIDs: []string{source.ID}, SourceNames: []string{source.Name},
+	}}, nil)
+	handler := NewStatusServer(pool, store).handler()
+
+	request := localTestRequest(http.MethodPost, "/api/sources/delete", strings.NewReader(fmt.Sprintf(`{"id":%q}`, source.ID)))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"retired_total":1`) {
+		t.Fatalf("delete source = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available || !nodes[0].SourceRetired {
+		t.Fatalf("pool after source delete = %#v", nodes)
+	}
+	select {
+	case <-refreshChan:
+	default:
+		t.Fatal("source delete did not queue a refresh")
+	}
 }

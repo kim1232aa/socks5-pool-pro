@@ -98,6 +98,80 @@ type CandidateCatalog struct {
 	persistMu      sync.Mutex
 }
 
+// ResetHealthOutcomes invalidates criterion-dependent candidate annotations
+// while retaining the full source inventory. Candidate cache format v1 did not
+// persist the CheckURL, so cached checked_failed/policy_filtered labels cannot
+// be trusted after a restart; the same reset is used immediately when an
+// operator changes the URL. Live pool membership is still overlaid at read
+// time, and later checks repopulate these annotations under the new standard.
+func (c *CandidateCatalog) ResetHealthOutcomes() int {
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return 0
+	}
+	snapshot.mu.Lock()
+	changed := 0
+	for i := range snapshot.records {
+		record := &snapshot.records[i]
+		if snapshot.protocols[record.protocolID] == "proxyip" {
+			continue
+		}
+		if record.status != candidateDeferred || record.checkedUnix != 0 {
+			record.status = candidateDeferred
+			record.checkedUnix = 0
+			changed++
+		}
+	}
+	if changed > 0 || snapshot.phase != "restored" {
+		snapshot.phase = "restored"
+		snapshot.completedAt = time.Time{}
+		snapshot.revision++
+	}
+	snapshot.mu.Unlock()
+	return changed
+}
+
+// ApplyHealthOutcomes keeps the candidate view consistent with periodic and
+// exhaustive retained-pool rechecks. It deliberately does not alter source
+// inventory or phase; those belong to the scrape lifecycle. Results are
+// process-local (startup resets criterion-dependent cache annotations), so a
+// five-minute recheck does not recompress the entire large catalog on disk.
+func (c *CandidateCatalog) ApplyHealthOutcomes(checked []Proxy, reachable, policyFiltered map[string]bool) int {
+	snapshot := c.snapshot.Load()
+	if snapshot == nil || len(checked) == 0 {
+		return 0
+	}
+	checkedAt := time.Now().Unix()
+	snapshot.mu.Lock()
+	changed := 0
+	for _, px := range checked {
+		if px.Protocol == "proxyip" {
+			continue
+		}
+		index := snapshot.find(px.Protocol, px.Addr())
+		if index < 0 {
+			continue
+		}
+		record := &snapshot.records[index]
+		status := candidateCheckedFailed
+		if policyFiltered[px.Key()] {
+			status = candidatePolicyFiltered
+		} else if reachable[px.Key()] {
+			status = candidateDeferred
+		}
+		if record.status != status || record.checkedUnix != checkedAt {
+			record.status = status
+			record.checkedUnix = checkedAt
+			changed++
+		}
+	}
+	if changed > 0 {
+		snapshot.revision++
+	}
+	snapshot.mu.Unlock()
+	return changed
+}
+
 func (c *CandidateCatalog) protocolTotal(protocol string) (int, bool) {
 	snapshot := c.snapshot.Load()
 	if snapshot == nil {
@@ -312,6 +386,15 @@ func buildCandidateSnapshot(candidates []Proxy, sourceLabels map[string]string) 
 	for _, px := range candidates {
 		addr := px.Addr()
 		protocolID := internProtocol(px.Protocol)
+		hasAuth := px.Username != "" || px.Password != ""
+		if !hasAuth {
+			for _, credential := range px.CredentialAlternates {
+				if credential.Username != "" || credential.Password != "" {
+					hasAuth = true
+					break
+				}
+			}
+		}
 		record := candidateRecord{
 			addr:       addr,
 			protocolID: protocolID,
@@ -319,7 +402,7 @@ func buildCandidateSnapshot(candidates []Proxy, sourceLabels map[string]string) 
 			cityID:     internCity(px.City),
 			continent:  encodeContinent(px.Continent),
 			status:     candidateDeferred,
-			hasAuth:    px.Username != "" || px.Password != "",
+			hasAuth:    hasAuth,
 		}
 		if px.Protocol == "proxyip" {
 			record.status = candidateResource

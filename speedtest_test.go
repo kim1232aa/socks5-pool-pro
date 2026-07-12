@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -99,6 +100,36 @@ func TestSpeedTestFallsBackToCompleteHetznerRange(t *testing.T) {
 	}
 	if primaryCalls.Load() != 1 || fallbackCalls.Load() != 1 || !rangeMatched.Load() {
 		t.Fatalf("calls primary/fallback=%d/%d rangeMatched=%v", primaryCalls.Load(), fallbackCalls.Load(), rangeMatched.Load())
+	}
+}
+
+func TestSpeedTestRetriesAuthenticationCandidatesAndReturnsWorkingCredential(t *testing.T) {
+	payload := strings.Repeat("x", speedTestMaxBytes)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+		_, _ = io.WriteString(w, payload)
+	}))
+	t.Cleanup(target.Close)
+	restoreSpeedTestURL(t, target.URL)
+
+	proxy, connectAttempts := newSpeedTestConnectProxyWithAuth(t, "working", "secret")
+	proxy.Username, proxy.Password = "old", "wrong"
+	proxy.CredentialAlternates = []ProxyCredential{{Username: "working", Password: "secret"}}
+	result, verified, err := speedTestCredentialCandidatesContext(context.Background(), proxy, 5*time.Second)
+	if err != nil {
+		t.Fatalf("SpeedTest credential retry error = %v", err)
+	}
+	if result.Bytes != speedTestMaxBytes {
+		t.Fatalf("SpeedTest credential retry bytes = %d", result.Bytes)
+	}
+	if got := connectAttempts.Load(); got != 2 {
+		t.Fatalf("authenticated CONNECT attempts = %d, want rejected primary + successful alternate", got)
+	}
+	if verified.Username != "working" || verified.Password != "secret" {
+		t.Fatalf("SpeedTest verified credential = %q/%q", verified.Username, verified.Password)
+	}
+	if len(verified.CredentialAlternates) != 1 || verified.CredentialAlternates[0].Username != "old" {
+		t.Fatalf("SpeedTest promoted alternatives = %#v", verified.CredentialAlternates)
 	}
 }
 
@@ -339,10 +370,26 @@ func restoreSpeedTestURLs(t *testing.T, primaryURL, fallbackURL string) {
 // newSpeedTestConnectProxy returns a local HTTP CONNECT relay. It exercises
 // the production dialHTTPConnect path while keeping every byte on localhost.
 func newSpeedTestConnectProxy(t *testing.T) Proxy {
+	proxy, _ := newSpeedTestConnectProxyWithAuth(t, "", "")
+	return proxy
+}
+
+func newSpeedTestConnectProxyWithAuth(t *testing.T, username, password string) (Proxy, *atomic.Int64) {
 	t.Helper()
+	var attempts atomic.Int64
+	expectedAuthorization := ""
+	if username != "" {
+		expectedAuthorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
 		if r.Method != http.MethodConnect {
 			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		if expectedAuthorization != "" && r.Header.Get("Proxy-Authorization") != expectedAuthorization {
+			w.Header().Set("Proxy-Authenticate", `Basic realm="speed-test"`)
+			http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 			return
 		}
 
@@ -390,5 +437,5 @@ func newSpeedTestConnectProxy(t *testing.T) Proxy {
 	if err != nil {
 		t.Fatalf("split proxy address: %v", err)
 	}
-	return Proxy{IP: host, Port: port, Protocol: "http"}
+	return Proxy{IP: host, Port: port, Protocol: "http"}, &attempts
 }

@@ -98,6 +98,37 @@ func TestStatusServerLimitsSpeedTestsToFourGlobalSlots(t *testing.T) {
 	}
 }
 
+func TestStatusSpeedTestPromotesWorkingCredentialCandidate(t *testing.T) {
+	payload := bytes.Repeat([]byte{'x'}, speedTestMaxBytes)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(target.Close)
+	restoreSpeedTestURL(t, target.URL)
+
+	proxy, _ := newSpeedTestConnectProxyWithAuth(t, "working", "secret")
+	proxy.Username, proxy.Password = "old", "wrong"
+	proxy.CredentialAlternates = []ProxyCredential{{Username: "working", Password: "secret"}}
+	proxy.Available = true
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{proxy}, nil)
+	server := NewStatusServer(pool, &ConfigStore{})
+	recorder := httptest.NewRecorder()
+	request := localTestRequest(http.MethodPost, "/api/nodes/speedtest", bytes.NewBufferString(`{"key":"`+proxy.Key()+`"}`))
+	server.handleNodeSpeedtest(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("credential speedtest handler = %d %s", recorder.Code, recorder.Body.String())
+	}
+	got, ok := pool.Find(proxy.Key())
+	if !ok || got.Username != "working" || got.Password != "secret" || got.SpeedBytes != speedTestMaxBytes {
+		t.Fatalf("pool after credential speedtest = %+v found=%v", got, ok)
+	}
+	if len(got.CredentialAlternates) != 1 || got.CredentialAlternates[0].Username != "old" {
+		t.Fatalf("pool alternatives after credential speedtest = %#v", got.CredentialAlternates)
+	}
+}
+
 func TestStatusSpeedTestCancellationReleasesSlotWithoutFallback(t *testing.T) {
 	started := make(chan struct{})
 	primary := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {

@@ -22,7 +22,92 @@ type manualVerifyResponse struct {
 	Country             string `json:"country"`
 	LabelMatchKnown     bool   `json:"label_match_known"`
 	LabelMatched        bool   `json:"label_matched"`
+	Code                string `json:"code"`
 	Error               string `json:"error"`
+	PolicyExcluded      bool   `json:"policy_excluded"`
+}
+
+func TestManualNodeVerifyHonorsRequireIPChangePolicy(t *testing.T) {
+	px := Proxy{IP: "192.0.2.69", Port: "1080", Protocol: "socks5", Available: false}
+	pool := NewProxyPool()
+	pool.SetRequireIPChangePolicy(true)
+	pool.Prime([]Proxy{px}, nil)
+	server := NewStatusServer(pool, &ConfigStore{cfg: PoolConfig{CheckURL: "http://health.test/check"}})
+	server.nodeVerifyOps = manualNodeVerifyOperations{
+		checkURL: func(context.Context, Proxy, string, time.Duration) (bool, time.Duration) {
+			return true, 10 * time.Millisecond
+		},
+		probeExitIP: func(context.Context, Proxy, time.Duration) string { return "203.0.113.69" },
+		lookupGeo:   func(context.Context, string, time.Duration) (string, string, string) { return "US", "", "NA" },
+	}
+	baselineExitMu.Lock()
+	previous := baselineExitIP
+	baselineExitIP = "203.0.113.69"
+	baselineExitMu.Unlock()
+	t.Cleanup(func() {
+		baselineExitMu.Lock()
+		baselineExitIP = previous
+		baselineExitMu.Unlock()
+	})
+
+	recorder := httptest.NewRecorder()
+	server.handleNodeVerify(recorder, httptest.NewRequest(http.MethodPost, "/api/nodes/verify", bytes.NewBufferString(`{"key":"`+px.Key()+`"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("manual policy verify = %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response manualVerifyResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Reachable || response.Available || !response.PolicyExcluded {
+		t.Fatalf("manual policy response = %#v", response)
+	}
+	if selected, ok, _ := pool.Pick(GroupAny, nil); ok {
+		t.Fatalf("manual verification revived transparent node: %+v", selected)
+	}
+}
+
+func TestManualNodeVerifyPromotesWorkingCredentialCandidate(t *testing.T) {
+	px := Proxy{
+		IP: "192.0.2.68", Port: "1080", Protocol: "socks5", Available: false,
+		Username: "old", Password: "wrong",
+		CredentialAlternates: []ProxyCredential{{Username: "working", Password: "secret"}},
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{px}, nil)
+	server := NewStatusServer(pool, &ConfigStore{cfg: PoolConfig{CheckURL: "http://health.test/check"}})
+	var probeCredential ProxyCredential
+	server.nodeVerifyOps = manualNodeVerifyOperations{
+		checkURLCredentials: func(_ context.Context, got Proxy, target string, _ time.Duration) (Proxy, bool, time.Duration, error) {
+			if target != "http://health.test/check" || got.Username != "old" {
+				t.Fatalf("manual credential check input = %+v target=%q", got, target)
+			}
+			working := got
+			working.Username, working.Password = "working", "secret"
+			return got.promoteCredential(working), true, 7 * time.Millisecond, nil
+		},
+		probeExitIP: func(_ context.Context, got Proxy, _ time.Duration) string {
+			probeCredential = ProxyCredential{Username: got.Username, Password: got.Password}
+			return ""
+		},
+		lookupGeo: func(context.Context, string, time.Duration) (string, string, string) { return "", "", "" },
+	}
+
+	recorder := httptest.NewRecorder()
+	server.handleNodeVerify(recorder, httptest.NewRequest(http.MethodPost, "/api/nodes/verify", bytes.NewBufferString(`{"key":"`+px.Key()+`"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("manual credential verify = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if probeCredential != (ProxyCredential{Username: "working", Password: "secret"}) {
+		t.Fatalf("exit probe credential = %+v", probeCredential)
+	}
+	got, ok := pool.Find(px.Key())
+	if !ok || got.Username != "working" || got.Password != "secret" || !got.Available {
+		t.Fatalf("pool credential after manual verify = %+v, found=%v", got, ok)
+	}
+	if len(got.CredentialAlternates) != 1 || got.CredentialAlternates[0].Username != "old" {
+		t.Fatalf("pool alternate credentials after promotion = %#v", got.CredentialAlternates)
+	}
 }
 
 func TestManualNodeVerifyRejectsDuplicateAndOverCapacityWork(t *testing.T) {
@@ -308,6 +393,66 @@ func TestManualNodeVerifyCancellationDuringRetryBackoffStopsNextAttempt(t *testi
 	}
 	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 0 {
 		t.Fatalf("backoff cancellation recorded observation %d/%d", successes, failures)
+	}
+}
+
+func TestManualNodeVerifyRejectsResultFromPreviousHealthCriterion(t *testing.T) {
+	px := Proxy{IP: "192.0.2.76", Port: "1080", Protocol: "socks5", Available: true, LatencyMs: 222}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{px}, nil)
+	server := NewStatusServer(pool, &ConfigStore{cfg: PoolConfig{CheckURL: "http://health.test/old"}})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server.nodeVerifyOps = manualNodeVerifyOperations{
+		checkURL: func(ctx context.Context, _ Proxy, target string, _ time.Duration) (bool, time.Duration) {
+			if target != "http://health.test/old" {
+				t.Errorf("manual verification target = %q", target)
+			}
+			close(started)
+			select {
+			case <-release:
+				return true, 17 * time.Millisecond
+			case <-ctx.Done():
+				return false, 0
+			}
+		},
+		probeExitIP: func(context.Context, Proxy, time.Duration) string { return "" },
+		lookupGeo:   func(context.Context, string, time.Duration) (string, string, string) { return "", "", "" },
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/nodes/verify", bytes.NewBufferString(`{"key":"`+px.Key()+`"}`))
+	done := make(chan struct{})
+	go func() {
+		server.handleNodeVerify(recorder, request)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("manual verification did not start")
+	}
+	pool.InvalidateHealth()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stale manual verification did not return")
+	}
+
+	var response manualVerifyResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode stale manual verification: %v; body=%s", err, recorder.Body.String())
+	}
+	if recorder.Code != http.StatusConflict || response.Code != "health_criterion_changed" || response.Error != "检测标准已改变，结果未应用" {
+		t.Fatalf("stale manual verification = %d %#v", recorder.Code, response)
+	}
+	updated, ok := pool.Find(px.Key())
+	if !ok || updated.Available || updated.LatencyMs != 222 {
+		t.Fatalf("stale manual verification changed invalidated node: %#v", updated)
+	}
+	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 0 {
+		t.Fatalf("stale manual verification recorded observation %d/%d", successes, failures)
 	}
 }
 

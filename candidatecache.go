@@ -588,6 +588,10 @@ func validateAndRebuildCandidateSnapshot(snapshot *candidateSnapshot) error {
 	if err := validateCandidateSnapshot(snapshot); err != nil {
 		return err
 	}
+	removed := filterNonPublicCandidateRecords(snapshot)
+	if removed > 0 {
+		log.Printf("[candidate-cache] skipped %d non-public or invalid ProxyIP endpoint(s)", removed)
+	}
 	snapshot.sourceTotals = make([]int, len(snapshot.sources))
 	snapshot.protocolTotals = make([]int, len(snapshot.protocols))
 	for _, record := range snapshot.records {
@@ -598,6 +602,29 @@ func validateAndRebuildCandidateSnapshot(snapshot *candidateSnapshot) error {
 	}
 	rebuildCandidateSourceFacets(snapshot)
 	return nil
+}
+
+// filterNonPublicCandidateRecords is an upgrade boundary for catalogs written
+// by versions that admitted private and special-use literals. Keep valid
+// records from the same snapshot (including hostname upstreams) instead of
+// rejecting the entire last-good catalog because a large feed contained a few
+// bad rows. The compact source-reference array may retain harmless unused
+// entries until the next successful network snapshot; all visible facets are
+// rebuilt from retained records only.
+func filterNonPublicCandidateRecords(snapshot *candidateSnapshot) int {
+	retained := snapshot.records[:0]
+	for _, record := range snapshot.records {
+		host, port, _ := net.SplitHostPort(record.addr)
+		ip := net.ParseIP(host)
+		protocol := snapshot.protocols[record.protocolID]
+		if (ip != nil && !isPublicInternetIP(ip)) || (protocol == "proxyip" && (ip == nil || port != "443")) {
+			continue
+		}
+		retained = append(retained, record)
+	}
+	removed := len(snapshot.records) - len(retained)
+	snapshot.records = retained
+	return removed
 }
 
 func validateCandidateSnapshot(snapshot *candidateSnapshot) error {

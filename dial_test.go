@@ -254,3 +254,220 @@ func TestDialUpstreamContextSuccessfulTunnelSurvivesInternalContextCleanup(t *te
 	_ = listener.Close()
 	handlers.Wait()
 }
+
+func TestDialUpstreamClassifiesHTTPConnectFailures(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		status        string
+		wantKind      UpstreamErrorKind
+		affectsHealth bool
+	}{
+		{name: "target refusal", status: "403 Forbidden", wantKind: UpstreamErrorTarget},
+		{name: "proxy authentication", status: "407 Proxy Authentication Required", wantKind: UpstreamErrorAuth, affectsHealth: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			done := make(chan error, 1)
+			go func() {
+				conn, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					done <- acceptErr
+					return
+				}
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				for {
+					line, readErr := reader.ReadString('\n')
+					if readErr != nil {
+						done <- readErr
+						return
+					}
+					if line == "\r\n" {
+						break
+					}
+				}
+				_, writeErr := conn.Write([]byte("HTTP/1.1 " + test.status + "\r\nContent-Length: 0\r\n\r\n"))
+				done <- writeErr
+			}()
+
+			host, port, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := DialUpstream(Proxy{IP: host, Port: port, Protocol: "http"}, "example.test:443", time.Second)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			var upstreamErr *UpstreamError
+			if !errors.As(err, &upstreamErr) || upstreamErr.Kind != test.wantKind {
+				t.Fatalf("DialUpstream() error = %#v, want kind %v", err, test.wantKind)
+			}
+			if got := upstreamFailureAffectsHealth(err); got != test.affectsHealth {
+				t.Fatalf("upstreamFailureAffectsHealth() = %v, want %v", got, test.affectsHealth)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("test upstream error: %v", err)
+			}
+		})
+	}
+}
+
+func TestDialUpstreamClassifiesEndpointAndInputFailures(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddress := listener.Addr().String()
+	_ = listener.Close()
+	host, port, err := net.SplitHostPort(closedAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = DialUpstream(Proxy{IP: host, Port: port, Protocol: "http"}, "example.test:443", 250*time.Millisecond)
+	var connectErr *UpstreamError
+	if !errors.As(err, &connectErr) || connectErr.Kind != UpstreamErrorConnect || !upstreamFailureAffectsHealth(err) {
+		t.Fatalf("closed endpoint error = %#v, want health-affecting connect error", err)
+	}
+
+	_, err = DialUpstream(Proxy{Protocol: "http"}, "bad host\r\nX-Test: injected:443", time.Second)
+	var targetErr *UpstreamError
+	if !errors.As(err, &targetErr) || targetErr.Kind != UpstreamErrorTarget || upstreamFailureAffectsHealth(err) {
+		t.Fatalf("invalid target error = %#v, want non-health target error", err)
+	}
+
+	_, err = DialUpstream(Proxy{Protocol: "proxyip"}, "example.test:443", time.Second)
+	var protocolErr *UpstreamError
+	if !errors.As(err, &protocolErr) || protocolErr.Kind != UpstreamErrorProtocol || !upstreamFailureAffectsHealth(err) {
+		t.Fatalf("unsupported protocol error = %#v, want health-affecting protocol error", err)
+	}
+}
+
+func TestDialCredentialCandidatesRetriesOnlyAuthenticationFailuresAndPromotes(t *testing.T) {
+	proxy := Proxy{
+		IP: "192.0.2.80", Port: "8080", Protocol: "http",
+		Username: "old", Password: "wrong",
+		CredentialAlternates: []ProxyCredential{
+			{Username: "also-wrong", Password: "bad"},
+			{Username: "working", Password: "secret"},
+		},
+	}
+	var attempted []ProxyCredential
+	var budgets []time.Duration
+	attempt := func(_ context.Context, candidate Proxy, _ string, budget time.Duration) (net.Conn, error) {
+		attempted = append(attempted, ProxyCredential{Username: candidate.Username, Password: candidate.Password})
+		budgets = append(budgets, budget)
+		if candidate.Username != "working" {
+			return nil, newUpstreamError(UpstreamErrorAuth, "test auth", errors.New("rejected"))
+		}
+		client, peer := net.Pipe()
+		_ = peer.Close()
+		return client, nil
+	}
+
+	conn, verified, err := dialUpstreamCredentialCandidatesContext(context.Background(), proxy, "example.test:443", 600*time.Millisecond, attempt)
+	if err != nil {
+		t.Fatalf("credential candidate dial error = %v", err)
+	}
+	_ = conn.Close()
+	if len(attempted) != 3 {
+		t.Fatalf("credential attempts = %#v, want all three declarations", attempted)
+	}
+	if verified.Username != "working" || verified.Password != "secret" {
+		t.Fatalf("promoted credential = %q/%q", verified.Username, verified.Password)
+	}
+	if len(verified.CredentialAlternates) != 2 || verified.CredentialAlternates[0].Username != "old" || verified.CredentialAlternates[1].Username != "also-wrong" {
+		t.Fatalf("promoted alternatives = %#v", verified.CredentialAlternates)
+	}
+	for index, budget := range budgets {
+		if budget <= 0 || budget > 600*time.Millisecond {
+			t.Fatalf("attempt %d budget = %s, want a bounded share of the 600ms total", index, budget)
+		}
+		if index > 0 && budget < budgets[index-1] {
+			t.Fatalf("attempt budgets = %v, later declarations must not receive less time", budgets)
+		}
+	}
+}
+
+func TestDialCredentialCandidatesStopsOnNonAuthenticationFailure(t *testing.T) {
+	proxy := Proxy{
+		IP: "192.0.2.81", Port: "8080", Protocol: "http",
+		Username: "primary", Password: "secret",
+		CredentialAlternates: []ProxyCredential{{Username: "must-not-run", Password: "secret"}},
+	}
+	attempts := 0
+	attempt := func(_ context.Context, _ Proxy, _ string, _ time.Duration) (net.Conn, error) {
+		attempts++
+		return nil, newUpstreamError(UpstreamErrorTarget, "test target", errors.New("forbidden"))
+	}
+
+	_, verified, err := dialUpstreamCredentialCandidatesContext(context.Background(), proxy, "example.test:443", time.Second, attempt)
+	var upstreamErr *UpstreamError
+	if !errors.As(err, &upstreamErr) || upstreamErr.Kind != UpstreamErrorTarget {
+		t.Fatalf("candidate dial error = %#v, want target failure", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("non-authentication failure tried %d credentials, want 1", attempts)
+	}
+	if verified.Username != proxy.Username || verified.Password != proxy.Password {
+		t.Fatalf("failed dial changed credential: %+v", verified)
+	}
+}
+
+func TestDialCredentialCandidatesSharesOneBoundedDeadline(t *testing.T) {
+	proxy := Proxy{
+		IP: "192.0.2.82", Port: "8080", Protocol: "http",
+		Username: "one", Password: "bad",
+		CredentialAlternates: []ProxyCredential{
+			{Username: "two", Password: "bad"},
+			{Username: "three", Password: "bad"},
+		},
+	}
+	attempts := 0
+	attempt := func(ctx context.Context, _ Proxy, _ string, _ time.Duration) (net.Conn, error) {
+		attempts++
+		<-ctx.Done()
+		return nil, newUpstreamError(UpstreamErrorAuth, "test stalled auth", ctx.Err())
+	}
+	started := time.Now()
+	_, _, err := dialUpstreamCredentialCandidatesContext(context.Background(), proxy, "example.test:443", 300*time.Millisecond, attempt)
+	elapsed := time.Since(started)
+	if !isUpstreamAuthenticationFailure(err) {
+		t.Fatalf("bounded credential dial error = %#v, want auth failure", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("stalled credential attempts = %d, want every fair-share attempt", attempts)
+	}
+	if elapsed < 250*time.Millisecond || elapsed > 550*time.Millisecond {
+		t.Fatalf("credential attempts elapsed = %s, want one bounded 300ms total", elapsed)
+	}
+}
+
+func TestValidateUpstreamTargetRejectsTextInjectionAndNonDecimalPorts(t *testing.T) {
+	for _, target := range []string{
+		"example.test:0",
+		"example.test:+443",
+		"example.test:-1",
+		"example.test:65536",
+		"example .test:443",
+		"example.test\r\nX-Injected: yes:443",
+		"[fe80::1%eth0]:443",
+	} {
+		t.Run(target, func(t *testing.T) {
+			if err := validateUpstreamTarget(target); err == nil {
+				t.Fatalf("validateUpstreamTarget(%q) unexpectedly succeeded", target)
+			}
+		})
+	}
+	for _, target := range []string{"example.test:443", "Example.TEST.:65535", "192.0.2.1:80", "[2001:db8::1]:443"} {
+		t.Run("valid "+target, func(t *testing.T) {
+			if err := validateUpstreamTarget(target); err != nil {
+				t.Fatalf("validateUpstreamTarget(%q) = %v", target, err)
+			}
+		})
+	}
+}

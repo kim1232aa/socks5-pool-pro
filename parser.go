@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +25,28 @@ import (
 var proxyURLRegex = regexp.MustCompile(`(?i)(?:socks5|https?)://[^\s<>"']+`)
 
 const maxFetchBytes = 64 << 20 // 64MB safety cap for source downloads
+
+const (
+	// The largest bundled feed currently contains roughly 230k records. Keep
+	// enough headroom for normal growth while bounding the maps/slices produced
+	// from a compact JSON response.
+	maxSourceParsedRecords   = 300_000
+	maxSourceProxyURLBytes   = 16 << 10
+	maxSourceAddressBytes    = 512
+	maxSourcePortBytes       = 16
+	maxSourceCredentialBytes = 255
+	maxSourceCountryBytes    = 64
+	maxSourceCityBytes       = 512
+	maxSourceContinentBytes  = 16
+	maxProxyIPPortsPerRecord = 64
+)
+
+var (
+	// ErrSourceEmpty distinguishes an unexpectedly empty/invalid 200 response
+	// from a legitimate authoritative empty feed (Source.AllowEmpty).
+	ErrSourceEmpty          = errors.New("source returned no valid proxy records")
+	ErrSourceBudgetExceeded = errors.New("source parsing budget exceeded")
+)
 
 const (
 	sourceFetchAttempts = 3
@@ -180,12 +204,19 @@ func guardedSourceDialContext(resolver sourceIPResolver, allowPrivate bool) func
 	}
 }
 
-var disallowedSourceNetworks = mustSourceNetworks(
+// nonPublicInternetNetworks is shared by source-URL SSRF checks and fetched
+// proxy endpoint validation. net.IP.IsGlobalUnicast intentionally includes
+// several special-use ranges (for example documentation and benchmarking
+// networks), so keep those ranges explicit here instead of treating
+// IsGlobalUnicast as equivalent to "usable on the public Internet".
+var nonPublicInternetNetworks = mustSourceNetworks(
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
 	"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
-	"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+	"192.31.196.0/24", "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
+	"192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24",
 	"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-	"::/128", "::1/128", "100::/64", "2001::/23", "2001:db8::/32",
+	"::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
+	"2001::/23", "2001:db8::/32", "2002::/16", "2620:4f:8000::/48",
 	"fc00::/7", "fe80::/10", "ff00::/8",
 )
 
@@ -202,15 +233,19 @@ func mustSourceNetworks(values ...string) []*net.IPNet {
 }
 
 func isDisallowedSourceIP(ip net.IP) bool {
+	return !isPublicInternetIP(ip)
+}
+
+func isPublicInternetIP(ip net.IP) bool {
 	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
-		return true
+		return false
 	}
-	for _, network := range disallowedSourceNetworks {
+	for _, network := range nonPublicInternetNetworks {
 		if network.Contains(ip) {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // fetchSourceWithClient keeps retry timing injectable for fast deterministic
@@ -243,14 +278,23 @@ func fetchSourceWithClient(src Source, client *http.Client, policy sourceFetchPo
 
 	valid := proxies[:0]
 	for _, px := range proxies {
-		px, ok := normalizeProxy(px)
+		if err := validateFetchedProxyFields(px); err != nil {
+			return nil, err
+		}
+		px, ok := normalizeFetchedProxy(px)
 		if !ok {
 			continue
 		}
 		px.SourceName = src.Name
+		if err := validateFetchedProxyFields(px); err != nil {
+			return nil, err
+		}
 		valid = append(valid, px)
 	}
 	proxies = valid
+	if len(proxies) == 0 && !src.AllowEmpty {
+		return nil, fmt.Errorf("%w: %s", ErrSourceEmpty, safeLogLabel(src.Name))
+	}
 
 	log.Printf("[fetch] %s: %d proxies from %s", safeLogLabel(src.Name), len(proxies), safeSourceURL(src.URL))
 	return proxies, nil
@@ -393,14 +437,38 @@ func normalizeProxy(px Proxy) (Proxy, bool) {
 	}
 	px.Port = strconv.FormatUint(port, 10)
 	if ip := net.ParseIP(px.IP); ip != nil {
+		if px.Protocol == "proxyip" && (!isPublicInternetIP(ip) || px.Port != "443") {
+			return Proxy{}, false
+		}
 		// Canonicalise IP spellings so equivalent IPv6/IPv4 representations
 		// share the same protocol-aware key during deduplication.
 		px.IP = ip.String()
 	} else {
+		// Cloudflare ProxyIP resources are deliberately narrower than ordinary
+		// forwarding candidates: they must remain literal public IPs on 443.
+		if px.Protocol == "proxyip" {
+			return Proxy{}, false
+		}
 		px.IP = strings.ToLower(strings.TrimSuffix(px.IP, "."))
 		if looksLikeIPv4Literal(px.IP) || !validProxyHostname(px.IP) {
 			return Proxy{}, false
 		}
+	}
+	return px, true
+}
+
+// normalizeFetchedProxy applies the public-feed trust boundary after syntax
+// normalization. Hostname upstreams remain supported without a DNS lookup,
+// while literal IPs from a feed must be publicly routable. Source.AllowPrivate
+// applies only to the URL used to download a trusted LAN feed; it must not let
+// that feed populate the candidate catalog with private or special-use IPs.
+func normalizeFetchedProxy(px Proxy) (Proxy, bool) {
+	px, ok := normalizeProxy(px)
+	if !ok {
+		return Proxy{}, false
+	}
+	if ip := net.ParseIP(px.IP); ip != nil && !isPublicInternetIP(ip) {
+		return Proxy{}, false
 	}
 	return px, true
 }
@@ -460,11 +528,18 @@ func validProxyHostname(host string) bool {
 // parseTextRegex extracts "scheme://ip:port" occurrences from a plain text
 // or HTML page (e.g. socks5-proxy.github.io).
 func parseTextRegex(body []byte) ([]Proxy, error) {
-	matches := proxyURLRegex.FindAllString(string(body), -1)
-	seen := make(map[string]bool)
-	var proxies []Proxy
+	matches := proxyURLRegex.FindAllIndex(body, maxSourceParsedRecords+1)
+	if len(matches) > maxSourceParsedRecords {
+		return nil, fmt.Errorf("%w: text source has more than %d records", ErrSourceBudgetExceeded, maxSourceParsedRecords)
+	}
+	seen := make(map[string]bool, len(matches))
+	proxies := make([]Proxy, 0, len(matches))
 
-	for _, raw := range matches {
+	for _, match := range matches {
+		if match[1]-match[0] > maxSourceProxyURLBytes {
+			return nil, sourceFieldBudgetError("proxy URL", match[1]-match[0], maxSourceProxyURLBytes)
+		}
+		raw := string(body[match[0]:match[1]])
 		// Markdown/HTML prose often attaches punctuation right after a URL.
 		// Strip only common trailing delimiters; credentials and IPv6 brackets
 		// inside the URL are left intact for parseProxyURL.
@@ -473,7 +548,10 @@ func parseTextRegex(body []byte) ([]Proxy, error) {
 		if err != nil {
 			continue
 		}
-		key := px.Key()
+		if err := validateFetchedProxyFields(px); err != nil {
+			return nil, err
+		}
+		key := sourceProxyDedupKey(px)
 		if seen[key] {
 			continue
 		}
@@ -483,46 +561,116 @@ func parseTextRegex(body []byte) ([]Proxy, error) {
 	return proxies, nil
 }
 
-var ipPortRegex = regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)`)
-
 // parsePlainList parses newline-separated "ip:port" entries (no scheme),
 // e.g. monosans/proxy-list's proxies/socks5.txt. protocol tags every
 // resulting entry since the file itself doesn't encode one.
 func parsePlainList(body []byte, protocol string) ([]Proxy, error) {
-	if protocol == "" {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if !isForwardingProtocol(protocol) {
 		return nil, fmt.Errorf("plain-list source requires a protocol")
 	}
-	return extractIPPortEntries(string(body), protocol), nil
+	seen := make(map[string]bool)
+	proxies := make([]Proxy, 0)
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 4096), maxSourceProxyURLBytes+1)
+	records := 0
+	for scanner.Scan() {
+		entry := strings.TrimSpace(scanner.Text())
+		if entry == "" || strings.HasPrefix(entry, "#") {
+			continue
+		}
+		records++
+		if records > maxSourceParsedRecords {
+			return nil, fmt.Errorf("%w: plain-list source has more than %d records", ErrSourceBudgetExceeded, maxSourceParsedRecords)
+		}
+		px, ok, err := parseBareProxyAddress(entry, protocol)
+		if err != nil {
+			return nil, err
+		}
+		key := sourceProxyDedupKey(px)
+		if !ok || seen[key] {
+			continue
+		}
+		seen[key] = true
+		proxies = append(proxies, px)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("%w: plain-list record exceeds %d bytes: %v", ErrSourceBudgetExceeded, maxSourceProxyURLBytes, err)
+	}
+	return proxies, nil
 }
 
 // parseJSONArray parses a JSON array of "ip:port" strings, e.g.
 // fyvri/fresh-proxy-list's classic/socks5.json. protocol tags every
 // resulting entry since the file itself doesn't encode one.
 func parseJSONArray(body []byte, protocol string) ([]Proxy, error) {
-	if protocol == "" {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if !isForwardingProtocol(protocol) {
 		return nil, fmt.Errorf("json-array source requires a protocol")
 	}
-	var entries []string
-	if err := json.Unmarshal(body, &entries); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil {
 		return nil, fmt.Errorf("parse json array: %w", err)
 	}
-	return extractIPPortEntries(strings.Join(entries, "\n"), protocol), nil
-}
-
-func extractIPPortEntries(text string, protocol string) []Proxy {
-	matches := ipPortRegex.FindAllStringSubmatch(text, -1)
+	if opening == nil {
+		if err := requireJSONEOF(decoder); err != nil {
+			return nil, fmt.Errorf("parse json array: %w", err)
+		}
+		return nil, nil
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '[' {
+		return nil, fmt.Errorf("parse json array: expected an array")
+	}
 	seen := make(map[string]bool)
-	var proxies []Proxy
-	for _, m := range matches {
-		px := Proxy{IP: m[1], Port: m[2], Protocol: protocol}
-		key := px.Key()
-		if seen[key] {
+	proxies := make([]Proxy, 0)
+	records := 0
+	for decoder.More() {
+		records++
+		if records > maxSourceParsedRecords {
+			return nil, fmt.Errorf("%w: json-array source has more than %d records", ErrSourceBudgetExceeded, maxSourceParsedRecords)
+		}
+		var entry string
+		if err := decoder.Decode(&entry); err != nil {
+			return nil, fmt.Errorf("parse json array record %d: %w", records, err)
+		}
+		if len(entry) > maxSourceProxyURLBytes {
+			return nil, sourceFieldBudgetError("json-array address", len(entry), maxSourceProxyURLBytes)
+		}
+		px, ok, err := parseBareProxyAddress(entry, protocol)
+		if err != nil {
+			return nil, err
+		}
+		key := sourceProxyDedupKey(px)
+		if !ok || seen[key] {
 			continue
 		}
 		seen[key] = true
 		proxies = append(proxies, px)
 	}
-	return proxies
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("parse json array closing delimiter: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("parse json array: %w", err)
+	}
+	return proxies, nil
+}
+
+func parseBareProxyAddress(entry, protocol string) (Proxy, bool, error) {
+	entry = strings.TrimSpace(entry)
+	if len(entry) > maxSourceProxyURLBytes {
+		return Proxy{}, false, sourceFieldBudgetError("proxy address", len(entry), maxSourceProxyURLBytes)
+	}
+	host, port, err := net.SplitHostPort(entry)
+	if err != nil || host == "" || port == "" {
+		return Proxy{}, false, nil
+	}
+	px := Proxy{IP: host, Port: port, Protocol: protocol}
+	if err := validateFetchedProxyFields(px); err != nil {
+		return Proxy{}, false, err
+	}
+	return px, true, nil
 }
 
 // edtEntry mirrors one element of the EDT-Pages/Proxy-List JSON feeds
@@ -538,15 +686,48 @@ type edtEntry struct {
 }
 
 func parseEDTJSON(body []byte) ([]Proxy, error) {
-	var entries []edtEntry
-	if err := json.Unmarshal(body, &entries); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil {
 		return nil, fmt.Errorf("parse EDT json: %w", err)
 	}
-
+	if opening == nil {
+		if err := requireJSONEOF(decoder); err != nil {
+			return nil, fmt.Errorf("parse EDT json: %w", err)
+		}
+		return nil, nil
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '[' {
+		return nil, fmt.Errorf("parse EDT json: expected an array")
+	}
 	seen := make(map[string]bool)
-	var proxies []Proxy
+	proxies := make([]Proxy, 0)
 
-	for _, e := range entries {
+	records := 0
+	for decoder.More() {
+		records++
+		if records > maxSourceParsedRecords {
+			return nil, fmt.Errorf("%w: EDT source has more than %d records", ErrSourceBudgetExceeded, maxSourceParsedRecords)
+		}
+		var e edtEntry
+		if err := decoder.Decode(&e); err != nil {
+			return nil, fmt.Errorf("parse EDT json record %d: %w", records, err)
+		}
+		if len(e.Proxy) > maxSourceProxyURLBytes {
+			return nil, sourceFieldBudgetError("EDT proxy URL", len(e.Proxy), maxSourceProxyURLBytes)
+		}
+		if len(e.IP) > maxSourceAddressBytes {
+			return nil, sourceFieldBudgetError("EDT address", len(e.IP), maxSourceAddressBytes)
+		}
+		if len(e.Country) > maxSourceCountryBytes {
+			return nil, sourceFieldBudgetError("EDT country", len(e.Country), maxSourceCountryBytes)
+		}
+		if len(e.City) > maxSourceCityBytes {
+			return nil, sourceFieldBudgetError("EDT city", len(e.City), maxSourceCityBytes)
+		}
+		if len(e.Continent) > maxSourceContinentBytes {
+			return nil, sourceFieldBudgetError("EDT continent", len(e.Continent), maxSourceContinentBytes)
+		}
 		px := Proxy{}
 		if e.Proxy != "" {
 			if parsed, err := parseProxyURL(e.Proxy); err == nil {
@@ -568,13 +749,22 @@ func parseEDTJSON(body []byte) ([]Proxy, error) {
 		px.Country = e.Country
 		px.City = e.City
 		px.Continent = e.Continent
+		if err := validateFetchedProxyFields(px); err != nil {
+			return nil, err
+		}
 
-		key := px.Key()
+		key := sourceProxyDedupKey(px)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		proxies = append(proxies, px)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("parse EDT json closing delimiter: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("parse EDT json: %w", err)
 	}
 	return proxies, nil
 }
@@ -604,52 +794,246 @@ type proxyIPEntry struct {
 type proxyIPPorts []int
 
 func (p *proxyIPPorts) UnmarshalJSON(data []byte) error {
-	var many []int
-	if err := json.Unmarshal(data, &many); err == nil {
-		*p = many
-		return nil
-	}
-	var one int
-	if err := json.Unmarshal(data, &one); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	first, err := decoder.Token()
+	if err != nil {
 		return fmt.Errorf("proxyip port must be an integer or integer array: %w", err)
 	}
-	*p = []int{one}
+	if first == nil {
+		if err := requireJSONEOF(decoder); err != nil {
+			return err
+		}
+		*p = nil
+		return nil
+	}
+	if delimiter, ok := first.(json.Delim); ok {
+		if delimiter != '[' {
+			return fmt.Errorf("proxyip port must be an integer or integer array")
+		}
+		ports := make(proxyIPPorts, 0, 4)
+		for decoder.More() {
+			if len(ports) >= maxProxyIPPortsPerRecord {
+				return fmt.Errorf("%w: proxyip record has more than %d ports", ErrSourceBudgetExceeded, maxProxyIPPortsPerRecord)
+			}
+			var value int
+			if err := decoder.Decode(&value); err != nil {
+				return fmt.Errorf("proxyip port array: %w", err)
+			}
+			ports = append(ports, value)
+		}
+		if _, err := decoder.Token(); err != nil {
+			return fmt.Errorf("proxyip port array: %w", err)
+		}
+		if err := requireJSONEOF(decoder); err != nil {
+			return err
+		}
+		*p = ports
+		return nil
+	}
+	number, ok := first.(json.Number)
+	if !ok {
+		return fmt.Errorf("proxyip port must be an integer or integer array")
+	}
+	value, err := strconv.Atoi(number.String())
+	if err != nil {
+		return fmt.Errorf("proxyip port must be an integer or integer array: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return err
+	}
+	*p = []int{value}
 	return nil
 }
 
 func parseProxyIPJSON(body []byte) ([]Proxy, error) {
-	var f proxyIPFile
-	if err := json.Unmarshal(body, &f); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil {
 		return nil, fmt.Errorf("parse proxyip json: %w", err)
 	}
-
+	if opening == nil {
+		if err := requireJSONEOF(decoder); err != nil {
+			return nil, fmt.Errorf("parse proxyip json: %w", err)
+		}
+		return nil, nil
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("parse proxyip json: expected an object")
+	}
 	seen := make(map[string]bool)
-	var proxies []Proxy
-
-	for _, e := range f.Data {
-		if e.IP == "" || !containsPort(e.Port, 443) {
+	proxies := make([]Proxy, 0)
+	foundData := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("parse proxyip json field: %w", err)
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("parse proxyip json: object key is not a string")
+		}
+		if key != "data" {
+			if err := skipJSONValue(decoder); err != nil {
+				return nil, fmt.Errorf("parse proxyip json field %q: %w", key, err)
+			}
 			continue
 		}
-		// EdgeTunnel-style ProxyIP consumers use these Cloudflare reverse
-		// endpoints on port 443 and select the IP itself. Emitting every port
-		// advertised for the same address inflated country totals and made the
-		// catalog diverge from the upstream resource browser.
-		px := Proxy{
-			IP:        e.IP,
-			Port:      strconv.Itoa(443),
-			Protocol:  "proxyip",
-			Country:   e.Meta.Country,
-			City:      e.Meta.City,
-			Continent: e.Meta.Continent,
+		if foundData {
+			return nil, fmt.Errorf("parse proxyip json: duplicate data field")
 		}
-		key := px.Key()
-		if seen[key] {
+		foundData = true
+		dataOpening, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("parse proxyip data: %w", err)
+		}
+		if dataOpening == nil {
 			continue
 		}
-		seen[key] = true
-		proxies = append(proxies, px)
+		if delimiter, ok := dataOpening.(json.Delim); !ok || delimiter != '[' {
+			return nil, fmt.Errorf("parse proxyip data: expected an array")
+		}
+		records := 0
+		for decoder.More() {
+			records++
+			if records > maxSourceParsedRecords {
+				return nil, fmt.Errorf("%w: proxyip source has more than %d records", ErrSourceBudgetExceeded, maxSourceParsedRecords)
+			}
+			var e proxyIPEntry
+			if err := decoder.Decode(&e); err != nil {
+				return nil, fmt.Errorf("parse proxyip record %d: %w", records, err)
+			}
+			literalIP := net.ParseIP(strings.TrimSpace(e.IP))
+			if literalIP == nil || !isPublicInternetIP(literalIP) || !containsPort(e.Port, 443) {
+				continue
+			}
+			// EdgeTunnel-style ProxyIP consumers use these Cloudflare reverse
+			// endpoints on port 443 and select the IP itself.
+			px := Proxy{
+				IP:        literalIP.String(),
+				Port:      strconv.Itoa(443),
+				Protocol:  "proxyip",
+				Country:   e.Meta.Country,
+				City:      e.Meta.City,
+				Continent: e.Meta.Continent,
+			}
+			if err := validateFetchedProxyFields(px); err != nil {
+				return nil, err
+			}
+			key := sourceProxyDedupKey(px)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			proxies = append(proxies, px)
+		}
+		if _, err := decoder.Token(); err != nil {
+			return nil, fmt.Errorf("parse proxyip data closing delimiter: %w", err)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("parse proxyip json closing delimiter: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("parse proxyip json: %w", err)
 	}
 	return proxies, nil
+}
+
+func validateFetchedProxyFields(px Proxy) error {
+	fields := []struct {
+		name  string
+		value string
+		limit int
+	}{
+		{"proxy address", px.IP, maxSourceAddressBytes},
+		{"proxy port", px.Port, maxSourcePortBytes},
+		{"proxy protocol", px.Protocol, 32},
+		{"proxy username", px.Username, maxSourceCredentialBytes},
+		{"proxy password", px.Password, maxSourceCredentialBytes},
+		{"proxy country", px.Country, maxSourceCountryBytes},
+		{"proxy city", px.City, maxSourceCityBytes},
+		{"proxy continent", px.Continent, maxSourceContinentBytes},
+		{"proxy source name", px.SourceName, maxSourceNameBytes},
+	}
+	for _, field := range fields {
+		if len(field.value) > field.limit {
+			return sourceFieldBudgetError(field.name, len(field.value), field.limit)
+		}
+	}
+	if len(px.SourceNames) > maxConfiguredSources {
+		return fmt.Errorf("%w: proxy has more than %d source names", ErrSourceBudgetExceeded, maxConfiguredSources)
+	}
+	for _, sourceName := range px.SourceNames {
+		if len(sourceName) > maxSourceNameBytes {
+			return sourceFieldBudgetError("proxy source name", len(sourceName), maxSourceNameBytes)
+		}
+	}
+	if len(px.CredentialAlternates) > maxCredentialAlternates {
+		return fmt.Errorf("%w: proxy has more than %d credential alternates", ErrSourceBudgetExceeded, maxCredentialAlternates)
+	}
+	for _, credential := range px.CredentialAlternates {
+		if len(credential.Username) > maxSourceCredentialBytes {
+			return sourceFieldBudgetError("alternate proxy username", len(credential.Username), maxSourceCredentialBytes)
+		}
+		if len(credential.Password) > maxSourceCredentialBytes {
+			return sourceFieldBudgetError("alternate proxy password", len(credential.Password), maxSourceCredentialBytes)
+		}
+	}
+	return nil
+}
+
+func sourceFieldBudgetError(field string, size, limit int) error {
+	return fmt.Errorf("%w: %s is %d bytes (limit %d)", ErrSourceBudgetExceeded, field, size, limit)
+}
+
+// sourceProxyDedupKey intentionally includes credentials. Two records can
+// advertise the same protocol/address with different authentication and the
+// checker must get a chance to try each variant before the refresh pipeline
+// merges them into one routable node.
+func sourceProxyDedupKey(px Proxy) string {
+	return px.Key() + "\x00" + strconv.Itoa(len(px.Username)) + ":" + px.Username + strconv.Itoa(len(px.Password)) + ":" + px.Password
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	if _, err := decoder.Token(); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return fmt.Errorf("unexpected trailing JSON value")
+}
+
+func skipJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '[':
+		for decoder.More() {
+			if err := skipJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+			if err := skipJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 func containsPort(ports []int, want int) bool {

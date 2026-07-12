@@ -1,56 +1,115 @@
 # SOCKS5 Pool Pro
 
-一个本地优先、可自愈的 SOCKS5 入口与多协议上游代理池。项目会抓取多个订阅源，验证真实连通性与出口信息，保留暂时失效的历史节点等待恢复，并通过一个固定的本地 SOCKS5 地址完成自动选路、故障切换和分流。
+SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开或自定义订阅，保留完整候选目录，对其中一部分做真实连通性检测，再通过固定的本地 SOCKS5 入口完成选路、切换和分流。
 
-项目同时维护两类完全不同的数据：
+它刻意把“来源里有多少地址”和“现在有多少可用代理”分开。公开列表中的地址不会因为被抓到就自动进入路由；只有 SOCKS5、HTTP、HTTPS 节点通过当前健康标准后才会成为可用上游。Cloudflare ProxyIP 则是另一类资源，始终与通用代理池隔离。
 
-- **可转发代理**：SOCKS5、HTTP、HTTPS 标签的 HTTP CONNECT 节点，经过真实健康检查后才能进入路由池。
-- **ProxyIP 资源**：Cloudflare Worker/VLESS/Trojan 类脚本使用的外部反代跳板，只进入候选目录，不会被误当成 SOCKS5/HTTP 上游。
+> `/api/status` 保留现有提取客户端依赖的兼容合同：顶层继续包含 `active_proxy`、`available_total` 和 `proxies`。`proxies` 只含当前健康节点，每项有 `proxy_url`，SOCKS5 节点额外有 `socks_url`。状态 API **不会返回 `telegram_url`**。
 
-> `/api/status` 是现有注册服务依赖的兼容协议。它会继续返回 `active_proxy`、`available_total` 和仅包含健康节点的 `proxies`；每项只有 `proxy_url`，SOCKS5 节点额外有 `socks_url`，不会返回 `telegram_url`。
+## 架构与数据边界
 
-## 主要能力
+```text
+订阅来源
+   │ 抓取、格式校验、协议感知去重
+   ▼
+完整候选目录 ── 有界轮转抽样 ── 真实 HTTP 健康检查 ── 已知转发池
+   │                                                   │
+   │ ProxyIP 仅浏览/专用验证                           │ 规则 + 分组策略
+   └── 不进入 SOCKS/HTTP 路由                          ▼
+                                               本地 SOCKS5 :1080
+```
 
-- 多订阅源并发抓取，支持文本、EDT JSON、ProxyIP JSON、纯地址列表和 JSON 字符串数组。
-- 协议感知去重；同一 `IP:port` 的 HTTP 与 SOCKS5 不会共享错误状态。
-- 有界、轮转式候选检测；几十万条来源数据不会一次性全部探测，也不会因为没抽到而被删除。
-- 已知节点三次连续后台失败后才暂时下线，下一次成功会自动恢复。
-- 真实出口 IP、国家/城市、匿名性、延迟、成功/失败次数及手动测速。
-- `sticky`、`round-robin`、`random`、`latency`、`speed`、`score` 六种分组策略。
-- DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR、GEOSITE、MATCH 分流规则及 DIRECT 直连。
-- 全新的 **Proxy Atlas** 管理界面：桌面侧栏、移动底栏、服务端分页、快照翻页、移动摘要详情、完整加载/错误/空状态。
-- 可追踪的异步刷新任务、稳定 API 错误码、请求 ID、CSRF/SSRF 防护及长任务并发限制。
-- 仅使用 Go 标准库；运行镜像内主进程为非 root 用户。
+项目维护三个不同层次的数据：
 
-## 快速开始
+| 层次 | 包含内容 | 是否可路由 | 持久化 |
+|---|---|---:|---:|
+| 候选目录 | 来源声明的全部去重记录，以及待检、失败、策略排除等状态 | 否 | `candidate_catalog.v1.bin.gz` |
+| 已知转发池 | 曾成功通过检查的 SOCKS5/HTTP/HTTPS 节点；失败节点保留为不可用 | 是，优先当前健康节点 | `pool_cache.json`（gzip） |
+| ProxyIP 资源 | Cloudflare Worker/VLESS/Trojan 类工具使用的外部反代地址 | 否 | 候选目录 |
 
-推荐使用仓库提供的 Compose 配置。两个端口默认都只绑定宿主机 `127.0.0.1`，数据保存在命名卷 `socks5-pool-pro-data`。
+配置和抽样游标分别保存在 `pool_config.json` 与 `candidate_sampler.json`。`pool_cache.json` 使用 gzip 压缩写入，同时能读取旧版本未压缩 JSON。数据目录和状态文件会使用私有权限；其中转发池缓存和配置可能包含上游凭据，备份应按敏感数据处理。候选目录缓存只保留 `has_auth` 标记，不复制候选用户名或密码。
+
+### 为什么界面里的数字不同
+
+| 字段 | 含义 |
+|---|---|
+| `scrape.raw` | 本轮成功下载的原始记录数 |
+| `scrape.candidates` | 本轮成功来源去重后的候选数 |
+| `candidate_total` | 当前完整候选目录总数；失败来源可沿用上次成功目录 |
+| `scrape.checked` | 本轮实际执行健康检查的有界子集 |
+| `scrape.fresh_alive` | 本轮子集中通过健康检查的节点 |
+| `total` | 跨刷新保留的已知转发节点数 |
+| `available_total` | 当前健康且可由提取 API 返回的节点数 |
+| `proxyip_total` | 非路由 ProxyIP 资源数 |
+
+大型来源可能有数十万条记录。`-max-candidates` 只限制每轮检测量，不会把未抽到的候选从目录删除。抽样会优先未见节点，并在来源与协议之间轮转；已知不可用节点也会在后续复检中获得恢复机会。
+
+## Cloudflare ProxyIP：只取纯 IP，固定 443
+
+本项目的 `proxyip-json` 逻辑与普通 SOCKS/HTTP 订阅不是一回事：
+
+- 只接受端口字段中包含 `443` 的记录；
+- 目录中规范化为 `proxyip://IP:443`；
+- 实际配置 ProxyIP 时只取纯 IP；
+- 不对它执行通用 SOCKS5、HTTP CONNECT 健康检查；
+- 不加入本地转发池，也不出现在 `/api/status.proxies`；
+- 可在候选页调用固定的 ProxyIP 专用验证服务做单条参考检查，该结果不会改变普通代理状态。
+
+下面两种数据表达的是不同概念：
+
+```text
+150.230.212.247
+```
+
+这是 ProxyIP 选择器使用的纯 IP。相反：
+
+```text
+8.220.201.169&port=1080&user=9&pass=9
+```
+
+这是带端口和凭据的 SOCKS/HTTP 链式代理参数，不是 ProxyIP。若该端点确实提供 SOCKS5，应在普通来源中写成标准代理 URL：
+
+```text
+socks5://9:9@8.220.201.169:1080
+```
+
+它随后会按普通转发节点进行真实健康检查。项目不会把链式参数误解析成 Cloudflare ProxyIP。
+
+## 快速部署：Docker Compose
+
+Compose 是推荐方式。默认只把 SOCKS5 和管理端口发布到宿主机 `127.0.0.1`，数据保存在命名卷 `socks5-pool-pro-data`。
 
 ```bash
 cp .env.example .env
+# 按需编辑 .env；如要让其他人访问管理面，先设置 ADMIN_USER/ADMIN_PASS
 docker compose up -d --build
 docker compose ps
 ```
 
-打开管理界面：
+管理界面：
 
 ```text
 http://127.0.0.1:8080/
 ```
 
-检查服务：
+基本检查：
 
 ```bash
 curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/readyz
+curl http://127.0.0.1:8080/api/status?compact=1
 curl --proxy socks5h://127.0.0.1:1080 https://api.ipify.org
 ```
 
-首次启动时 `/healthz` 会立即返回 `200`；候选目录第一次发布前 `/readyz` 返回 `503`，发布后返回 `200`。抓取和健康检查在后台继续进行，不会阻塞管理页面启动。
+- `/healthz` 只表示 HTTP 进程能响应，启动后应返回 `200`。
+- `/readyz` 在首个候选快照发布前返回 `503`，之后返回 `200`。
+- 第一次抓取和健康检查在后台运行；管理页面可以先启动。
+- 如果设置了 `ADMIN_USER/ADMIN_PASS`，管理 API 的 `curl` 需要加 `-u 用户名:密码`。
+- 如果设置了 `SOCKS_USER/SOCKS_PASS`，SOCKS 客户端也必须提供对应凭据。
 
-### 不使用 Docker
+### 直接运行二进制
 
-建议使用当前受支持的 Go 1.26.5；`go.mod` 保留 Go 1.23 语言基线：
+`go.mod` 的语言基线是 Go 1.23；仓库 Dockerfile 当前使用 Go 1.26.5 构建。
 
 ```bash
 go build -o socks5-pool .
@@ -60,89 +119,62 @@ go build -o socks5-pool .
   -data-dir ./data
 ```
 
-## Proxy Atlas 管理界面
+## 管理界面
 
-界面按任务而不是按内部结构组织为五个区域：
+内置 Proxy Atlas 管理界面由 `web/dashboard.html`、`web/dashboard.css` 和 `web/dashboard.js` 组成，构建时嵌入二进制。主要页面包括：
 
-1. **代理池**：当前出口、健康统计、真实出口国家、延迟/速度、手动切换、复检和测速。
-2. **候选目录**：服务端浏览完整抓取清单，包括待检测、检测失败、策略过滤、已知可用/不可用和 ProxyIP 资源。
-3. **订阅来源**：新增、启停和删除来源；可信局域网来源可以显式开启 `allow_private`。
-4. **分流规则**：编辑规则顺序和 MATCH 默认目标。
-5. **分组策略**：按国家、协议、来源或固定节点建立独立策略组。
+- **转发代理池**：健康状态、实测出口、延迟、评分、测速、人工复检和节点切换；
+- **候选库存**：服务端分页浏览完整去重目录，区分待检、失败、策略排除、池内可用/不可用和 ProxyIP；
+- **来源订阅**：新增、启停、删除来源及 `allow_private`、`allow_empty` 高级选项；
+- **分流规则**：按顺序维护域名、CIDR、GEOSITE 与兜底规则；
+- **分组策略**：按国家、协议、来源或指定节点建立策略组。
 
-桌面端使用固定侧栏和数据表格；移动端使用底部导航，每页默认 10 条，节点与候选只展示摘要，按需展开详情。危险的“清理不可用节点”与普通筛选、导出操作分开显示。
+节点和候选都使用服务端筛选、分页与快照令牌，浏览器不会一次下载完整大池。移动端与桌面端共用相同 API。
 
-## 节点、候选与计数
+## 健康检查与节点生命周期
 
-这些数字故意不相等：
-
-| 名称 | API 字段 | 含义 |
-|---|---|---|
-| 来源原始量 | `scrape.raw` | 本轮成功来源返回的原始记录数 |
-| 去重候选 | `scrape.candidates` | 本轮成功来源中去重后的协议+地址组合 |
-| 完整候选目录 | `candidate_total` | 当前目录总量；来源失败时会保留该来源上次成功的数据 |
-| 本轮检测 | `scrape.checked` | 受 `-max-candidates` 限制、实际探测的子集 |
-| 本轮通过 | `scrape.fresh_alive` | 本轮检测后通过的转发节点 |
-| 已知池 | `total` | 跨刷新保留的可转发节点库存 |
-| 当前可用 | `available_total` | 现在允许参与路由的健康节点 |
-| ProxyIP | `proxyip_total` | 仅供 Worker 类配置使用的资源数量，不参与 SOCKS 路由 |
-
-当某些来源失败时，候选目录状态会是 `partial`。失败来源的旧目录被保留，因此 `scrape.candidates` 可能小于 `candidate_total`；这表示本轮抓取不完整，不表示节点被删除。完整目录会写入数据卷，服务重启后先恢复再刷新，所以只要 `data-dir` 仍在且缓存有效，来源临时失败和普通重启都不会让该来源的目录缩水。
-
-### 有界候选检测
-
-大型公开源可能一次返回数十万条记录。项目只从中选取最多 `-max-candidates` 条进行当前轮探测，选择方式是：
-
-- 未见过的节点优先；
-- 来源和协议之间尽量平衡；
-- 未检测部分通过持久化游标在后续刷新继续轮转；
-- 旧的不可用节点也通过独立游标获得恢复机会。
-
-完整候选仍可在“候选目录”中分页查看，浏览器不会一次下载全部数据。
-
-大型来源的单次下载可能需要 30–40 秒，这是数 MiB 公开归档的正常耗时，不代表刷新卡死。抓取仍然受到明确边界约束：每个来源单次尝试最多 45 秒、整个来源最多 140 秒、响应体最多 64 MiB，同时最多抓取 4 个来源；健康探测仍只处理本轮 `-max-candidates` 指定的有界子集。
-
-### 候选目录持久化
-
-每次完成候选快照后，服务会以原子替换方式写入：
+默认检查目标是：
 
 ```text
-<data-dir>/candidate_catalog.v1.bin.gz
+https://www.google.com/generate_204
 ```
 
-启动时会在第一次网络抓取之前校验并恢复该文件，因此管理页面可以先显示上次完整目录。缓存保留来源归属、候选状态、地区、时间和 `has_auth` 标记，使来源级的“本轮失败则沿用上次成功目录”语义跨进程重启继续成立。只有显式停用/删除来源、成功抓取到不同内容，或删除数据卷/缓存文件，目录才会按新事实变化。
+健康判定规则：
 
-该候选缓存**不会写入上游用户名或密码**，也不能用来还原认证凭据；对带认证候选只记录 `has_auth=true`。候选目录中的认证信息要由订阅源重新提供，已进入转发池的节点则继续使用独立的池缓存，避免几十万条候选快照变成另一份凭据副本。缓存文件权限为 `0600`，并有压缩大小、解压大小、记录数和字符串长度限制；损坏或不兼容的文件会被拒绝，不会发布部分解码结果。
+- 必须通过候选代理完成真实 HTTP 请求；仅能建立 TCP 连接不算健康；
+- 默认目标必须直接返回 `204`；
+- 自定义目标接受直接返回的任意 `2xx`；
+- 重定向和非 `2xx` 都失败；
+- 出口 IP、地理信息和匿名性探测是尽力而为，附加探测失败不会抹掉已经通过的基础健康结果；
+- `-require-ip-change=true` 时，只有在本机出口与代理出口都已测得且相同的节点才会被策略排除，未知状态不会被误删。
 
-## Cloudflare ProxyIP 的正确含义
+在界面或 `POST /api/settings/check-url` 修改目标后，旧标准下的所有健康结果立即失效，并触发保留池全量复检。检查结果带有健康标准代次；旧异步任务即使较晚完成，也不能把节点按旧标准重新标为可用。复检完成前这些节点属于“等待当前标准复检”，不会被路由选中，也不能执行永久清理；进度可从 `/api/health-recheck/status` 查询。重复保存同一个规范化 URL 返回 `changed:false`，不会让全池重复下线。
 
-内置 `zip.cm.edu.kg/all.json` 数据源中的地址是 Worker/VLESS/Trojan 类隧道所使用的外部反代跳板，并不是普通 Cloudflare 边缘优选 IP，也不保证支持 SOCKS5 或 HTTP CONNECT。
+升级时，配置中精确等于历史默认值 `http://www.google.com/generate_204` 的目标会迁移到 HTTPS；用户自行设置的其他 HTTP 地址不会被改写。检查 URL 或出口变化策略改变都会使旧缓存标准失效，并安排复检。
 
-因此项目采用以下隔离逻辑：
+新候选只有成功后才进入已知转发池。已知节点在普通后台检查中连续失败 3 次才标为不可用，下一次成功可以自愈；实际转发时若确认是上游连接、认证或协议故障，会立即停止选择该节点，而目标站自身拒绝连接不会污染全局节点健康。不可用节点默认只隐藏，不会自动删除；只有“永久清理不可用节点”操作会物理移除它们。
 
-- 解析为 `protocol=proxyip`；
-- 只进入候选目录和 ProxyIP 计数；
-- 永不加入通用转发池；
-- 只能通过候选行上的 ProxyIP 专用验证按钮，委托固定验证服务进行单条检查；
-- 验证结果不会改变普通代理健康状态。
+同一个协议与地址如果由来源声明了多组凭据，会保留有界的凭据候选，并在同一个节点超时预算内逐个尝试；验证成功的凭据会提升为当前主凭据。同一 `IP:port` 的 SOCKS5 与 HTTP 声明仍是两个独立节点，不共享错误状态。
 
-像 `socks5://user:pass@host:1080` 这样的带认证 SOCKS URL 仍是正常转发节点，与 ProxyIP 无关。
+### 测速不是健康检查
 
-## 订阅源
+测速是按需操作，不会在每轮刷新中对全池自动下载。它完整读取固定 3 MB 样本，拒绝重定向、非完整响应和异常 Range；主测速点失败后会在同一总预算内尝试备用测速点。测速失败可能只是测速站链路问题，不会因此直接判定代理不健康。`speed` 策略只对已有有效测速样本的节点有参考意义。
 
-内置来源包括 EDT-Pages、Proxifly、Monosans、Fyvri、socks5-proxy.github.io，以及默认关闭的 ProxyIP 来源。所有来源都可在界面中启停，配置持久化在数据卷的 `pool_config.json`。
+## 来源、last-good 与空清单
 
-支持的格式：
+支持的来源格式：
 
-| `format` | 数据形态 | 是否需要 `protocol` |
+| `format` | 输入 | `protocol` |
 |---|---|---|
-| `text-regex` | 文本/HTML 中的完整代理 URL | 否 |
-| `edt-json` | EDT 风格对象数组 | 否 |
-| `proxyip-json` | `data[].ip/port/meta` 资源结构 | 否 |
-| `plain-list` | 每行一个 `host:port` | 是 |
-| `json-array` | `host:port` 字符串数组 | 是 |
+| `text-regex` | 文本或 HTML 中的完整 `scheme://host:port` | 数据自带 |
+| `edt-json` | EDT 风格对象数组 | 数据自带 |
+| `proxyip-json` | `data[].ip/port/meta` | 固定为 `proxyip` |
+| `plain-list` | 每行一个 `host:port` | 必须指定 `socks5`、`http` 或 `https` |
+| `json-array` | `host:port` 字符串数组 | 必须指定 `socks5`、`http` 或 `https` |
 
-新增普通来源：
+初始配置包含 EDT-Pages、Proxifly、Monosans、Fyvri 和 socks5-proxy.github.io 等普通来源；内置 ProxyIP 来源默认关闭，可按需启用。
+
+新增来源示例：
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/sources \
@@ -155,7 +187,20 @@ curl -X POST http://127.0.0.1:8080/api/sources \
   }'
 ```
 
-默认拒绝指向 loopback、私网、link-local、CGNAT、保留地址或公私混合 DNS 结果的来源 URL，并在每次重定向和真实拨号前重新校验。确实需要可信局域网订阅时必须显式声明：
+来源刷新采用 last-good 语义：
+
+- 下载失败、解析失败或 HTTP 200 但没有有效记录时，默认把本轮视为失败；
+- 候选目录会按来源保留该来源上一次成功快照，其他成功来源照常更新，刷新状态显示 `partial`；
+- 只有显式设置 `allow_empty=true`，空清单才是“该来源确实为空”的权威结果；
+- 停用或删除来源会立即让该来源曾声明过的转发节点保守退役，但不会自动清除已知转发库存、统计和池缓存；
+- 同一端点的凭据候选目前不逐来源归属。为避免误用被停用来源的凭据，即使端点还出现在另一启用来源中，也会先退出路由；下一轮从启用来源重新抓取并通过健康检查后会解除退役；
+- 后续候选快照按当前启用来源重建，停用来源的 last-good 不再参与新快照。
+
+因此“来源停用/删除”和“永久清理不可用节点”是两件事。前者停止使用来源并保留历史库存，后者才是显式删除池内不可用记录。
+
+### 私网来源与 SSRF 防护
+
+默认拒绝来源 URL 指向 loopback、私网、link-local、CGNAT、保留地址以及公私混合 DNS 结果，并在重定向和实际拨号前重新校验。确实需要访问自己控制的局域网订阅时，可显式设置：
 
 ```json
 {
@@ -167,31 +212,23 @@ curl -X POST http://127.0.0.1:8080/api/sources \
 }
 ```
 
-`allow_private` 只放行订阅文件地址，不会自动信任、删除或改写文件中声明的代理节点。不要对不受你控制的地址启用它。
+`allow_private` 只放行订阅文件地址，不会自动信任、删除或改写文件中声明的代理节点；不要对不受你控制的地址启用它。抓取到的字面 IP 必须是可公网路由地址；私网、CGNAT、环回、链路本地、文档、组播和保留网段会在进入候选目录前逐条过滤，不会让同一来源中的其他公网节点失效，域名形式的上游仍然支持。来源 URL 的 userinfo 和查询值会在管理响应与日志中脱敏，但原始值仍需写入私有配置文件才能完成抓取；URL fragment 会直接被拒绝。
 
-来源 URL 可以包含私有订阅所需的 userinfo 或查询参数。管理响应和日志会脱敏全部 userinfo、查询值和 fragment；持久化配置文件权限为 `0600`。
+单个来源响应体、解析记录数、字段长度、重试时间和并发抓取数都有硬边界。当前实现同时最多抓取 4 个来源，单个响应最多 64 MiB、最多解析 300,000 条记录，合并候选缓存最多 1,200,000 条。达到边界的来源按失败处理并沿用 last-good，不会发布半截结果。
+
+## 路由与策略
+
+本地入口只实现 SOCKS5 CONNECT。目标按规则从上到下匹配，再交给 `DIRECT`、`ANY`、`COUNTRY:XX` 或自定义分组：
+
+- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`、`GEOSITE`、`MATCH`；
+- 策略：`sticky`、`round-robin`、`random`、`latency`、`speed`、`score`；
+- 自定义组可按国家、协议、来源或协议感知节点 key 筛选；
+- `COUNTRY:JP` 这类动态组无需预先创建；
+- 指定组没有普通健康成员时会回退到 `ANY`，连接同一目标时最多尝试不同上游 3 次；来源退役、健康标准失效和出口策略排除属于硬不可路由状态，不会通过回退重新选中。
+
+来源标签 `https` 在本项目中表示能用 HTTP CONNECT 访问 HTTPS 目标的 HTTP 代理，并不表示客户端先用 TLS 连接代理本身；因此对外 `proxy_url` 可能规范化为 `http://...`。
 
 ## HTTP API
-
-所有 JSON API 响应都带有：
-
-- `X-Request-ID`
-- `Cache-Control: no-store, private`
-- `X-Content-Type-Options: nosniff`
-- 点击劫持与 Referrer 防护头
-
-错误结构保留旧的 `error` 字段，同时提供稳定机器码：
-
-```json
-{
-  "error": "country must be a two-letter ASCII ISO code or __unknown__",
-  "code": "invalid_country",
-  "request_id": "7e5f..."
-}
-```
-
-错误方法返回 `405` 和 `Allow`；未知 `/api/*` 返回 JSON `404`，不会再错误返回管理首页。
-管理写接口会拒绝未知 JSON 字段，字段拼写错误不会再被静默忽略。
 
 ### 兼容提取接口
 
@@ -200,7 +237,7 @@ GET /api/status
 GET /api/status?compact=1
 ```
 
-完整接口用于现有代理提取客户端：
+完整响应的核心合同：
 
 ```json
 {
@@ -218,20 +255,20 @@ GET /api/status?compact=1
 }
 ```
 
-兼容保证：
+保证如下：
 
-- `active_proxy` 即使空池也存在，值为 `""`；
-- `available_total == len(proxies)`，核心字段来自同一次池快照；
-- `proxies` 只包含健康的 SOCKS5/HTTP/HTTPS 转发节点；
-- 每项始终有 `proxy_url`；SOCKS5 额外有 `socks_url`；
+- `active_proxy` 即使没有健康选择也保留，值为 `""`；
+- `available_total == len(proxies)`；
+- 数组只含当前健康的 SOCKS5/HTTP/HTTPS 节点；
+- 每项始终有 `proxy_url`，仅 SOCKS5 额外有 `socks_url`；
 - 不返回 `telegram_url`；
-- `compact=1` 只返回计数和状态，不返回完整代理数组，适合界面轮询。
+- `compact=1` 省略大代理数组，增加候选总量、阶段、来源错误和更新时间，适合界面轮询。
 
-URL 中可能包含上游节点凭据，不要把完整状态响应发布到公共位置。
+代理 URL 可能带上游凭据。不要把完整 `/api/status` 暴露到公共缓存、日志或第三方页面。
 
 ### v1 健康代理接口
 
-新客户端应优先使用分页接口：
+新客户端优先使用有界接口：
 
 ```text
 GET /api/v1/proxies?page=1&page_size=20
@@ -239,275 +276,224 @@ GET /api/v1/proxies?protocol=socks5&country=JP&page_size=50
 GET /api/v1/proxies/pick?protocol=socks5&country=JP
 ```
 
-`/api/v1/proxies` 返回按稳定 key 排序的健康节点、`snapshot_id`、`page_count`、`has_next`、`filtered_total` 和 `available_total`。`page_size` 最大为 100；无效页码、协议或国家返回 `400`。
+`/api/v1/proxies` 只返回健康节点，支持协议、国家、分页和不透明 `snapshot_id`，`page_size` 最大为 100。连续翻页时回传前一页的 `snapshot_id`；如果池已变化，服务返回 `409 snapshot_changed`，客户端应从第 1 页重新开始。
 
-`/api/v1/proxies/pick` 从符合过滤条件的节点中按内部质量评分挑选一个；无匹配节点返回 `404 proxy_not_found`。
+`/api/v1/proxies/pick` 从过滤结果中选出内部评分最高的节点；没有匹配时返回 `404 proxy_not_found`。v1 同样只有 `proxy_url`/`socks_url`，不提供 Telegram URL。
 
-### 快照分页
+### 常用管理接口
 
-节点页、候选页和 v1 代理页都会返回不透明的 `snapshot_id`。连续翻页时把它带回服务端：
-
-```text
-GET /api/candidates/page?page=2&page_size=50&snapshot_id=<上一页返回值>
-```
-
-当目录或影响结果的健康状态改变时，服务端返回：
-
-```text
-409 snapshot_changed
-```
-
-客户端应清除旧 token 并从第 1 页重新请求。token 包含当前进程标识，服务重启后旧 token 不会被错误接受。普通真实连接产生的成功计数不会无意义地使候选目录 token 失效。
-
-### 异步刷新
-
-```text
-POST /api/refresh
-GET  /api/refresh/status
-```
-
-触发接口返回 `202 Accepted`：
-
-```json
-{
-  "id": "refresh-...",
-  "status": "queued",
-  "requested_at": "2026-07-11T09:00:00Z",
-  "accepted": true,
-  "coalesced": false,
-  "status_url": "/api/refresh/status"
-}
-```
-
-重复请求只保留一个待执行任务，并通过 `coalesced` 告知调用方。状态接口返回 `state=idle|queued|running`，以及当前、待执行和上一个任务；结束状态可能是 `complete`、`partial` 或 `skipped`。
-
-### 管理接口索引
-
-| 方法 | 路径 | 用途 |
+| 方法 | 路径 | 作用 |
 |---|---|---|
-| GET | `/healthz` | 数据无关的 liveness |
-| GET | `/readyz` | 首次候选目录是否已发布 |
+| GET | `/healthz` | 无数据 liveness |
+| GET | `/readyz` | 首个候选快照是否发布 |
 | GET | `/api/status` | 兼容状态与健康代理数组 |
 | GET | `/api/v1/proxies` | 健康代理分页 |
 | GET | `/api/v1/proxies/pick` | 选择一个健康代理 |
-| POST | `/api/refresh` | 排队刷新任务 |
-| GET | `/api/refresh/status` | 刷新任务状态 |
+| POST | `/api/refresh` | 排队一次异步来源刷新 |
+| GET | `/api/refresh/status` | 查看运行中、待执行和最近刷新任务 |
+| GET | `/api/health-recheck/status` | 查看健康标准全量复检进度 |
 | GET | `/api/nodes/page` | 已知转发池分页、筛选、排序 |
 | GET | `/api/candidates/page` | 完整候选目录分页 |
-| GET | `/api/nodes` | 旧版完整节点数组；大池场景不推荐 |
-| GET | `/api/nodes/export` | CSV 或 `format=tme` 导出 |
-| POST | `/api/nodes/switch` | 固定 ANY 当前节点 |
-| POST | `/api/nodes/auto` | 恢复 ANY 自动选择 |
-| POST | `/api/nodes/verify` | 立即复检一个节点 |
-| POST | `/api/nodes/speedtest` | 对一个节点执行完整下载测速 |
-| POST | `/api/nodes/clear-unavailable` | 显式删除当前不可用节点 |
+| GET | `/api/nodes` | 旧版完整节点数组，已标记弃用 |
+| POST | `/api/nodes/verify` | 人工复检一个转发节点 |
+| POST | `/api/nodes/speedtest` | 对一个节点执行按需测速 |
 | POST | `/api/proxyip/verify` | 单条 ProxyIP 专用验证 |
-| GET/POST | `/api/settings/check-url` | 读取或修改健康检查目标 |
+| GET/POST | `/api/settings/check-url` | 读取或修改健康目标 |
 | GET/POST | `/api/sources` | 列出或新增来源 |
-| POST | `/api/sources/toggle` | 启停来源 |
-| POST | `/api/sources/delete` | 删除来源 |
 | GET/POST | `/api/rules` | 列出或新增规则 |
-| POST | `/api/rules/delete` | 删除规则 |
-| POST | `/api/rules/move` | 调整规则顺序 |
-| POST | `/api/rules/default` | 修改 MATCH 默认组 |
-| POST | `/api/rules/preset-gfw` | 写入 GFW 预设 |
 | GET/POST | `/api/groups` | 列出或新增分组 |
-| POST | `/api/groups/strategy` | 修改分组策略 |
-| POST | `/api/groups/delete` | 删除分组 |
 
-手动节点复检最多同时运行 4 个任务，ProxyIP 验证最多 8 个不同任务，测速最多 4 个任务；同节点重复任务会合并或返回 `429`，满载响应带 `Retry-After`。
+`POST /api/refresh` 返回 `202` 和任务 ID；重复请求最多合并成一个待执行任务，避免无界队列。节点页、候选页与 v1 页都使用快照分页。未知 `/api/*` 返回 JSON `404`，错误响应包含稳定 `code`、可读 `error` 和 `request_id`。
 
-## 安全模型
+## 管理面安全
 
-### 默认本地模式
+### 未配置管理认证
 
-未配置管理认证时，管理首页和全部 `/api/*` 只接受 `Host: localhost` 或 loopback IP；`/healthz` 和 `/readyz` 仍保持数据无关、无需认证。Compose 同时只把端口发布到宿主机 `127.0.0.1`，并使用独立 Docker 网络。
+没有设置 `ADMIN_USER/ADMIN_PASS` 时，管理首页和 `/api/*` 同时要求：
 
-这意味着：
+1. `Host` 是 `localhost` 或 loopback IP；
+2. TCP 对端是 loopback，或是通过 `-trusted-management-proxy` 明确列出的**单个精确 IP**。
 
-- `http://127.0.0.1:8080/api/status` 的现有本机提取方式保持可用；
-- 浏览器 DNS rebinding 使用任意域名访问本地管理面会被拒绝；
-- 另一个容器通过服务名、容器 IP 或 `host.docker.internal` 访问未认证管理面会得到 `403 untrusted_host`；
-- 容器间调用必须先启用管理认证，再使用 Basic Auth。
+转发头不会被信任，`-trusted-management-proxy` 也不接受 CIDR 或主机名。Compose 把端口绑定到宿主机 `127.0.0.1`，并只信任固定 Docker 网桥网关 `172.30.250.1`，从而让宿主机经发布端口访问仍然可用；这不是对整个容器网段放行。
 
-### 管理认证
+若修改 Compose 的网段或网关，必须同步修改命令中的 `-trusted-management-proxy`。若 `172.30.250.0/24` 与现有网络冲突，也应成对调整这两处。
 
-在 `.env` 中同时设置：
+`/healthz` 和 `/readyz` 始终无认证且不泄露池数据，便于编排器探测。
+
+### Basic Auth 与跨站写保护
+
+需要从非本机访问时，至少同时设置：
 
 ```dotenv
 ADMIN_USER=operator
 ADMIN_PASS=replace-with-a-long-random-password
 ```
 
-启用后，管理首页和每个 `/api/*` 都需要 HTTP Basic Auth：
+启用后，页面和所有 `/api/*` 都需要 HTTP Basic Auth；请同时在外层反向代理启用 TLS。启用前先更新自动提取客户端，否则 `/api/status` 会返回 `401`。
 
-```bash
-curl -u operator:password http://127.0.0.1:8080/api/status
-```
+浏览器状态修改请求还会检查 `Origin` 和 `Sec-Fetch-Site`，不开放通配 CORS。响应默认带 `no-store`、请求 ID、`nosniff`、禁止嵌套和 Referrer 防护头。
 
-启用认证前先更新所有机器提取客户端，否则它们会收到 `401`。SOCKS5 入站认证与管理认证彼此独立。
-
-浏览器写请求还会检查 `Origin` 和 `Sec-Fetch-Site`；项目不会发送通配 CORS 头。
-
-### SOCKS5 入站认证
+SOCKS 入站认证与管理认证互相独立：
 
 ```dotenv
 SOCKS_USER=proxy-client
 SOCKS_PASS=replace-with-another-password
 ```
 
-然后客户端使用 RFC 1929 用户名密码连接本地 1080 端口。两项必须一起设置或一起留空。
+用户名与密码必须成对设置。也可使用 `SOCKS_USER_FILE`、`SOCKS_PASS_FILE`、`ADMIN_USER_FILE`、`ADMIN_PASS_FILE` 读取 Docker/Kubernetes secret；直接环境值与对应 `_FILE` 不能同时存在，显式 CLI 参数优先。
 
-### Secret file
+## 配置
 
-除了直接环境变量，还支持：
+### 二进制 CLI
 
-- `SOCKS_USER_FILE`
-- `SOCKS_PASS_FILE`
-- `ADMIN_USER_FILE`
-- `ADMIN_PASS_FILE`
-
-这适合 Docker/Kubernetes secret，避免凭据出现在进程参数或普通环境配置中。直接值与对应 `_FILE` 不能同时设置；显式 CLI 参数优先于环境默认值。
-
-## 配置参数
-
-| CLI | 默认值 | 说明 |
+| 参数 | 默认值 | 说明 |
 |---|---:|---|
 | `-listen` | `127.0.0.1:1080` | 本地 SOCKS5 监听地址 |
-| `-status` | `127.0.0.1:8080` | 管理页面/API 监听地址 |
+| `-status` | `127.0.0.1:8080` | 管理页面/API 地址 |
 | `-data-dir` | `./data` | 持久化目录 |
-| `-scrape-interval` | `20m` | 来源刷新周期 |
-| `-check-timeout` | `10s` | 单节点健康检查超时 |
-| `-max-concurrent` | `20` | 健康检查并发数 |
-| `-max-candidates` | `3000` | 每轮最多检测的候选数 |
-| `-require-ip-change` | `true` | 排除已确认没有改变出口 IP 的透明代理 |
+| `-scrape-interval` | `20m` | 刷新完成后到下一轮的间隔 |
+| `-check-timeout` | `10s` | 单节点检查、出口与附加探测共享的总预算 |
+| `-max-concurrent` | `20` | 并发健康检查数 |
+| `-max-candidates` | `3000` | 每轮最多检查的候选数 |
+| `-max-client-connections` | `512` | 入站 SOCKS5 并发连接上限 |
+| `-require-ip-change` | `true` | 排除已确认未改变出口 IP 的节点 |
+| `-trusted-management-proxy` | 空 | 可转发未认证本地管理请求的精确对端 IP；可重复或逗号分隔 |
 | `-socks-user/-socks-pass` | 空 | SOCKS5 入站认证 |
-| `-admin-user/-admin-pass` | 空 | 管理页面和 API Basic Auth |
+| `-admin-user/-admin-pass` | 空 | 管理页面/API Basic Auth |
 
-当平台提供 `PORT` 环境变量且没有显式传 `-status` 时，HTTP 管理服务监听 `0.0.0.0:$PORT`；SOCKS5 仍使用 1080。
+平台设置 `PORT` 且 CLI 未显式指定监听地址时，管理服务监听 `0.0.0.0:$PORT`，SOCKS5 保持 `0.0.0.0:1080`。
 
-## Docker 运维
+### Compose 环境变量
 
-### 更新
+`.env.example` 提供：
+
+| 变量 | Compose 默认值 | 说明 |
+|---|---:|---|
+| `SOCKS_PORT` | `1080` | 宿主机 loopback SOCKS 端口 |
+| `DASHBOARD_PORT` | `8080` | 宿主机 loopback 管理端口 |
+| `MAX_CONCURRENT` | `50` | 健康检查并发数 |
+| `MAX_CANDIDATES` | `1500` | 每轮检测候选数 |
+| `MAX_CLIENT_CONNECTIONS` | `512` | 入站连接上限 |
+| `SCRAPE_INTERVAL` | `20m` | 来源刷新间隔 |
+| `CHECK_TIMEOUT` | `10s` | 健康检查预算 |
+| `REQUIRE_IP_CHANGE` | `true` | 是否要求已知出口发生变化 |
+| `GOMEMLIMIT` | `1200MiB` | Go 运行时软内存目标 |
+| `GOGC` | `75` | Go GC 百分比 |
+
+Compose 还设置 1536 MiB 内存上限、512 MiB reservation、4 CPU、512 PID、`nofile=65536`、16 MiB 临时目录和日志轮转。这些是保护边界，不是性能或可用节点数量承诺；来源规模、网络质量和检查超时都会影响刷新耗时与资源使用。
+
+容器根文件系统只读，仅数据卷和 `/tmp` 可写；入口脚本只用 root 修复旧卷权限，随后以 UID/GID 10001 运行服务。镜像构建与运行基础镜像已固定 digest。
+
+## 升级、备份与恢复
+
+普通更新不会删除命名卷：
 
 ```bash
 git pull --ff-only
-docker compose up -d --build
+docker compose build --pull
+docker compose up -d
 docker compose ps
 ```
 
-命名卷不会因重新构建或普通 `docker compose down` 被删除。不要使用 `down -v`，除非你确实要清空节点池、来源和规则。
+`docker compose up -d` 会复用 `socks5-pool-pro-data`。普通 `docker compose down` 也保留命名卷；**不要执行 `docker compose down -v`**，除非确定要清空来源、规则、候选目录、转发池与统计。
 
-### 备份数据卷
+早期版本的同名网络可能使用动态网段；新版固定为 `172.30.250.0/24`，用于精确限制未认证管理访问。第一次从旧网络升级时，先备份并确认该网络没有其他容器，再只重建容器和网络：
+
+```bash
+docker compose stop proxy-pool
+docker rm -f socks5-pool-pro 2>/dev/null || true
+docker network inspect socks5-pool-pro-net
+# 仅当上一步的 Containers 为空、确认没有其他使用者时执行：
+docker network rm socks5-pool-pro-net
+docker compose up -d --build
+```
+
+这不会删除 `socks5-pool-pro-data`；不要为迁移网桥使用 `docker compose down -v`。如果固定网段与本机已有网络冲突，应同时修改 Compose 网段、网关和 `-trusted-management-proxy`，保持精确 IP 对齐。
+
+建议停服务后做一致性备份：
 
 ```bash
 mkdir -p backups
+docker compose stop proxy-pool
 docker run --rm \
   -v socks5-pool-pro-data:/data:ro \
   -v "$PWD/backups:/backup" \
   alpine:3.24.1 \
-  tar -czf /backup/socks5-pool-data.tar.gz -C /data .
+  sh -c 'umask 077; tar -czf /backup/socks5-pool-data.tar.gz -C /data .'
+chmod 600 backups/socks5-pool-data.tar.gz
+docker compose start proxy-pool
 ```
 
-### 直接 `docker run`
+恢复会覆盖当前卷，请先另做备份并保持服务停止：
 
 ```bash
-docker build -t socks5-pool-pro .
-docker network create socks5-pool-pro-net
-docker run -d --name socks5-pool-pro --restart unless-stopped \
-  --network socks5-pool-pro-net \
-  -p 127.0.0.1:1080:1080 \
-  -p 127.0.0.1:8080:8080 \
-  -v socks5-pool-pro-data:/app/data \
-  socks5-pool-pro
+docker compose stop proxy-pool
+docker run --rm \
+  -v socks5-pool-pro-data:/data \
+  -v "$PWD/backups:/backup:ro" \
+  alpine:3.24.1 \
+  sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; tar -xzf /backup/socks5-pool-data.tar.gz -C /data'
+docker compose start proxy-pool
 ```
 
-镜像入口只以 root 修复 `/app/data` 的历史权限，随后通过 `su-exec` 以 UID/GID 10001 运行服务。Compose 根文件系统为只读，只有数据卷和临时目录可写。
+进程收到 SIGINT/SIGTERM 时会停止接收新连接，给 HTTP/SOCKS 会话有限时间退出，并刷新池缓存。Compose 的 `stop_grace_period` 为 45 秒。
 
 ## Railway
 
-仓库保留 `railway.toml`。Railway 的 `PORT` 主要用于 HTTP 管理页面与健康检查；普通 HTTP 公网入口不会自动暴露 SOCKS5 TCP 1080。如需公开 SOCKS5，应使用平台 TCP 入口、私网服务或 VPS。
+仓库保留 `railway.toml`，使用 Dockerfile 构建，`/healthz` 用作健康检查。Railway 的 `PORT` 面向 HTTP 管理服务；普通 HTTP 域名不会自动提供 SOCKS5 TCP 1080。
 
-公开部署必须设置 `ADMIN_USER/ADMIN_PASS`，并为管理入口提供 TLS。若还要公开 SOCKS5，同时设置独立的 `SOCKS_USER/SOCKS_PASS`。
+在 Railway 上部署时：
 
-## 排查指南
-
-### 页面/API 返回 `403 untrusted_host`
-
-当前没有启用管理认证，并且请求 Host 不是 localhost/loopback。使用宿主机发布的 `http://127.0.0.1:8080`；如果确实需要从反向代理、局域网或另一个容器访问，请启用 `ADMIN_USER/ADMIN_PASS`。
-
-### 翻页返回 `409 snapshot_changed`
-
-目录或影响筛选结果的健康状态在翻页期间改变。清除旧 `snapshot_id`，重新请求第 1 页。Proxy Atlas 会自动完成该恢复。
-
-### 操作返回 `429`
-
-测速、手动复检或 ProxyIP 验证达到并发上限。尊重 `Retry-After` 后重试，不要并发轰炸同一个节点。
-
-### 候选很多，可用节点很少
-
-候选只是来源声明的地址；只有实际通过当前 CheckURL 的节点才能成为可用代理。免费公开列表中大量地址过期是正常现象。
-
-### 某个国家显示总数很多但可用数为 0
-
-总数来自完整候选目录或已知库存，可用数来自当前真实健康状态。国家筛选不会把未验证或失败节点伪装成可用节点。
-
-### `partial` 或来源错误
-
-部分来源本轮超时/失败，成功来源已更新，失败来源上一次目录仍保留。这个保留状态会写入 `<data-dir>/candidate_catalog.v1.bin.gz`，所以容器普通重启后仍能恢复；下一轮会自动重试失败来源。只有数据卷被删除、缓存损坏/版本不兼容，或该来源从未成功抓取过时，启动后才没有可沿用的旧目录。大型来源单次抓取 30–40 秒属于正常范围，可结合刷新任务状态和来源错误判断，不要仅因等待时间较长就删除数据卷。
-
-### 测速没有结果
-
-测速会验证完整响应、拒绝重定向和不完整下载，并受 42 秒左右的任务预算约束。节点只通过轻量健康检查并不代表它能稳定完成测速文件下载。
+- 给 `/app/data` 挂载持久卷，否则重建实例会丢失本地状态；
+- 设置 `ADMIN_USER/ADMIN_PASS`，并只通过 HTTPS 使用管理面；
+- 若需要外部 SOCKS5，必须另行配置平台 TCP 入口，并设置独立的 `SOCKS_USER/SOCKS_PASS`；
+- 不要把公开 HTTP 域名当作 SOCKS5 入口。
 
 ## 开发与验证
-
-本机有 Go：
 
 ```bash
 gofmt -w *.go
 go test ./...
 go vet ./...
 go test -race ./...
+node --check web/dashboard.js
+docker compose config
+docker build -t socks5-pool-pro:test .
 ```
 
-只使用 Docker：
+没有本地 Go 时可使用构建镜像：
 
 ```bash
 docker run --rm -v "$PWD:/src" -w /src golang:1.26.5-alpine3.24 go test ./...
 docker run --rm -v "$PWD:/src" -w /src golang:1.26.5-alpine3.24 go vet ./...
 docker run --rm -v "$PWD:/src" -w /src golang:1.26.5-alpine3.24 \
   sh -c 'apk add --no-cache gcc musl-dev >/dev/null && CGO_ENABLED=1 go test -race ./...'
-docker build -t socks5-pool-pro:test .
 ```
 
-测试覆盖协议解析、SOCKS/HTTP 隧道、健康失败防抖、缓存权限、候选采样、分页快照、API 合同、认证/CSRF、来源 SSRF、ProxyIP 验证、测速、CSV 注入和响应式界面合同。
+测试覆盖来源解析与预算、SOCKS/HTTP 隧道、认证、健康失败防抖、凭据变体、缓存权限、候选采样与分页、API 合同、CSRF/SSRF、ProxyIP 验证、测速、优雅关闭和前端合同。
 
-## 项目结构
+## 主要文件
 
 ```text
-main.go                 抓取、检查、刷新任务与后台调度
-server.go               入站 SOCKS5 服务和分流
-dial.go                 SOCKS5/HTTP CONNECT 上游拨号
-pool.go                 节点池、健康统计、策略和持久化调度
-candidate_catalog.go    大候选目录、来源保留和快照分页
-candidatecache.go       候选目录压缩缓存、启动恢复与安全边界
+main.go                 刷新、抽样、健康任务与进程生命周期
 parser.go               来源抓取、SSRF 防护与格式解析
 checker.go              健康检查、出口 IP 与地理信息
-speedtest.go            严格按需测速
-manual_verify.go        手动节点复检
-proxyip_verify.go       ProxyIP 专用验证
-sourcestore.go          来源/规则/分组配置
-status.go               HTTP API、中间件与响应模型
-dashboard_html.go       Proxy Atlas 单文件管理前端
-compose.yaml            推荐本地部署
+pool.go                 已知转发池、健康状态、策略与持久化
+candidate_catalog.go    完整候选目录、last-good 合并与分页
+candidatecache.go       候选目录压缩缓存
+server.go               本地 SOCKS5 入口与规则路由
+dial.go                 SOCKS5/HTTP CONNECT 上游拨号
+status.go               管理 API、安全中间件与响应模型
+sourcestore.go          来源、规则、分组和检查目标配置
+speedtest.go            按需完整样本测速
+web/                    嵌入式 Proxy Atlas 前端
+compose.yaml            推荐的本地容器部署
 ```
 
 ## 已知边界
 
-- 免费来源质量和可用率会随时间剧烈变化，项目只能真实检测，不能让失效代理重新工作。
-- 内置大型来源合计接近五十万条时，一次完整刷新会短暂同时持有解析对象、去重结果和紧凑目录；实测峰值约 540 MiB。建议为容器预留至少 1 GiB 内存，小内存环境应减少或停用大型来源。
-- 未自带国家信息的节点依赖第三方地理查询；被限流时显示未知国家，但不会因此直接判定代理不可用。
-- `speed` 策略只有在节点完成过手动测速后才有可靠数据。
-- 旧 `/api/nodes` 会返回完整数组，大池场景应使用 `/api/nodes/page` 或 `/api/v1/proxies`。
-- 管理 API 中的代理 URL 可能携带上游凭据；即使有 `no-store`，也不应公开转发响应内容。
+- 免费代理列表变化快，候选多不等于健康节点多；项目只能检测和管理，不能修复失效上游。
+- 第三方出口 IP、地理信息、测速和 ProxyIP 验证服务都可能超时或限流；这些附加结果不应与基础健康状态混为一谈。
+- 全部健康节点的 `/api/status` 可能较大；新客户端应使用 `/api/v1/proxies`，界面轮询应使用 `compact=1`。
+- 管理 API、CSV 与池缓存可能含上游凭据；即使响应设置了 `no-store`，也不应公开转发或上传到不可信系统。
+- 大型来源仍会在解析和建立紧凑目录时占用显著内存。应按实际来源规模调整容器资源、启用来源数量和每轮检测预算，不要把默认值当作容量保证。

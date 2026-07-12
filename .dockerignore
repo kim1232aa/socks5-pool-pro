@@ -1,6 +1,9 @@
 .git
 .gitignore
 .gitattributes
+.env
+.env.*
+!.env.example
 data/
 tmp/
 temp/

@@ -7,6 +7,13 @@ import (
 	"strconv"
 )
 
+const maxCredentialAlternates = 8
+
+type ProxyCredential struct {
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 // Proxy represents a single upstream node, regardless of which source or
 // protocol it came from.
 type Proxy struct {
@@ -14,6 +21,11 @@ type Proxy struct {
 	Port     string
 	Username string
 	Password string
+	// CredentialAlternates retains a small bounded set of declarations for an
+	// endpoint advertised with different credentials. Candidate identity and
+	// health state remain endpoint-based, but validation can try every variant
+	// instead of discarding a working login before it is tested.
+	CredentialAlternates []ProxyCredential `json:"credential_alternates,omitempty"`
 
 	// Protocol is one of "socks5", "http", "https", or "proxyip".
 	// "proxyip" resources do not speak a generic proxy protocol (see parser.go)
@@ -33,6 +45,17 @@ type Proxy struct {
 	// SourceName remains the deterministic primary name for older API/UI
 	// consumers; source-aware routing should consult both fields.
 	SourceNames []string `json:"SourceNames,omitempty"`
+	// SourceIDs is the stable configured-source provenance used to retire a
+	// node from routing when every source that supplied it is disabled/deleted.
+	// Display names above remain user-facing and may be renamed or duplicated.
+	SourceIDs []string `json:"SourceIDs,omitempty"`
+	// SourceRetired prevents background rechecks from making a node routable
+	// after every source that supplied it has been disabled or deleted.
+	SourceRetired bool `json:"source_retired,omitempty"`
+	// Hard routing boundaries, distinct from an ordinary transient health
+	// failure that may use the historical all-unavailable fallback.
+	HealthInvalidated bool `json:"health_invalidated,omitempty"`
+	PolicyExcluded    bool `json:"policy_excluded,omitempty"`
 
 	// LatencyMs is the round-trip time observed during the last health
 	// check, in milliseconds. Zero if never measured.
@@ -118,6 +141,49 @@ func (p Proxy) urlWithScheme(scheme string) string {
 // another, so HTTP and SOCKS declarations must never share failure state.
 func (p Proxy) Key() string {
 	return p.Protocol + "://" + p.Addr()
+}
+
+func (p Proxy) credentialCandidates() []Proxy {
+	out := make([]Proxy, 0, 1+len(p.CredentialAlternates))
+	seen := make(map[ProxyCredential]bool, 1+len(p.CredentialAlternates))
+	appendCredential := func(credential ProxyCredential) {
+		if seen[credential] {
+			return
+		}
+		seen[credential] = true
+		candidate := p
+		candidate.Username = credential.Username
+		candidate.Password = credential.Password
+		out = append(out, candidate)
+	}
+	appendCredential(ProxyCredential{Username: p.Username, Password: p.Password})
+	for _, credential := range p.CredentialAlternates {
+		appendCredential(credential)
+	}
+	return out
+}
+
+func (p Proxy) promoteCredential(successful Proxy) Proxy {
+	oldPrimary := ProxyCredential{Username: p.Username, Password: p.Password}
+	newPrimary := ProxyCredential{Username: successful.Username, Password: successful.Password}
+	p.Username, p.Password = successful.Username, successful.Password
+	p.CredentialAlternates = nil
+	appendAlternative := func(credential ProxyCredential) {
+		if credential == newPrimary || len(p.CredentialAlternates) >= maxCredentialAlternates {
+			return
+		}
+		for _, existing := range p.CredentialAlternates {
+			if existing == credential {
+				return
+			}
+		}
+		p.CredentialAlternates = append(p.CredentialAlternates, credential)
+	}
+	appendAlternative(oldPrimary)
+	for _, credential := range successful.CredentialAlternates {
+		appendAlternative(credential)
+	}
+	return p
 }
 
 // parseProxyURL parses strings like "socks5://user:pass@1.2.3.4:1080" or

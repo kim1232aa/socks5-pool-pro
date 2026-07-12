@@ -50,7 +50,7 @@ func TestFetchSourceRetriesTemporaryFailureThenSucceeds(t *testing.T) {
 			http.Error(w, "temporary upstream failure", http.StatusServiceUnavailable)
 			return
 		}
-		_, _ = w.Write([]byte("198.51.100.10:8080\n"))
+		_, _ = w.Write([]byte("8.8.8.8:8080\n"))
 	}))
 	defer server.Close()
 
@@ -61,7 +61,7 @@ func TestFetchSourceRetriesTemporaryFailureThenSucceeds(t *testing.T) {
 	if got := attempts.Load(); got != 2 {
 		t.Fatalf("attempts = %d, want 2", got)
 	}
-	if len(proxies) != 1 || proxies[0].Key() != "http://198.51.100.10:8080" {
+	if len(proxies) != 1 || proxies[0].Key() != "http://8.8.8.8:8080" {
 		t.Fatalf("proxies = %#v, want the successful retry result", proxies)
 	}
 }
@@ -98,7 +98,7 @@ func TestFetchSourceRetriesTransientFyvriArchive404ThenSucceeds(t *testing.T) {
 			http.Error(w, "archive edge has not propagated", http.StatusNotFound)
 			return
 		}
-		_, _ = w.Write([]byte("198.51.100.11:8080\n"))
+		_, _ = w.Write([]byte("1.1.1.1:8080\n"))
 	}))
 	defer server.Close()
 
@@ -109,7 +109,7 @@ func TestFetchSourceRetriesTransientFyvriArchive404ThenSucceeds(t *testing.T) {
 	if got := attempts.Load(); got != 2 {
 		t.Fatalf("attempts = %d, want one bounded retry", got)
 	}
-	if len(proxies) != 1 || proxies[0].Addr() != "198.51.100.11:8080" {
+	if len(proxies) != 1 || proxies[0].Addr() != "1.1.1.1:8080" {
 		t.Fatalf("proxies = %#v, want successful retry result", proxies)
 	}
 }
@@ -143,7 +143,7 @@ func TestFetchSourceClosesEveryRetryResponseBody(t *testing.T) {
 		body := "temporary failure"
 		if attempt == 3 {
 			status = http.StatusOK
-			body = "198.51.100.12:8080\n"
+			body = "8.8.4.4:8080\n"
 		}
 		return &http.Response{
 			StatusCode: status,
@@ -206,7 +206,7 @@ func TestFetchSourceAllowsSlowResponseBodyWithinAttemptBudget(t *testing.T) {
 			flusher.Flush()
 		}
 		time.Sleep(80 * time.Millisecond)
-		_, _ = w.Write([]byte("198.51.100.13:8080\n"))
+		_, _ = w.Write([]byte("9.9.9.9:8080\n"))
 	}))
 	defer server.Close()
 

@@ -162,7 +162,7 @@ func TestFetchSourceUsesOriginalURLButLogsOnlyRedactedURL(t *testing.T) {
 		if got := r.URL.Query().Get("token"); got != token {
 			t.Errorf("fetch token = %q, want %q", got, token)
 		}
-		_, _ = w.Write([]byte("198.51.100.44:8080\n"))
+		_, _ = w.Write([]byte("8.8.8.8:8080\n"))
 	}))
 	defer server.Close()
 

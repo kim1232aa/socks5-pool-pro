@@ -4,19 +4,183 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// UpstreamErrorKind separates failures of the configured upstream itself from
+// target-specific refusals. A client asking for a closed or policy-blocked
+// destination must not globally mark an otherwise healthy proxy unavailable.
+type UpstreamErrorKind uint8
+
+const (
+	UpstreamErrorUnknown UpstreamErrorKind = iota
+	UpstreamErrorConnect
+	UpstreamErrorAuth
+	UpstreamErrorProtocol
+	UpstreamErrorTarget
+)
+
+// UpstreamError is returned by every failed DialUpstream handshake. Err stays
+// in the unwrap chain so context cancellation/deadline checks remain intact.
+type UpstreamError struct {
+	Kind UpstreamErrorKind
+	Op   string
+	Err  error
+}
+
+func (e *UpstreamError) Error() string {
+	if e == nil {
+		return "upstream error"
+	}
+	if e.Op == "" {
+		return fmt.Sprint(e.Err)
+	}
+	return fmt.Sprintf("%s: %v", e.Op, e.Err)
+}
+
+func (e *UpstreamError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func newUpstreamError(kind UpstreamErrorKind, op string, err error) error {
+	if err == nil {
+		err = fmt.Errorf("upstream operation failed")
+	}
+	return &UpstreamError{Kind: kind, Op: op, Err: err}
+}
+
+// upstreamFailureAffectsHealth reports whether the proxy endpoint itself is at
+// fault. Unknown errors fail safe: they affect only the current client request.
+func upstreamFailureAffectsHealth(err error) bool {
+	var upstreamErr *UpstreamError
+	if !errors.As(err, &upstreamErr) {
+		return false
+	}
+	switch upstreamErr.Kind {
+	case UpstreamErrorConnect, UpstreamErrorAuth, UpstreamErrorProtocol:
+		return true
+	default:
+		return false
+	}
+}
+
+func isUpstreamAuthenticationFailure(err error) bool {
+	var upstreamErr *UpstreamError
+	return errors.As(err, &upstreamErr) && upstreamErr.Kind == UpstreamErrorAuth
+}
 
 // DialUpstream establishes a raw tunnel to target through the given upstream
 // proxy. It preserves the historical timeout-only API for callers that do not
 // have a request context.
 func DialUpstream(px Proxy, target string, timeout time.Duration) (net.Conn, error) {
 	return DialUpstreamContext(context.Background(), px, target, timeout)
+}
+
+type upstreamCredentialDialAttempt func(context.Context, Proxy, string, time.Duration) (net.Conn, error)
+
+// DialUpstreamCredentialCandidatesContext retries the bounded credential set
+// only after a definitive upstream-authentication failure. Connection,
+// protocol, cancellation, and target-specific failures stop immediately: a
+// different password cannot repair those conditions and blindly traversing
+// every declaration would multiply latency and load.
+//
+// All attempts share one deadline. Dividing the remaining time by the number
+// of declarations left prevents a stalled authentication exchange from
+// starving a later valid credential. The successful declaration is promoted
+// in the returned Proxy; callers that own a ProxyPool can persist it with
+// UpdateVerifiedCredentialsAtGeneration.
+func DialUpstreamCredentialCandidatesContext(parent context.Context, px Proxy, target string, timeout time.Duration) (net.Conn, Proxy, error) {
+	return dialUpstreamCredentialCandidatesContext(parent, px, target, timeout, DialUpstreamContext)
+}
+
+func dialUpstreamCredentialCandidatesContext(parent context.Context, px Proxy, target string, timeout time.Duration, attempt upstreamCredentialDialAttempt) (net.Conn, Proxy, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeout <= 0 {
+		return nil, px, newUpstreamError(UpstreamErrorProtocol, "select credential budget", fmt.Errorf("credential retry timeout must be positive"))
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	candidates := px.credentialCandidates()
+	var lastErr error
+	for index, candidate := range candidates {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if lastErr != nil {
+				return nil, px, lastErr
+			}
+			return nil, px, ctxErr
+		}
+		attemptsLeft := len(candidates) - index
+		attemptBudget := time.Until(deadline) / time.Duration(attemptsLeft)
+		if attemptBudget <= 0 {
+			break
+		}
+		attemptContext, cancelAttempt := context.WithTimeout(ctx, attemptBudget)
+		conn, err := attempt(attemptContext, candidate, target, attemptBudget)
+		cancelAttempt()
+		if err == nil {
+			return conn, px.promoteCredential(candidate), nil
+		}
+		lastErr = err
+		if !isUpstreamAuthenticationFailure(err) {
+			return nil, px, err
+		}
+	}
+	if lastErr != nil {
+		return nil, px, lastErr
+	}
+	return nil, px, context.DeadlineExceeded
+}
+
+// credentialCandidateDialer adapts the retry helper to net/http.Transport and
+// remembers which declaration established the tunnel. It is safe for the
+// transport to invoke DialContext concurrently, even though current health and
+// speed requests normally need only one connection.
+type credentialCandidateDialer struct {
+	proxy   Proxy
+	timeout time.Duration
+
+	mu       sync.Mutex
+	verified Proxy
+	found    bool
+}
+
+func newCredentialCandidateDialer(px Proxy, timeout time.Duration) *credentialCandidateDialer {
+	return &credentialCandidateDialer{proxy: px, timeout: timeout}
+}
+
+func (d *credentialCandidateDialer) DialContext(ctx context.Context, _, target string) (net.Conn, error) {
+	conn, verified, err := DialUpstreamCredentialCandidatesContext(ctx, d.proxy, target, d.timeout)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	d.verified = verified
+	d.found = true
+	d.mu.Unlock()
+	return conn, nil
+}
+
+func (d *credentialCandidateDialer) Verified() (Proxy, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.found {
+		return Proxy{}, false
+	}
+	return cloneProxy(d.verified), true
 }
 
 // DialUpstreamContext is the cancellation-aware form. Context cancellation
@@ -38,13 +202,49 @@ func DialUpstreamContext(parent context.Context, px Proxy, target string, timeou
 	defer cancel()
 
 	switch px.Protocol {
+	case "socks5", "http", "https":
+		// Valid forwarding protocol; validate the authority below before putting it
+		// on either a length-framed SOCKS request or a text HTTP CONNECT request.
+	default:
+		return nil, newUpstreamError(UpstreamErrorProtocol, "select upstream protocol", fmt.Errorf("protocol %q cannot be used as a forwarding upstream", px.Protocol))
+	}
+	if err := validateUpstreamTarget(target); err != nil {
+		return nil, newUpstreamError(UpstreamErrorTarget, "validate target", err)
+	}
+
+	switch px.Protocol {
 	case "socks5":
 		return dialSOCKS5Context(ctx, px, target)
 	case "http", "https":
 		return dialHTTPConnectContext(ctx, px, target)
-	default:
-		return nil, fmt.Errorf("protocol %q cannot be used as a forwarding upstream", px.Protocol)
 	}
+	return nil, newUpstreamError(UpstreamErrorProtocol, "select upstream protocol", fmt.Errorf("protocol %q cannot be used as a forwarding upstream", px.Protocol))
+}
+
+func validateUpstreamTarget(target string) error {
+	if strings.TrimSpace(target) != target {
+		return fmt.Errorf("target contains surrounding whitespace")
+	}
+	host, rawPort, err := net.SplitHostPort(target)
+	if err != nil || host == "" {
+		return fmt.Errorf("target must be a host:port authority")
+	}
+	if rawPort == "" {
+		return fmt.Errorf("target port must be between 1 and 65535")
+	}
+	for _, char := range rawPort {
+		if char < '0' || char > '9' {
+			return fmt.Errorf("target port must contain decimal digits only")
+		}
+	}
+	port, err := strconv.ParseUint(rawPort, 10, 16)
+	if err != nil || port == 0 {
+		return fmt.Errorf("target port must be between 1 and 65535")
+	}
+	if ip := net.ParseIP(host); ip == nil && !validProxyHostname(host) {
+		return fmt.Errorf("target host is not a valid IP address or DNS name")
+	}
+	return nil
 }
 
 func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error) {
@@ -54,7 +254,7 @@ func dialSOCKS5(px Proxy, target string, timeout time.Duration) (net.Conn, error
 func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net.Conn, err error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", px.Addr())
 	if err != nil {
-		return nil, err
+		return nil, newUpstreamError(UpstreamErrorConnect, "connect to SOCKS5 upstream", err)
 	}
 	stopCancellationWatch := watchUpstreamHandshake(ctx, conn)
 	watchStopped := false
@@ -74,15 +274,15 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	}
 	greeting := append([]byte{socks5Version, byte(len(methods))}, methods...)
 	if _, writeErr := conn.Write(greeting); writeErr != nil {
-		return nil, upstreamHandshakeError(ctx, writeErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "write SOCKS5 greeting", upstreamHandshakeError(ctx, writeErr))
 	}
 
 	buf := make([]byte, 2)
 	if _, readErr := io.ReadFull(conn, buf); readErr != nil {
-		return nil, upstreamHandshakeError(ctx, readErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 method", upstreamHandshakeError(ctx, readErr))
 	}
 	if buf[0] != socks5Version {
-		return nil, fmt.Errorf("not socks5")
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 method", fmt.Errorf("unexpected version %d", buf[0]))
 	}
 
 	switch buf[1] {
@@ -90,36 +290,43 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 		// no auth required
 	case 0x02:
 		if px.Username == "" {
-			return nil, fmt.Errorf("upstream requires auth, none configured")
+			return nil, newUpstreamError(UpstreamErrorAuth, "authenticate SOCKS5 upstream", fmt.Errorf("upstream requires auth, none configured"))
+		}
+		if len(px.Username) > 255 || len(px.Password) > 255 {
+			return nil, newUpstreamError(UpstreamErrorAuth, "authenticate SOCKS5 upstream", fmt.Errorf("upstream credentials exceed 255 bytes"))
 		}
 		authReq := []byte{0x01, byte(len(px.Username))}
 		authReq = append(authReq, []byte(px.Username)...)
 		authReq = append(authReq, byte(len(px.Password)))
 		authReq = append(authReq, []byte(px.Password)...)
 		if _, writeErr := conn.Write(authReq); writeErr != nil {
-			return nil, upstreamHandshakeError(ctx, writeErr)
+			return nil, newUpstreamError(UpstreamErrorAuth, "write SOCKS5 authentication", upstreamHandshakeError(ctx, writeErr))
 		}
 		authResp := make([]byte, 2)
 		if _, readErr := io.ReadFull(conn, authResp); readErr != nil {
-			return nil, upstreamHandshakeError(ctx, readErr)
+			return nil, newUpstreamError(UpstreamErrorAuth, "read SOCKS5 authentication", upstreamHandshakeError(ctx, readErr))
+		}
+		if authResp[0] != socks5AuthVersion {
+			return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 authentication", fmt.Errorf("unexpected authentication version %d", authResp[0]))
 		}
 		if authResp[1] != 0x00 {
-			return nil, fmt.Errorf("upstream rejected auth")
+			return nil, newUpstreamError(UpstreamErrorAuth, "authenticate SOCKS5 upstream", fmt.Errorf("upstream rejected auth"))
 		}
 	case 0xFF:
-		return nil, fmt.Errorf("upstream has no acceptable auth method")
+		return nil, newUpstreamError(UpstreamErrorAuth, "authenticate SOCKS5 upstream", fmt.Errorf("upstream has no acceptable auth method"))
 	default:
-		return nil, fmt.Errorf("unsupported auth method: %d", buf[1])
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 method", fmt.Errorf("unsupported auth method: %d", buf[1]))
 	}
 
 	host, portStr, splitErr := net.SplitHostPort(target)
 	if splitErr != nil {
-		return nil, splitErr
+		return nil, newUpstreamError(UpstreamErrorTarget, "parse SOCKS5 target", splitErr)
 	}
-	var port int
-	if _, scanErr := fmt.Sscanf(portStr, "%d", &port); scanErr != nil {
-		return nil, scanErr
+	parsedPort, scanErr := strconv.ParseUint(portStr, 10, 16)
+	if scanErr != nil || parsedPort == 0 {
+		return nil, newUpstreamError(UpstreamErrorTarget, "parse SOCKS5 target", fmt.Errorf("invalid target port"))
 	}
+	port := int(parsedPort)
 
 	req := []byte{socks5Version, cmdConnect, 0x00}
 	if ip := net.ParseIP(host); ip != nil {
@@ -136,7 +343,7 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	}
 	req = append(req, byte(port>>8), byte(port&0xff))
 	if _, writeErr := conn.Write(req); writeErr != nil {
-		return nil, upstreamHandshakeError(ctx, writeErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "write SOCKS5 CONNECT", upstreamHandshakeError(ctx, writeErr))
 	}
 
 	// The CONNECT reply length depends on ATYP. Read the fixed header first,
@@ -144,10 +351,13 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	// the returned tunnel.
 	header := make([]byte, 4)
 	if _, readErr := io.ReadFull(conn, header); readErr != nil {
-		return nil, upstreamHandshakeError(ctx, readErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 CONNECT reply", upstreamHandshakeError(ctx, readErr))
+	}
+	if header[0] != socks5Version || header[2] != 0x00 {
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 CONNECT reply", fmt.Errorf("malformed reply header"))
 	}
 	if header[1] != 0x00 {
-		return nil, fmt.Errorf("upstream connect failed, status: %d", header[1])
+		return nil, newUpstreamError(UpstreamErrorTarget, "connect SOCKS5 target", fmt.Errorf("upstream status %d", header[1]))
 	}
 
 	var addrLen int
@@ -159,14 +369,14 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	case atypDomain:
 		lenByte := make([]byte, 1)
 		if _, readErr := io.ReadFull(conn, lenByte); readErr != nil {
-			return nil, upstreamHandshakeError(ctx, readErr)
+			return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 CONNECT reply", upstreamHandshakeError(ctx, readErr))
 		}
 		addrLen = int(lenByte[0])
 	default:
-		return nil, fmt.Errorf("upstream connect reply: unknown address type %d", header[3])
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 CONNECT reply", fmt.Errorf("unknown address type %d", header[3]))
 	}
 	if _, readErr := io.ReadFull(conn, make([]byte, addrLen+2)); readErr != nil {
-		return nil, upstreamHandshakeError(ctx, readErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 CONNECT reply", upstreamHandshakeError(ctx, readErr))
 	}
 	// Stop and join the watcher before the final context check. Once joined,
 	// cancellation cannot race with a successful return and close a tunnel
@@ -174,7 +384,7 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	stopCancellationWatch()
 	watchStopped = true
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		return nil, newUpstreamError(UpstreamErrorProtocol, "complete SOCKS5 handshake", ctxErr)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
@@ -191,7 +401,7 @@ func dialHTTPConnect(px Proxy, target string, timeout time.Duration) (net.Conn, 
 func dialHTTPConnectContext(ctx context.Context, px Proxy, target string) (result net.Conn, err error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", px.Addr())
 	if err != nil {
-		return nil, err
+		return nil, newUpstreamError(UpstreamErrorConnect, "connect to HTTP upstream", err)
 	}
 	stopCancellationWatch := watchUpstreamHandshake(ctx, conn)
 	watchStopped := false
@@ -213,7 +423,7 @@ func dialHTTPConnectContext(ctx context.Context, px Proxy, target string) (resul
 	}
 	sb.WriteString("\r\n")
 	if _, writeErr := conn.Write([]byte(sb.String())); writeErr != nil {
-		return nil, upstreamHandshakeError(ctx, writeErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "write HTTP CONNECT", upstreamHandshakeError(ctx, writeErr))
 	}
 
 	// bufio.Reader may buffer tunneled bytes following the CONNECT response.
@@ -221,17 +431,21 @@ func dialHTTPConnectContext(ctx context.Context, px Proxy, target string) (resul
 	br := bufio.NewReader(conn)
 	resp, readErr := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if readErr != nil {
-		return nil, upstreamHandshakeError(ctx, readErr)
+		return nil, newUpstreamError(UpstreamErrorProtocol, "read HTTP CONNECT response", upstreamHandshakeError(ctx, readErr))
 	}
 	_ = resp.Body.Close()
 	// RFC 9110 defines any 2xx response as a successful CONNECT tunnel.
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("upstream CONNECT failed: %s", resp.Status)
+		kind := UpstreamErrorTarget
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			kind = UpstreamErrorAuth
+		}
+		return nil, newUpstreamError(kind, "connect HTTP target", fmt.Errorf("upstream CONNECT failed: %s", resp.Status))
 	}
 	stopCancellationWatch()
 	watchStopped = true
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		return nil, newUpstreamError(UpstreamErrorProtocol, "complete HTTP CONNECT handshake", ctxErr)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return &bufConn{Conn: conn, r: br}, nil
@@ -281,4 +495,18 @@ type bufConn struct {
 
 func (b *bufConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
+}
+
+func (b *bufConn) CloseWrite() error {
+	if conn, ok := b.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return fmt.Errorf("underlying connection does not support CloseWrite")
+}
+
+func (b *bufConn) CloseRead() error {
+	if conn, ok := b.Conn.(interface{ CloseRead() error }); ok {
+		return conn.CloseRead()
+	}
+	return fmt.Errorf("underlying connection does not support CloseRead")
 }

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,14 +19,23 @@ import (
 // their own via the dashboard - Google's connectivity-check endpoint,
 // chosen because it's free of the rate limits a heavier destination (or
 // one the user later points at, e.g. an app's own homepage) might impose
-// under hundreds of concurrent probes.
-const defaultCheckURL = "http://www.google.com/generate_204"
+// under hundreds of concurrent probes. HTTPS prevents a transparent HTTP
+// intermediary from manufacturing the default probe response. The one exact
+// HTTP URL shipped as the historical default is migrated below; arbitrary
+// operator-saved HTTP targets remain valid and are preserved.
+const defaultCheckURL = "https://www.google.com/generate_204"
+const legacyDefaultCheckURL = "http://www.google.com/generate_204"
 
 const (
 	builtinProxyIPSourceID = "builtin-proxyip"
 	maxConfiguredSources   = 64
 	maxSourceNameBytes     = 256
 	maxSourceURLBytes      = 8 << 10
+	maxPoolConfigBytes     = 8 << 20
+	maxConfigRules         = 4096
+	maxConfigGroups        = 1024
+	maxConfigListValues    = 4096
+	maxConfigValueBytes    = 8 << 10
 
 	legacyProxyIPSourceName = "ProxyIP (Cloudflare edge)"
 	legacyProxyIPSourceNote = "这些是 Cloudflare 边缘优选 IP，用于 Worker/VLESS/Trojan 类隧道脚本的反代地址，不支持通用 SOCKS5/HTTP 协议，不会参与本地转发，仅供查看和导出使用"
@@ -56,9 +68,14 @@ type Source struct {
 	// AllowPrivate is an explicit escape hatch for trusted LAN-hosted feeds.
 	// It affects only the source download URL; proxy endpoints advertised by a
 	// feed are not removed or rewritten by this setting.
-	AllowPrivate bool   `json:"allow_private,omitempty"`
-	Builtin      bool   `json:"builtin"`
-	Note         string `json:"note,omitempty"`
+	AllowPrivate bool `json:"allow_private,omitempty"`
+	// AllowEmpty makes an HTTP 200 response containing no valid proxy records an
+	// authoritative empty inventory. It is deliberately opt-in: by default an
+	// unexpectedly empty feed is treated as a failed refresh so its last-known
+	// good candidates remain available.
+	AllowEmpty bool   `json:"allow_empty,omitempty"`
+	Builtin    bool   `json:"builtin"`
+	Note       string `json:"note,omitempty"`
 }
 
 // PoolConfig is the full persisted state: sources, routing rules, custom
@@ -68,12 +85,180 @@ type PoolConfig struct {
 	Rules   []Rule   `json:"rules"`
 	Groups  []Group  `json:"groups"`
 	// CheckURL is the sole criterion for "is this node alive": every
-	// candidate is dialed through and this URL is fetched - a node is
-	// alive if it gets any HTTP response back. Empty means defaultCheckURL
-	// (see CheckURL()). User-settable from the dashboard so "alive" can
-	// mean whatever the user actually cares about reaching (their own
-	// app's URL, a specific streaming service, etc.), not just Google.
+	// candidate is dialed through and this URL is fetched without following
+	// redirects. The built-in default must return exactly 204; a custom target
+	// must return a 2xx response. Empty means defaultCheckURL (see CheckURL()).
+	// User-settable from the dashboard so "alive" can mean whatever the user
+	// actually cares about reaching, not just Google.
 	CheckURL string `json:"check_url,omitempty"`
+}
+
+// UnmarshalJSON bounds the top-level collections while they are decoded. A
+// byte cap alone is insufficient because a few MiB of compact `{}`/`""`
+// records can expand into much larger Go slices before post-parse validation.
+func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("pool config must be an object")
+	}
+	var out PoolConfig
+	seen := make(map[string]bool, 4)
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return fmt.Errorf("pool config field is not a string")
+		}
+		if seen[field] {
+			return fmt.Errorf("duplicate pool config field %q", field)
+		}
+		seen[field] = true
+		switch field {
+		case "sources":
+			out.Sources, err = decodeBoundedJSONArray[Source](decoder, maxConfiguredSources)
+		case "rules":
+			out.Rules, err = decodeBoundedJSONArray[Rule](decoder, maxConfigRules)
+		case "groups":
+			out.Groups, err = decodeBoundedJSONArray[Group](decoder, maxConfigGroups)
+		case "check_url":
+			err = decoder.Decode(&out.CheckURL)
+		default:
+			err = skipJSONValue(decoder)
+		}
+		if err != nil {
+			return fmt.Errorf("pool config field %q: %w", field, err)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return err
+	}
+	*cfg = out
+	return nil
+}
+
+func decodeBoundedJSONArray[T any](decoder *json.Decoder, limit int) ([]T, error) {
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if opening == nil {
+		return nil, nil
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '[' {
+		return nil, fmt.Errorf("expected an array")
+	}
+	out := make([]T, 0)
+	for decoder.More() {
+		if len(out) >= limit {
+			return nil, fmt.Errorf("array exceeds %d entries", limit)
+		}
+		var value T
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (group *Group) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("group must be an object")
+	}
+	var out Group
+	seen := make(map[string]bool, 7)
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return fmt.Errorf("group field is not a string")
+		}
+		if seen[field] {
+			return fmt.Errorf("duplicate group field %q", field)
+		}
+		seen[field] = true
+		switch field {
+		case "id":
+			err = decoder.Decode(&out.ID)
+		case "name":
+			err = decoder.Decode(&out.Name)
+		case "strategy":
+			err = decoder.Decode(&out.Strategy)
+		case "countries":
+			out.Countries, err = decodeBoundedJSONStringArray(decoder)
+		case "protocols":
+			out.Protocols, err = decodeBoundedJSONStringArray(decoder)
+		case "sources":
+			out.Sources, err = decodeBoundedJSONStringArray(decoder)
+		case "nodes":
+			out.Nodes, err = decodeBoundedJSONStringArray(decoder)
+		default:
+			err = fmt.Errorf("unknown group field %q", field)
+		}
+		if err != nil {
+			return fmt.Errorf("group field %q: %w", field, err)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return err
+	}
+	*group = out
+	return nil
+}
+
+func decodeBoundedJSONStringArray(decoder *json.Decoder) ([]string, error) {
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if opening == nil {
+		return nil, nil
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '[' {
+		return nil, fmt.Errorf("expected an array")
+	}
+	out := make([]string, 0)
+	for decoder.More() {
+		if len(out) >= maxConfigListValues {
+			return nil, fmt.Errorf("array exceeds %d entries", maxConfigListValues)
+		}
+		var value string
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
+			return nil, fmt.Errorf("array value exceeds limits or contains control characters")
+		}
+		out = append(out, value)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ConfigStore persists PoolConfig to a JSON file on disk, guarding all
@@ -84,13 +269,38 @@ type ConfigStore struct {
 	cfg  PoolConfig
 }
 
+// ConfigPersistenceError marks a failure after a validated configuration has
+// reached the filesystem write/rename/fsync stage. API handlers can use
+// errors.As to distinguish an internal durability failure (HTTP 500) from
+// validation and business-conflict errors (HTTP 400/409).
+type ConfigPersistenceError struct {
+	Err error
+}
+
+func (e *ConfigPersistenceError) Error() string {
+	if e == nil || e.Err == nil {
+		return "persist configuration"
+	}
+	return "persist configuration: " + e.Err.Error()
+}
+
+func (e *ConfigPersistenceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 func NewConfigStore(dataDir string) (*ConfigStore, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("secure data dir: %w", err)
+	}
 	cs := &ConfigStore{path: filepath.Join(dataDir, "pool_config.json")}
 
-	data, err := os.ReadFile(cs.path)
+	data, err := readPrivateRegularFile(cs.path, maxPoolConfigBytes)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("read config: %w", err)
@@ -106,8 +316,16 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if err := validatePersistedPoolConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("validate config: %w", err)
+	}
 	cs.cfg = cfg
-	if migrateProxyIPSourceMetadata(&cs.cfg) {
+	migrated := migrateProxyIPSourceMetadata(&cs.cfg)
+	if cs.cfg.CheckURL == legacyDefaultCheckURL {
+		cs.cfg.CheckURL = defaultCheckURL
+		migrated = true
+	}
+	if migrated {
 		if err := cs.writeLocked(); err != nil {
 			return nil, fmt.Errorf("persist source metadata migration: %w", err)
 		}
@@ -258,41 +476,51 @@ func defaultPoolConfig() PoolConfig {
 }
 
 func (cs *ConfigStore) writeLocked() error {
-	data, err := json.MarshalIndent(cs.cfg, "", "  ")
+	return cs.writeConfigLocked(cs.cfg)
+}
+
+func (cs *ConfigStore) writeConfigLocked(cfg PoolConfig) error {
+	if err := validatePersistedPoolConfig(&cfg); err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := cs.path + ".tmp"
-	// Source definitions and future custom upstreams can include credentials;
-	// keep the persisted configuration private to the service account.
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	if len(data) > maxPoolConfigBytes {
+		return fmt.Errorf("pool config exceeds %d bytes", maxPoolConfigBytes)
 	}
-	return os.Rename(tmp, cs.path)
+	if err := writePrivateFileAtomic(cs.path, data); err != nil {
+		return &ConfigPersistenceError{Err: err}
+	}
+	return nil
 }
 
 // mutate runs fn with exclusive access to the config, then persists it.
 func (cs *ConfigStore) mutate(fn func(*PoolConfig) error) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if err := fn(&cs.cfg); err != nil {
+	next := clonePoolConfig(cs.cfg)
+	if err := fn(&next); err != nil {
 		return err
 	}
-	return cs.writeLocked()
+	// Validation also applies harmless canonicalization (trimmed URLs/names and
+	// lower-case formats/protocols). Do it on the copy that will become live so
+	// memory and the bytes written by writeConfigLocked cannot diverge.
+	if err := validatePersistedPoolConfig(&next); err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
+	if err := cs.writeConfigLocked(next); err != nil {
+		return err
+	}
+	cs.cfg = next
+	return nil
 }
 
 func (cs *ConfigStore) Snapshot() PoolConfig {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	out := PoolConfig{
-		Sources: make([]Source, len(cs.cfg.Sources)),
-		Rules:   make([]Rule, len(cs.cfg.Rules)),
-		Groups:  make([]Group, len(cs.cfg.Groups)),
-	}
-	copy(out.Sources, cs.cfg.Sources)
-	copy(out.Rules, cs.cfg.Rules)
-	copy(out.Groups, cs.cfg.Groups)
-	return out
+	return clonePoolConfig(cs.cfg)
 }
 
 func (cs *ConfigStore) Sources() []Source {
@@ -314,35 +542,16 @@ func (cs *ConfigStore) EnabledSources() []Source {
 }
 
 func (cs *ConfigStore) AddSource(s Source) (Source, error) {
-	s.Name = strings.TrimSpace(s.Name)
-	s.URL = strings.TrimSpace(s.URL)
-	s.Protocol = strings.ToLower(strings.TrimSpace(s.Protocol))
-	if s.Name == "" || s.URL == "" {
-		return Source{}, fmt.Errorf("name and url are required")
-	}
-	if len(s.Name) > maxSourceNameBytes || hasLogControlCharacters(s.Name) {
-		return Source{}, fmt.Errorf("source name must be at most %d bytes and contain no control characters", maxSourceNameBytes)
-	}
-	if len(s.URL) > maxSourceURLBytes {
-		return Source{}, fmt.Errorf("source url exceeds %d bytes", maxSourceURLBytes)
-	}
-	if _, err := validateSourceURL(s.URL, s.AllowPrivate); err != nil {
+	validated, err := validateSourceDefinition(s)
+	if err != nil {
 		return Source{}, err
 	}
-	switch s.Format {
-	case FormatTextRegex, FormatEDTJSON, FormatProxyIPJSON:
-	case FormatPlainList, FormatJSONArray:
-		if !isForwardingProtocol(s.Protocol) {
-			return Source{}, fmt.Errorf("format %q requires protocol socks5, http, or https", s.Format)
-		}
-	default:
-		return Source{}, fmt.Errorf("unknown format: %q", s.Format)
-	}
+	s = validated
 	s.ID = generateID("src")
 	s.Builtin = false
 	s.Enabled = true // a source you just added is one you want to use now
 
-	err := cs.mutate(func(c *PoolConfig) error {
+	err = cs.mutate(func(c *PoolConfig) error {
 		if len(c.Sources) >= maxConfiguredSources {
 			return fmt.Errorf("source limit reached: at most %d sources are allowed", maxConfiguredSources)
 		}
@@ -397,25 +606,8 @@ func (cs *ConfigStore) CheckURL() string {
 // applies immediately rather than waiting for the next scheduled scrape.
 func (cs *ConfigStore) SetCheckURL(raw string) error {
 	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return fmt.Errorf("url is required")
-	}
-	if len(raw) > maxSourceURLBytes {
-		return fmt.Errorf("url exceeds %d bytes", maxSourceURLBytes)
-	}
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("invalid url: must be a full http:// or https:// address")
-	}
-	// Health checks are sent through untrusted public proxies and the configured
-	// target is mentioned in operational diagnostics. Do not accept credentials
-	// in userinfo or a never-transmitted fragment where they are easy to leak or
-	// misunderstand. Query parameters remain supported for compatibility.
-	if u.User != nil {
-		return fmt.Errorf("invalid url: embedded username/password is not allowed")
-	}
-	if u.Fragment != "" {
-		return fmt.Errorf("invalid url: fragments are not allowed")
+	if err := validateCheckURL(raw); err != nil {
+		return err
 	}
 	return cs.mutate(func(c *PoolConfig) error {
 		c.CheckURL = raw
@@ -430,6 +622,235 @@ func hasLogControlCharacters(value string) bool {
 		}
 	}
 	return false
+}
+
+func clonePoolConfig(cfg PoolConfig) PoolConfig {
+	out := PoolConfig{
+		Sources:  append([]Source(nil), cfg.Sources...),
+		Rules:    append([]Rule(nil), cfg.Rules...),
+		Groups:   make([]Group, len(cfg.Groups)),
+		CheckURL: cfg.CheckURL,
+	}
+	for i, group := range cfg.Groups {
+		out.Groups[i] = cloneGroup(group)
+	}
+	return out
+}
+
+func cloneGroup(group Group) Group {
+	group.Countries = append([]string(nil), group.Countries...)
+	group.Protocols = append([]string(nil), group.Protocols...)
+	group.Sources = append([]string(nil), group.Sources...)
+	group.Nodes = append([]string(nil), group.Nodes...)
+	return group
+}
+
+func validatePersistedPoolConfig(cfg *PoolConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	if len(cfg.Sources) > maxConfiguredSources {
+		return fmt.Errorf("source count %d exceeds limit %d", len(cfg.Sources), maxConfiguredSources)
+	}
+	seenIDs := make(map[string]struct{}, len(cfg.Sources))
+	for i, source := range cfg.Sources {
+		if strings.TrimSpace(source.ID) == "" || source.ID != strings.TrimSpace(source.ID) || len(source.ID) > maxConfigValueBytes || hasLogControlCharacters(source.ID) {
+			return fmt.Errorf("source %d has an invalid id", i)
+		}
+		if _, exists := seenIDs[source.ID]; exists {
+			return fmt.Errorf("source %d has duplicate id %q", i, source.ID)
+		}
+		seenIDs[source.ID] = struct{}{}
+		normalized, err := validateSourceDefinition(source)
+		if err != nil {
+			return fmt.Errorf("source %d: %w", i, err)
+		}
+		cfg.Sources[i] = normalized
+		if len(source.Note) > maxConfigValueBytes || hasLogControlCharacters(source.Note) {
+			return fmt.Errorf("source %d note exceeds limits or contains control characters", i)
+		}
+	}
+	if len(cfg.Rules) > maxConfigRules {
+		return fmt.Errorf("rule count %d exceeds limit %d", len(cfg.Rules), maxConfigRules)
+	}
+	for i, rule := range cfg.Rules {
+		for _, value := range []string{rule.ID, rule.Type, rule.Value, rule.Group} {
+			if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
+				return fmt.Errorf("rule %d contains an oversized or control-character value", i)
+			}
+		}
+	}
+	if len(cfg.Groups) > maxConfigGroups {
+		return fmt.Errorf("group count %d exceeds limit %d", len(cfg.Groups), maxConfigGroups)
+	}
+	for i, group := range cfg.Groups {
+		for _, value := range []string{group.ID, group.Name, group.Strategy} {
+			if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
+				return fmt.Errorf("group %d contains an oversized or control-character value", i)
+			}
+		}
+		for _, values := range [][]string{group.Countries, group.Protocols, group.Sources, group.Nodes} {
+			if len(values) > maxConfigListValues {
+				return fmt.Errorf("group %d list exceeds %d entries", i, maxConfigListValues)
+			}
+			for _, value := range values {
+				if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
+					return fmt.Errorf("group %d list contains an oversized or control-character value", i)
+				}
+			}
+		}
+	}
+	if cfg.CheckURL != "" {
+		cfg.CheckURL = strings.TrimSpace(cfg.CheckURL)
+		if err := validateCheckURL(cfg.CheckURL); err != nil {
+			return fmt.Errorf("check url: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateSourceDefinition(source Source) (Source, error) {
+	source.Name = strings.TrimSpace(source.Name)
+	source.URL = strings.TrimSpace(source.URL)
+	source.Format = strings.ToLower(strings.TrimSpace(source.Format))
+	source.Protocol = strings.ToLower(strings.TrimSpace(source.Protocol))
+	if source.Name == "" || source.URL == "" {
+		return Source{}, fmt.Errorf("name and url are required")
+	}
+	if len(source.Name) > maxSourceNameBytes || hasLogControlCharacters(source.Name) {
+		return Source{}, fmt.Errorf("source name must be at most %d bytes and contain no control characters", maxSourceNameBytes)
+	}
+	if len(source.URL) > maxSourceURLBytes {
+		return Source{}, fmt.Errorf("source url exceeds %d bytes", maxSourceURLBytes)
+	}
+	if _, err := validateSourceURL(source.URL, source.AllowPrivate); err != nil {
+		return Source{}, err
+	}
+	switch source.Format {
+	case FormatTextRegex, FormatEDTJSON, FormatProxyIPJSON:
+	case FormatPlainList, FormatJSONArray:
+		if !isForwardingProtocol(source.Protocol) {
+			return Source{}, fmt.Errorf("format %q requires protocol socks5, http, or https", source.Format)
+		}
+	default:
+		return Source{}, fmt.Errorf("unknown format: %q", source.Format)
+	}
+	return source, nil
+}
+
+func validateCheckURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Errorf("url is required")
+	}
+	if len(raw) > maxSourceURLBytes {
+		return fmt.Errorf("url exceeds %d bytes", maxSourceURLBytes)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("invalid url: must be a full http:// or https:// address")
+	}
+	if u.User != nil {
+		return fmt.Errorf("invalid url: embedded username/password is not allowed")
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("invalid url: fragments are not allowed")
+	}
+	if port := u.Port(); port != "" {
+		value, portErr := strconv.ParseUint(port, 10, 16)
+		if portErr != nil || value == 0 {
+			return fmt.Errorf("invalid url: port must be between 1 and 65535")
+		}
+	}
+	return nil
+}
+
+// readPrivateRegularFile treats persisted state as untrusted input. It rejects
+// symlinks and special files, re-checks the opened descriptor to close the
+// Lstat/Open race, applies a hard byte cap, and repairs legacy permissive modes.
+func readPrivateRegularFile(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", filepath.Base(path))
+	}
+	if info.Size() < 0 || info.Size() > maxBytes {
+		return nil, fmt.Errorf("%s size %d exceeds limit %d", filepath.Base(path), info.Size(), maxBytes)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat opened %s: %w", filepath.Base(path), err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return nil, fmt.Errorf("%s changed while opening or is not a regular file", filepath.Base(path))
+	}
+	if openedInfo.Size() < 0 || openedInfo.Size() > maxBytes {
+		return nil, fmt.Errorf("opened %s size %d exceeds limit %d", filepath.Base(path), openedInfo.Size(), maxBytes)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, fmt.Errorf("secure %s permissions: %w", filepath.Base(path), err)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d bytes", filepath.Base(path), maxBytes)
+	}
+	return data, nil
+}
+
+func writePrivateFileAtomic(path string, data []byte) (returnErr error) {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("persisted state path must not be empty")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		if returnErr != nil {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := temp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := io.Copy(temp, bytes.NewReader(data)); err != nil {
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func generateID(prefix string) string {

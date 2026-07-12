@@ -39,17 +39,21 @@ func validRuleType(t string) bool {
 // removed), it falls back to GroupAny so traffic is never silently
 // dropped.
 func MatchGroup(rules []Rule, host string) string {
-	ip := net.ParseIP(host)
-	lowerHost := strings.ToLower(host)
+	// DNS names with and without the absolute-name trailing dot identify the
+	// same host. Canonicalize once before every rule type so an input such as
+	// "example.com." cannot bypass DOMAIN/DOMAIN-SUFFIX while GEOSITE happens
+	// to match it differently.
+	lowerHost := canonicalRoutingHost(host)
+	ip := net.ParseIP(lowerHost)
 
 	for _, r := range rules {
 		switch r.Type {
 		case RuleDomain:
-			if strings.EqualFold(host, r.Value) {
+			if lowerHost == canonicalRoutingHost(r.Value) {
 				return r.Group
 			}
 		case RuleDomainSuffix:
-			v := strings.ToLower(strings.TrimPrefix(r.Value, "."))
+			v := strings.TrimPrefix(canonicalRoutingHost(r.Value), ".")
 			if lowerHost == v || strings.HasSuffix(lowerHost, "."+v) {
 				return r.Group
 			}
@@ -73,6 +77,10 @@ func MatchGroup(rules []Rule, host string) string {
 		}
 	}
 	return GroupAny
+}
+
+func canonicalRoutingHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
 func (cs *ConfigStore) Rules() []Rule {
@@ -102,15 +110,22 @@ func (cs *ConfigStore) AddRule(r Rule) (Rule, error) {
 	if r.Group == "" {
 		return Rule{}, fmt.Errorf("group is required")
 	}
+	r.Group = canonicalReservedGroup(r.Group)
 	// Normalize a dynamic country target ("country:jp" -> "COUNTRY:JP") so it
 	// matches the uppercase ISO codes stored on nodes. Any other group name
 	// is passed through and resolved (or gracefully fallen back) at dial time.
 	if cc, ok := parseCountryGroup(r.Group); ok {
+		if !validCountryGroupCode(cc) {
+			return Rule{}, fmt.Errorf("country group must use a two-letter ASCII country code")
+		}
 		r.Group = countryGroupPrefix + strings.ToUpper(cc)
 	}
 	r.ID = generateID("rule")
 
 	err := cs.mutate(func(c *PoolConfig) error {
+		if !routingTargetExists(c, r.Group) {
+			return fmt.Errorf("routing target does not exist: %s", r.Group)
+		}
 		insertAt := len(c.Rules)
 		for i, existing := range c.Rules {
 			if existing.Type == RuleMatch {
@@ -174,15 +189,22 @@ func (cs *ConfigStore) SetDefaultGroup(group string) error {
 	if group == "" {
 		return fmt.Errorf("group is required")
 	}
+	group = canonicalReservedGroup(group)
 	// Same normalization AddRule applies - without it, a non-canonically-
 	// cased "country:jp" passed directly via the API wouldn't match
 	// parseCountryGroup's case-sensitive "COUNTRY:" prefix check, and the
 	// default route would silently fall back to the entire pool instead of
 	// the intended country.
 	if cc, ok := parseCountryGroup(group); ok {
+		if !validCountryGroupCode(cc) {
+			return fmt.Errorf("country group must use a two-letter ASCII country code")
+		}
 		group = countryGroupPrefix + strings.ToUpper(cc)
 	}
 	return cs.mutate(func(c *PoolConfig) error {
+		if !routingTargetExists(c, group) {
+			return fmt.Errorf("routing target does not exist: %s", group)
+		}
 		for i, r := range c.Rules {
 			if r.Type == RuleMatch {
 				c.Rules[i].Group = group
@@ -220,11 +242,15 @@ func (cs *ConfigStore) Groups() []Group {
 // AddGroup creates a new named, filtered subset of the pool with its own
 // load-balancing strategy.
 func (cs *ConfigStore) AddGroup(g Group) (Group, error) {
+	g.Name = strings.TrimSpace(g.Name)
 	if g.Name == "" {
 		return Group{}, fmt.Errorf("name is required")
 	}
 	if strings.EqualFold(g.Name, GroupAny) || strings.EqualFold(g.Name, GroupDirect) {
 		return Group{}, fmt.Errorf("%q is a reserved group name", g.Name)
+	}
+	if len(g.Name) >= len(countryGroupPrefix) && strings.EqualFold(g.Name[:len(countryGroupPrefix)], countryGroupPrefix) {
+		return Group{}, fmt.Errorf("%q uses the reserved dynamic country-group namespace", g.Name)
 	}
 	switch g.Strategy {
 	case StrategySticky, StrategyRoundRobin, StrategyRandom, StrategyLatency, StrategySpeed, StrategyScore:
@@ -234,6 +260,7 @@ func (cs *ConfigStore) AddGroup(g Group) (Group, error) {
 		return Group{}, fmt.Errorf("unknown strategy: %q", g.Strategy)
 	}
 	g.ID = generateID("grp")
+	g = cloneGroup(g)
 
 	err := cs.mutate(func(c *PoolConfig) error {
 		for _, existing := range c.Groups {
@@ -241,10 +268,10 @@ func (cs *ConfigStore) AddGroup(g Group) (Group, error) {
 				return fmt.Errorf("group already exists: %s", g.Name)
 			}
 		}
-		c.Groups = append(c.Groups, g)
+		c.Groups = append(c.Groups, cloneGroup(g))
 		return nil
 	})
-	return g, err
+	return cloneGroup(g), err
 }
 
 // SetGroupStrategy changes just the load-balancing strategy of an
@@ -272,10 +299,58 @@ func (cs *ConfigStore) DeleteGroup(id string) error {
 	return cs.mutate(func(c *PoolConfig) error {
 		for i, g := range c.Groups {
 			if g.ID == id {
+				for _, rule := range c.Rules {
+					if strings.EqualFold(rule.Group, g.Name) {
+						return fmt.Errorf("group %q is still referenced by routing rule %q", g.Name, rule.ID)
+					}
+				}
 				c.Groups = append(c.Groups[:i], c.Groups[i+1:]...)
 				return nil
 			}
 		}
 		return fmt.Errorf("group not found: %s", id)
 	})
+}
+
+func validCountryGroupCode(code string) bool {
+	code = strings.TrimSpace(code)
+	if len(code) != 2 {
+		return false
+	}
+	for i := 0; i < len(code); i++ {
+		b := code[i]
+		if b >= 'a' && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if b < 'A' || b > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+func routingTargetExists(config *PoolConfig, target string) bool {
+	if target == GroupAny || target == GroupDirect {
+		return true
+	}
+	if code, ok := parseCountryGroup(target); ok {
+		return validCountryGroupCode(code)
+	}
+	for _, group := range config.Groups {
+		if strings.EqualFold(group.Name, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalReservedGroup(group string) string {
+	group = strings.TrimSpace(group)
+	if strings.EqualFold(group, GroupAny) {
+		return GroupAny
+	}
+	if strings.EqualFold(group, GroupDirect) {
+		return GroupDirect
+	}
+	return group
 }

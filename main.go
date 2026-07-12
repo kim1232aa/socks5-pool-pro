@@ -1,29 +1,46 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
-	lastScrapeTime time.Time
-	nextScrapeTime time.Time
-	lastScrapeInfo ScrapeInfo
-	scrapeMu       sync.RWMutex
-	refreshChan    = make(chan struct{}, 1) // manual refresh trigger
-	recheckChan    = make(chan struct{}, 1)
-	healthCycleMu  sync.Mutex // full refresh and whole-pool recheck must not overlap
-	refreshOpMu    sync.RWMutex
-	refreshOpSeq   uint64
-	refreshActive  *RefreshOperation
-	refreshPending *RefreshOperation
-	refreshLast    *RefreshOperation
+	lastScrapeTime  time.Time
+	nextScrapeTime  time.Time
+	lastScrapeInfo  ScrapeInfo
+	scrapeMu        sync.RWMutex
+	refreshChan     = make(chan struct{}, 1) // manual refresh trigger
+	recheckChan     = make(chan struct{}, 1)
+	fullRecheckChan = make(chan struct{}, 1)
+	healthCycleMu   sync.Mutex // full refresh and whole-pool recheck must not overlap
+	// sourceLifecycleMu makes source configuration changes and the final pool
+	// install one ordered transaction. Without it, an in-flight refresh that
+	// captured an enabled source before it was disabled could revive that
+	// source's nodes after the API had already retired them.
+	sourceLifecycleMu    sync.Mutex
+	refreshOpMu          sync.RWMutex
+	refreshOpSeq         uint64
+	refreshActive        *RefreshOperation
+	refreshPending       *RefreshOperation
+	refreshLast          *RefreshOperation
+	healthRecheckOpMu    sync.RWMutex
+	healthRecheckOpSeq   uint64
+	healthRecheckActive  *HealthRecheckOperation
+	healthRecheckPending *HealthRecheckOperation
+	healthRecheckLast    *HealthRecheckOperation
 )
+
+var recheckProbeExitIP = probeExitIPContext
 
 // ScrapeInfo separates source inventory from the tested/usable pool. Keeping
 // these counters distinct prevents a 250k-entry feed from being presented as
@@ -43,7 +60,8 @@ type ScrapeInfo struct {
 // during a running job creates one bounded follow-up job in refreshChan.
 type RefreshOperation struct {
 	ID           string `json:"id"`
-	Status       string `json:"status"` // queued, running, complete, partial, skipped
+	Status       string `json:"status"`            // queued, running, complete, partial, skipped
+	Trigger      string `json:"trigger,omitempty"` // startup, scheduled, manual
 	RequestedAt  string `json:"requested_at"`
 	StartedAt    string `json:"started_at,omitempty"`
 	CompletedAt  string `json:"completed_at,omitempty"`
@@ -56,6 +74,28 @@ type RefreshOperationStatus struct {
 	Active  *RefreshOperation `json:"active,omitempty"`
 	Pending *RefreshOperation `json:"pending,omitempty"`
 	Last    *RefreshOperation `json:"last,omitempty"`
+}
+
+type HealthRecheckOperation struct {
+	ID             string `json:"id"`
+	Status         string `json:"status"` // queued, running, complete, superseded
+	Generation     uint64 `json:"generation"`
+	CheckURL       string `json:"check_url"`
+	RequestedAt    string `json:"requested_at"`
+	StartedAt      string `json:"started_at,omitempty"`
+	CompletedAt    string `json:"completed_at,omitempty"`
+	Total          int    `json:"total"`
+	Completed      int    `json:"completed"`
+	Reachable      int    `json:"reachable"`
+	Failed         int    `json:"failed"`
+	PolicyFiltered int    `json:"policy_filtered"`
+}
+
+type HealthRecheckOperationStatus struct {
+	State   string                  `json:"state"`
+	Active  *HealthRecheckOperation `json:"active,omitempty"`
+	Pending *HealthRecheckOperation `json:"pending,omitempty"`
+	Last    *HealthRecheckOperation `json:"last,omitempty"`
 }
 
 type refreshRunResult struct {
@@ -105,30 +145,59 @@ func main() {
 	log.Printf("  data-dir: %s", cfg.DataDir)
 	log.Printf("  scrape:   every %s", cfg.ScrapeInterval)
 
+	// Establish the policy baseline before deciding whether a persisted pool was
+	// validated under the same require-ip-change criterion. When the policy is
+	// disabled its fingerprint is baseline-independent, so avoid delaying both
+	// listeners on an unnecessary external request.
+	if cfg.RequireIPChange {
+		InitBaselineExit(cfg.CheckTimeout)
+	}
+
 	pool := NewProxyPool()
+	pool.SetHealthCriterion(store.CheckURL())
+	pool.SetRequireIPChangePolicy(cfg.RequireIPChange)
 	candidateCache := newCandidateCatalogCache(cfg.DataDir)
 	pool.candidates.SetDiskCache(candidateCache)
 	if loaded, loadErr := pool.candidates.LoadDiskCache(); loadErr != nil {
 		log.Printf("[candidate-cache] load failed, continuing with an empty catalog: %v", loadErr)
 	} else if loaded {
+		reset := pool.candidates.ResetHealthOutcomes()
 		snapshot := pool.candidates.snapshot.Load()
 		snapshot.mu.RLock()
-		log.Printf("[candidate-cache] restored %d candidates (generation=%d revision=%d phase=%s)", len(snapshot.records), snapshot.generation, snapshot.revision, snapshot.phase)
+		log.Printf("[candidate-cache] restored %d candidates and reset %d criterion-dependent outcomes (generation=%d revision=%d phase=%s)", len(snapshot.records), reset, snapshot.generation, snapshot.revision, snapshot.phase)
 		snapshot.mu.RUnlock()
 	}
 
 	// Seed from the on-disk cache so the pool is usable immediately, then
 	// enable write-back so every refresh keeps the cache fresh.
 	cache := newPoolCache(cfg.DataDir)
-	if fwd, info, stats := cache.load(); len(fwd) > 0 || len(info) > 0 {
+	cacheCriterionChanged := false
+	if fwd, info, stats, cachedCheckURL, cachedHealthPolicy, cachedRecheckPending := cache.loadWithHealthState(); len(fwd) > 0 || len(info) > 0 {
 		pool.Prime(fwd, info)
 		pool.restoreStats(stats)
+		// A legacy cache has no criterion metadata. Treat it as stale rather
+		// than advertising nodes that may only have passed the former HTTP
+		// default (or another user target) as healthy under today's URL.
+		if strings.TrimSpace(cachedCheckURL) != store.CheckURL() || cachedHealthPolicy != pool.HealthPolicyFingerprint() {
+			pool.InvalidateHealth(store.CheckURL())
+			cacheCriterionChanged = true
+		} else if cachedRecheckPending {
+			pool.RestoreHealthRecheckPending()
+			cacheCriterionChanged = true
+		}
 	}
 	pool.SetCache(cache)
-
-	// Measure our own direct egress once, as the baseline for detecting
-	// transparent proxies that don't actually change the exit IP.
-	InitBaselineExit(cfg.CheckTimeout)
+	// Config may have changed while the process was offline. Retire cached
+	// nodes whose full provenance is no longer enabled before either listener
+	// accepts traffic, while retaining the inventory for later recovery.
+	if retired := pool.ApplyEnabledSources(store.Sources()); retired > 0 {
+		log.Printf("[pool] retired %d cached node(s) from disabled or deleted sources", retired)
+		cacheCriterionChanged = true
+	}
+	if cacheCriterionChanged {
+		pool.FlushCache()
+		_, _ = TriggerFullRecheck(pool)
+	}
 
 	// Background: initial scrape + check, then periodic scrape + manual
 	// refresh, all serialized through one goroutine/loop. This runs in the
@@ -141,20 +210,35 @@ func main() {
 	// finished last would "win" with possibly-stale settings even though
 	// the newer request should always be the one that takes effect.
 	go func() {
-		refreshPool(cfg, store, pool)
-		ticker := time.NewTicker(cfg.ScrapeInterval)
-		defer ticker.Stop()
+		run := func(trigger string, manual bool) {
+			var operationID string
+			if manual {
+				log.Printf("[main] manual refresh triggered")
+				operationID = beginRefreshOperation()
+			} else {
+				operationID = beginBackgroundRefreshOperation(trigger)
+			}
+			result := refreshPool(cfg, store, pool)
+			finishRefreshOperation(operationID, result)
+		}
+
+		run("startup", false)
+		timer := time.NewTimer(cfg.ScrapeInterval)
+		defer timer.Stop()
 		for {
 			select {
-			case <-ticker.C:
-				refreshPool(cfg, store, pool)
+			case <-timer.C:
+				run("scheduled", false)
 			case <-refreshChan:
-				log.Printf("[main] manual refresh triggered")
-				operationID := beginRefreshOperation()
-				result := refreshPool(cfg, store, pool)
-				finishRefreshOperation(operationID, result)
-				ticker.Reset(cfg.ScrapeInterval)
+				run("manual", true)
 			}
+			// Completion-based scheduling keeps the reported next deadline and the
+			// timer in the same time model, even when a large refresh runs for minutes.
+			next := time.Now().Add(cfg.ScrapeInterval)
+			scrapeMu.Lock()
+			nextScrapeTime = next
+			scrapeMu.Unlock()
+			timer.Reset(time.Until(next))
 		}
 	}()
 
@@ -183,6 +267,7 @@ func main() {
 		timer := time.NewTimer(15 * time.Second)
 		defer timer.Stop()
 		for {
+			full := false
 			select {
 			case <-timer.C:
 			case <-recheckChan:
@@ -192,27 +277,95 @@ func main() {
 					default:
 					}
 				}
+			case <-fullRecheckChan:
+				full = true
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 			}
-			if BaselineExitIP() == "" {
-				InitBaselineExit(cfg.CheckTimeout)
+			// A full request is stronger than a bounded one. Coalesce it even if a
+			// periodic/manual bounded signal won the select above first.
+			if !full {
+				select {
+				case <-fullRecheckChan:
+					full = true
+				default:
+				}
 			}
-			reCheckAlive(cfg, store, pool)
+			if cfg.RequireIPChange {
+				_, baselineChanged := RefreshBaselineExitWithChange(cfg.CheckTimeout)
+				if baselineChanged && pool.SetRequireIPChangePolicy(true) {
+					pool.InvalidateHealth(store.CheckURL())
+					pool.candidates.ResetHealthOutcomes()
+					pool.FlushCache()
+					_, _ = TriggerFullRecheck(pool)
+					if full {
+						select {
+						case <-fullRecheckChan:
+						default:
+						}
+					}
+				}
+			}
+			if full {
+				reCheckAllAlive(cfg, store, pool)
+			} else {
+				reCheckAlive(cfg, store, pool)
+			}
 			timer.Reset(5 * time.Minute)
 		}
 	}()
 
-	// Background: status dashboard
-	go func() {
-		status := NewStatusServerWithAdminCredentials(pool, store, cfg.AdminUser, cfg.AdminPass)
-		log.Printf("[status] dashboard at http://%s", cfg.StatusAddr)
-		if err := status.Start(cfg.StatusAddr); err != nil {
-			log.Printf("[status] failed to start: %v", err)
-		}
-	}()
+	status := NewStatusServerWithAdminCredentials(pool, store, cfg.AdminUser, cfg.AdminPass)
+	trustedManagementProxies := make([]string, 0, len(cfg.TrustedManagementProxies))
+	for _, ip := range cfg.TrustedManagementProxies {
+		trustedManagementProxies = append(trustedManagementProxies, ip.String())
+	}
+	if err := status.SetTrustedManagementProxies(trustedManagementProxies); err != nil {
+		log.Fatalf("[main] invalid trusted management proxy: %v", err)
+	}
+	server := NewServerWithCredentialsAndLimit(
+		cfg.ListenAddr, pool, store, cfg.SOCKSUser, cfg.SOCKSPass, cfg.MaxClientConnections,
+	)
 
-	// Start SOCKS5 server (blocks)
-	server := NewServerWithCredentials(cfg.ListenAddr, pool, store, cfg.SOCKSUser, cfg.SOCKSPass)
-	log.Fatal(server.Start())
+	// Treat both listeners as one service. A bind/runtime failure in either is
+	// fatal, while SIGINT/SIGTERM closes admission, drains handlers to a bounded
+	// deadline, and flushes the latest pool state before the process exits.
+	serverErrors := make(chan error, 2)
+	go func() {
+		log.Printf("[status] dashboard at http://%s", cfg.StatusAddr)
+		serverErrors <- status.Start(cfg.StatusAddr)
+	}()
+	go func() { serverErrors <- server.Start() }()
+
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	var exitErr error
+	select {
+	case <-signalContext.Done():
+		log.Printf("[main] shutdown requested")
+	case err := <-serverErrors:
+		if err != nil {
+			exitErr = err
+			log.Printf("[main] listener failed: %v", err)
+		}
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelShutdown()
+	if err := status.Shutdown(shutdownContext); err != nil {
+		log.Printf("[status] shutdown: %v", err)
+	}
+	if err := server.Shutdown(shutdownContext); err != nil {
+		log.Printf("[server] shutdown: %v", err)
+	}
+	pool.FlushCache()
+	if exitErr != nil {
+		log.Fatalf("[main] stopped after listener failure: %v", exitErr)
+	}
 }
 
 // reCheckAlive re-probes a bounded, rotating slice of known nodes against the
@@ -220,41 +373,113 @@ func main() {
 // without an unbounded retained pool turning a five-minute background pass
 // into a multi-hour job. No scraping or geo lookups happen here.
 func reCheckAlive(cfg *Config, store *ConfigStore, pool *ProxyPool) {
+	_, _ = reCheckNodes(cfg, store, pool, pool.RecheckCandidates(cfg.MaxCandidates), pool.Size(), "recheck", "")
+}
+
+func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool) {
+	all := pool.All()
+	nodes := all[:0]
+	for _, px := range all {
+		if !px.SourceRetired {
+			nodes = append(nodes, px)
+		}
+	}
+	operation := beginHealthRecheckOperation(pool, len(nodes))
+	generation, completed := reCheckNodes(cfg, store, pool, nodes, len(nodes), "full-recheck", operation.ID)
+	if completed {
+		completed = pool.CompleteHealthRecheck(generation)
+		if completed {
+			pool.FlushCache()
+		}
+	}
+	finishHealthRecheckOperation(operation.ID, completed)
+}
+
+func reCheckNodes(cfg *Config, store *ConfigStore, pool *ProxyPool, nodes []Proxy, knownTotal int, logLabel, operationID string) (uint64, bool) {
 	healthCycleMu.Lock()
 	defer healthCycleMu.Unlock()
-	knownTotal := pool.Size()
-	nodes := pool.RecheckCandidates(cfg.MaxCandidates)
+	healthGeneration, testURL := currentHealthCriterion(pool, store)
 	if len(nodes) == 0 {
-		return
+		return healthGeneration, true
 	}
-	testURL := store.CheckURL()
+	healthContext, finishHealthWork, current := pool.BeginHealthWork(healthGeneration)
+	if !current {
+		return healthGeneration, false
+	}
+	defer finishHealthWork()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, cfg.MaxConcurrent)
+	baseline := BaselineExitIP()
+	var outcomeMu sync.Mutex
+	checked := make([]Proxy, 0, len(nodes))
+	reachableKeys := make(map[string]bool, len(nodes))
+	policyFiltered := make(map[string]bool)
+checkLoop:
 	for _, px := range nodes {
 		if px.Protocol == "proxyip" {
 			continue
 		}
+		select {
+		case sem <- struct{}{}:
+		case <-healthContext.Done():
+			break checkLoop
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(px Proxy) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			start := time.Now()
-			ok := checkURL(px, testURL, cfg.CheckTimeout)
-			latency := time.Since(start).Milliseconds()
-			pool.ObserveHealthResult(px.Key(), ok, latency)
+			nodeContext, cancelNode := context.WithTimeout(healthContext, cfg.CheckTimeout)
+			defer cancelNode()
+			verified, reachable, latency := checkCredentialCandidates(nodeContext, px, testURL, cfg.CheckTimeout)
+			if healthContext.Err() != nil {
+				return
+			}
+			policyAllowed := true
+			exitIP := ""
+			ipChangeKnown := false
+			ipChanged := false
+			if reachable && cfg.RequireIPChange {
+				exitIP = recheckProbeExitIP(nodeContext, verified, cfg.CheckTimeout)
+				if healthContext.Err() != nil {
+					return
+				}
+				ipChangeKnown = exitIP != "" && baseline != ""
+				ipChanged = ipChangeKnown && exitIP != baseline
+				policyAllowed = !ipChangeKnown || ipChanged
+			}
+			if reachable {
+				pool.UpdateVerifiedCredentialsAtGeneration(px.Key(), verified, healthGeneration)
+			}
+			if !pool.ObserveHealthOutcomeAtGeneration(px.Key(), reachable, policyAllowed, latency.Milliseconds(), healthGeneration) {
+				return
+			}
+			recordHealthRecheckOutcome(operationID, reachable, reachable && !policyAllowed)
+			if exitIP != "" {
+				pool.UpdateGeo(px.Key(), exitIP, "", "", "", ipChanged, ipChangeKnown)
+			}
+			outcomeMu.Lock()
+			checked = append(checked, px)
+			if reachable {
+				reachableKeys[px.Key()] = true
+			}
+			if reachable && !policyAllowed {
+				policyFiltered[px.Key()] = true
+			}
+			outcomeMu.Unlock()
 		}(px)
 	}
 	wg.Wait()
-	log.Printf("[recheck] re-probed %d/%d known nodes against %s", len(nodes), knownTotal, safeSourceURL(testURL))
+	if healthContext.Err() == nil {
+		pool.candidates.ApplyHealthOutcomes(checked, reachableKeys, policyFiltered)
+	}
+	log.Printf("[%s] re-probed %d/%d known nodes against %s", logLabel, len(nodes), knownTotal, safeSourceURL(testURL))
+	return healthGeneration, healthContext.Err() == nil
 }
 
 // refreshPool fetches every enabled source concurrently, dedups the
 // combined candidate list, health-checks it, and installs the result as
 // the pool's new live proxy list.
 func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunResult {
-	healthCycleMu.Lock()
-	defer healthCycleMu.Unlock()
 	sources := store.EnabledSources()
 	if len(sources) == 0 {
 		log.Printf("[main] no enabled sources, skipping refresh")
@@ -272,31 +497,49 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 		failedSources = make(map[string]bool)
 		wg            sync.WaitGroup
 	)
-	for _, src := range sources {
+	// A fixed worker set starts every configured source eventually without
+	// creating dozens of goroutines that can expire in a separate queue before
+	// they ever get a network slot.
+	jobs := make(chan Source)
+	workerCount := min(len(sources), maxConcurrentSourceFetches)
+	for range workerCount {
 		wg.Add(1)
-		go func(src Source) {
+		go func() {
 			defer wg.Done()
-			proxies, err := FetchSource(src)
-			if err != nil {
-				log.Printf("[error] scrape %s failed: %v", src.Name, err)
+			for src := range jobs {
+				proxies, err := FetchSource(src)
+				if err != nil {
+					log.Printf("[error] scrape %s failed: %v", src.Name, err)
+					mu.Lock()
+					sourceErrors++
+					failedSources[src.ID] = true
+					mu.Unlock()
+					continue
+				}
+				for i := range proxies {
+					// During dedupe/catalog construction SourceName carries the stable
+					// ConfigStore ID. It is translated back to the display name before
+					// candidates reach the checker/pool, avoiding extra attribution
+					// fields and per-entry slices on a ~500k-item transient inventory.
+					proxies[i].SourceName = src.ID
+				}
 				mu.Lock()
-				sourceErrors++
-				failedSources[src.ID] = true
+				if len(proxies) > maxCandidateCacheRecords-len(all) {
+					sourceErrors++
+					failedSources[src.ID] = true
+					mu.Unlock()
+					log.Printf("[error] scrape %s exceeded combined candidate budget %d; preserving its previous catalog", src.Name, maxCandidateCacheRecords)
+					continue
+				}
+				all = append(all, proxies...)
 				mu.Unlock()
-				return
 			}
-			for i := range proxies {
-				// During dedupe/catalog construction SourceName carries the stable
-				// ConfigStore ID. It is translated back to the display name before
-				// candidates reach the checker/pool, avoiding extra attribution
-				// fields and per-entry slices on a ~500k-item transient inventory.
-				proxies[i].SourceName = src.ID
-			}
-			mu.Lock()
-			all = append(all, proxies...)
-			mu.Unlock()
-		}(src)
+		}()
 	}
+	for _, src := range sources {
+		jobs <- src
+	}
+	close(jobs)
 	wg.Wait()
 
 	rawCount := len(all)
@@ -304,6 +547,7 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 	all = nil
 	candidateTotal := len(deduped)
 	catalogRefresh := pool.candidates.begin(deduped, sourceLabels, failedSources, sourceErrors)
+	captureCandidateSourceIDs(deduped)
 	restoreCandidateSourceLabels(deduped, sourceLabels)
 
 	// ProxyIP entries are external reverse-proxy/jump resources for Cloudflare
@@ -315,7 +559,7 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 
 	// Some sources (e.g. large community-aggregated lists) return well
 	// over 100k raw entries. Checking all of them every cycle would make
-	// a refresh take hours and hammer ip-api.com's rate limit. Cap the
+	// a refresh take hours and hammer auxiliary lookup services. Cap the
 	// checked set, but retain a small cursor state so repeated cycles walk
 	// deterministically through the entire source inventory instead of
 	// retrying the same failing prefix forever.
@@ -340,16 +584,25 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 	// fine but got excluded from alive for a policy reason (transparent
 	// proxy). Only genuine connectivity failures should flip a
 	// previously-known-good node to Available=false.
-	testURL := store.CheckURL()
-	alive, unreachable, policyFiltered := checkProxiesDetailed(candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
-	pool.Update(alive, unreachable)
-	// A node that is reachable but violates require-ip-change must not remain
-	// routable merely because it survived in the known pool from an older
-	// cycle. This is a policy state change, not a connection failure, so it
-	// deliberately does not increment failure statistics.
-	for key := range policyFiltered {
-		pool.SetAvailable(key, false)
+	healthCycleMu.Lock()
+	defer healthCycleMu.Unlock()
+	healthGeneration, testURL := currentHealthCriterion(pool, store)
+	healthContext, finishHealthWork, current := pool.BeginHealthWork(healthGeneration)
+	if !current {
+		pool.candidates.complete(catalogRefresh, nil, nil, nil)
+		return refreshRunResult{Status: "skipped", SourceErrors: sourceErrors, Error: "health criterion changed before checking; exhaustive recheck queued"}
 	}
+	alive, unreachable, policyFiltered := checkProxiesDetailedContext(healthContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	finishHealthWork()
+	applied := applyRefreshHealthResults(pool, store, alive, unreachable, policyFiltered, healthGeneration)
+	if !applied {
+		pool.candidates.complete(catalogRefresh, nil, nil, nil)
+		log.Printf("[main] discarded health results because the check criterion changed during refresh")
+		return refreshRunResult{Status: "skipped", SourceErrors: sourceErrors, Error: "health criterion changed during refresh; exhaustive recheck queued"}
+	}
+	// Reconcile against the current source configuration while the lifecycle
+	// lock is still held. This closes the race where a refresh started before a
+	// source toggle/delete and would otherwise revive its stale credentials.
 	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
 
 	scrapeMu.Lock()
@@ -368,6 +621,28 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 		status = "partial"
 	}
 	return refreshRunResult{Status: status, SourceErrors: sourceErrors}
+}
+
+// applyRefreshHealthResults closes the source-toggle race at the one point a
+// completed network check can make nodes routable. Tests exercise this helper
+// directly with a deliberately stale result captured before a source change.
+func applyRefreshHealthResults(pool *ProxyPool, store *ConfigStore, alive []Proxy, unreachable, policyFiltered map[string]bool, healthGeneration uint64) bool {
+	sourceLifecycleMu.Lock()
+	defer sourceLifecycleMu.Unlock()
+	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
+		return false
+	}
+	return true
+}
+
+func currentHealthCriterion(pool *ProxyPool, store *ConfigStore) (uint64, string) {
+	generation, checkURL := pool.HealthCriterion()
+	if checkURL != "" {
+		return generation, checkURL
+	}
+	checkURL = store.CheckURL()
+	pool.SetHealthCriterion(checkURL)
+	return pool.HealthCriterion()
 }
 
 func splitHealthInventory(candidates []Proxy) (health []Proxy, resources int) {
@@ -411,7 +686,13 @@ func dedupeCandidates(list []Proxy) []Proxy {
 		if a.Port != b.Port {
 			return a.Port < b.Port
 		}
-		return a.SourceName < b.SourceName
+		if a.SourceName != b.SourceName {
+			return a.SourceName < b.SourceName
+		}
+		if a.Username != b.Username {
+			return a.Username < b.Username
+		}
+		return a.Password < b.Password
 	})
 
 	write := 0
@@ -427,6 +708,7 @@ func dedupeCandidates(list []Proxy) []Proxy {
 		// then fill any missing metadata from the other declaration.
 		if px.SourceName != "" && (cur.SourceName == "" || px.SourceName < cur.SourceName) {
 			px = mergeCandidateMetadata(px, cur)
+			px = mergeCandidateCredentials(px, cur)
 			px.SourceNames = attribution
 			if len(attribution) > 0 {
 				px.SourceName = attribution[0]
@@ -434,6 +716,7 @@ func dedupeCandidates(list []Proxy) []Proxy {
 			list[write-1] = px
 		} else {
 			cur = mergeCandidateMetadata(cur, px)
+			cur = mergeCandidateCredentials(cur, px)
 			cur.SourceNames = attribution
 			if len(attribution) > 0 {
 				cur.SourceName = attribution[0]
@@ -512,10 +795,17 @@ func restoreCandidateSourceLabels(candidates []Proxy, labels map[string]string) 
 	}
 }
 
-func mergeCandidateMetadata(dst, src Proxy) Proxy {
-	if dst.Username == "" {
-		dst.Username, dst.Password = src.Username, src.Password
+func captureCandidateSourceIDs(candidates []Proxy) {
+	for i := range candidates {
+		ids := candidates[i].SourceNames
+		if len(ids) == 0 && candidates[i].SourceName != "" {
+			ids = []string{candidates[i].SourceName}
+		}
+		candidates[i].SourceIDs = append(candidates[i].SourceIDs[:0], ids...)
 	}
+}
+
+func mergeCandidateMetadata(dst, src Proxy) Proxy {
 	if dst.Country == "" || dst.Country == "Unknown" {
 		dst.Country = src.Country
 	}
@@ -526,6 +816,32 @@ func mergeCandidateMetadata(dst, src Proxy) Proxy {
 		dst.Continent = src.Continent
 	}
 	return dst
+}
+
+func mergeCandidateCredentials(primary, other Proxy) Proxy {
+	primaryCredential := ProxyCredential{Username: primary.Username, Password: primary.Password}
+	seen := map[ProxyCredential]bool{primaryCredential: true}
+	for _, credential := range primary.CredentialAlternates {
+		seen[credential] = true
+	}
+	appendAlternative := func(credential ProxyCredential) {
+		if seen[credential] || len(primary.CredentialAlternates) >= maxCredentialAlternates {
+			return
+		}
+		seen[credential] = true
+		primary.CredentialAlternates = append(primary.CredentialAlternates, credential)
+	}
+	appendAlternative(ProxyCredential{Username: other.Username, Password: other.Password})
+	for _, credential := range other.CredentialAlternates {
+		appendAlternative(credential)
+	}
+	sort.Slice(primary.CredentialAlternates, func(i, j int) bool {
+		if primary.CredentialAlternates[i].Username != primary.CredentialAlternates[j].Username {
+			return primary.CredentialAlternates[i].Username < primary.CredentialAlternates[j].Username
+		}
+		return primary.CredentialAlternates[i].Password < primary.CredentialAlternates[j].Password
+	})
+	return primary
 }
 
 // sampleBalanced guarantees every source/protocol bucket a small share, then
@@ -594,12 +910,7 @@ func RequestRefresh() (operation RefreshOperation, accepted bool) {
 		refreshOpMu.Unlock()
 		return operation, false
 	}
-	refreshOpSeq++
-	now := time.Now().UTC()
-	job := &RefreshOperation{
-		ID:     fmt.Sprintf("refresh-%d-%d", now.UnixNano(), refreshOpSeq),
-		Status: "queued", RequestedAt: now.Format(time.RFC3339Nano),
-	}
+	job := newRefreshOperationLocked("manual", "queued")
 	refreshPending = job
 	operation = *job
 	refreshOpMu.Unlock()
@@ -626,17 +937,33 @@ func beginRefreshOperation() string {
 	job := refreshPending
 	refreshPending = nil
 	if job == nil {
-		refreshOpSeq++
-		now := time.Now().UTC()
-		job = &RefreshOperation{
-			ID:     fmt.Sprintf("refresh-%d-%d", now.UnixNano(), refreshOpSeq),
-			Status: "queued", RequestedAt: now.Format(time.RFC3339Nano),
-		}
+		job = newRefreshOperationLocked("manual", "queued")
 	}
 	job.Status = "running"
 	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	refreshActive = job
 	return job.ID
+}
+
+func beginBackgroundRefreshOperation(trigger string) string {
+	refreshOpMu.Lock()
+	defer refreshOpMu.Unlock()
+	job := newRefreshOperationLocked(trigger, "running")
+	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	refreshActive = job
+	return job.ID
+}
+
+// newRefreshOperationLocked allocates a refresh operation while refreshOpMu is
+// held. Background runs use the same observable state as manual jobs without
+// consuming a manual follow-up that may have been queued while a cycle ran.
+func newRefreshOperationLocked(trigger, status string) *RefreshOperation {
+	refreshOpSeq++
+	now := time.Now().UTC()
+	return &RefreshOperation{
+		ID:     fmt.Sprintf("refresh-%d-%d", now.UnixNano(), refreshOpSeq),
+		Status: status, Trigger: trigger, RequestedAt: now.Format(time.RFC3339Nano),
+	}
 }
 
 func finishRefreshOperation(id string, result refreshRunResult) {
@@ -687,5 +1014,127 @@ func TriggerRecheck() {
 	select {
 	case recheckChan <- struct{}{}:
 	default:
+	}
+}
+
+// TriggerFullRecheck invalidates no state by itself; callers changing the
+// health criterion first mark old observations stale, then enqueue this
+// observable exhaustive pass. Requests for the same generation coalesce;
+// a newer generation replaces an older pending job.
+func TriggerFullRecheck(pool *ProxyPool) (HealthRecheckOperation, bool) {
+	generation, checkURL := pool.HealthCriterion()
+	healthRecheckOpMu.Lock()
+	if healthRecheckPending != nil && healthRecheckPending.Generation == generation {
+		operation := *healthRecheckPending
+		healthRecheckOpMu.Unlock()
+		return operation, false
+	}
+	if healthRecheckActive != nil && healthRecheckActive.Generation == generation {
+		operation := *healthRecheckActive
+		healthRecheckOpMu.Unlock()
+		return operation, false
+	}
+	if healthRecheckPending != nil {
+		superseded := *healthRecheckPending
+		superseded.Status = "superseded"
+		superseded.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		healthRecheckLast = &superseded
+	}
+	healthRecheckOpSeq++
+	now := time.Now().UTC()
+	job := &HealthRecheckOperation{
+		ID:     fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), healthRecheckOpSeq),
+		Status: "queued", Generation: generation, CheckURL: checkURL,
+		RequestedAt: now.Format(time.RFC3339Nano),
+	}
+	healthRecheckPending = job
+	operation := *job
+	healthRecheckOpMu.Unlock()
+
+	select {
+	case fullRecheckChan <- struct{}{}:
+	default:
+	}
+	return operation, true
+}
+
+func beginHealthRecheckOperation(pool *ProxyPool, total int) HealthRecheckOperation {
+	healthRecheckOpMu.Lock()
+	defer healthRecheckOpMu.Unlock()
+	job := healthRecheckPending
+	healthRecheckPending = nil
+	if job == nil {
+		generation, checkURL := pool.HealthCriterion()
+		healthRecheckOpSeq++
+		now := time.Now().UTC()
+		job = &HealthRecheckOperation{
+			ID:     fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), healthRecheckOpSeq),
+			Status: "queued", Generation: generation, CheckURL: checkURL,
+			RequestedAt: now.Format(time.RFC3339Nano),
+		}
+	}
+	job.Status = "running"
+	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	job.Total = total
+	healthRecheckActive = job
+	return *job
+}
+
+func recordHealthRecheckOutcome(id string, reachable, policyFiltered bool) {
+	if id == "" {
+		return
+	}
+	healthRecheckOpMu.Lock()
+	defer healthRecheckOpMu.Unlock()
+	if healthRecheckActive == nil || healthRecheckActive.ID != id {
+		return
+	}
+	healthRecheckActive.Completed++
+	if reachable {
+		healthRecheckActive.Reachable++
+	} else {
+		healthRecheckActive.Failed++
+	}
+	if policyFiltered {
+		healthRecheckActive.PolicyFiltered++
+	}
+}
+
+func finishHealthRecheckOperation(id string, completed bool) {
+	healthRecheckOpMu.Lock()
+	defer healthRecheckOpMu.Unlock()
+	if healthRecheckActive == nil || healthRecheckActive.ID != id {
+		return
+	}
+	if completed {
+		healthRecheckActive.Status = "complete"
+	} else {
+		healthRecheckActive.Status = "superseded"
+	}
+	healthRecheckActive.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	finished := *healthRecheckActive
+	healthRecheckLast = &finished
+	healthRecheckActive = nil
+}
+
+func getHealthRecheckOperationStatus() HealthRecheckOperationStatus {
+	healthRecheckOpMu.RLock()
+	defer healthRecheckOpMu.RUnlock()
+	clone := func(operation *HealthRecheckOperation) *HealthRecheckOperation {
+		if operation == nil {
+			return nil
+		}
+		copy := *operation
+		return &copy
+	}
+	state := "idle"
+	if healthRecheckPending != nil {
+		state = "queued"
+	}
+	if healthRecheckActive != nil {
+		state = "running"
+	}
+	return HealthRecheckOperationStatus{
+		State: state, Active: clone(healthRecheckActive), Pending: clone(healthRecheckPending), Last: clone(healthRecheckLast),
 	}
 }

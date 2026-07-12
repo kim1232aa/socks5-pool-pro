@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -97,19 +99,32 @@ func parseCountryGroup(name string) (code string, ok bool) {
 // ProxyPool holds the live, health-checked node list plus per-group
 // selection state.
 type ProxyPool struct {
-	mu              sync.RWMutex
-	proxies         []Proxy           // forwarding-capable (socks5/http/https)
-	proxyIndex      map[string]int    // protocol-aware key -> first index in proxies
-	proxyIPNodes    []Proxy           // informational-only "proxyip" nodes (see parser.go)
-	candidates      *CandidateCatalog // full, non-routable source inventory
-	groupState      map[string]*groupCursor
-	stats           map[string]*nodeStats // keyed by Proxy.Key()
-	cache           *poolCache
-	cacheGeneration uint64
-	persistTimer    *time.Timer
-	persistToken    uint64
-	persistDebounce time.Duration
-	recheckCursor   string
+	mu                      sync.RWMutex
+	proxies                 []Proxy           // forwarding-capable (socks5/http/https)
+	proxyIndex              map[string]int    // protocol-aware key -> first index in proxies
+	proxyIPNodes            []Proxy           // informational-only "proxyip" nodes (see parser.go)
+	candidates              *CandidateCatalog // full, non-routable source inventory
+	groupState              map[string]*groupCursor
+	stats                   map[string]*nodeStats // keyed by Proxy.Key()
+	cache                   *poolCache
+	cacheGeneration         uint64
+	persistTimer            *time.Timer
+	persistToken            uint64
+	persistDebounce         time.Duration
+	recheckCursor           string
+	healthGeneration        uint64
+	healthCheckURL          string
+	healthRunID             uint64
+	healthCancel            context.CancelFunc
+	healthRecheckPending    bool
+	requireIPChangePolicy   bool
+	healthPolicyFingerprint string
+	// routingRevision changes whenever a proxy field that can affect
+	// eligibility, group membership, or latency/speed selection changes.
+	// statsRevision independently tracks score inputs, which are updated on
+	// every live connection and would otherwise make non-score picks retry.
+	routingRevision uint64
+	statsRevision   uint64
 }
 
 const defaultPoolPersistDebounce = 500 * time.Millisecond
@@ -139,6 +154,7 @@ func (p *ProxyPool) RecordResult(key string, ok bool, latencyMs int64) {
 	} else {
 		st.Failures++
 	}
+	p.statsRevision++
 	p.queuePersistenceLocked()
 }
 
@@ -161,22 +177,52 @@ func (p *ProxyPool) statsForKeyLocked(key string) *nodeStats {
 // RecordResult call in reCheckAlive did, preserving score semantics while
 // replacing three independently locked mutations with one.
 func (p *ProxyPool) ObserveHealthResult(key string, ok bool, latencyMs int64) bool {
+	return p.observeHealthOutcome(key, ok, ok, latencyMs, nil)
+}
+
+func (p *ProxyPool) ObserveHealthResultAtGeneration(key string, ok bool, latencyMs int64, generation uint64) bool {
+	return p.observeHealthOutcome(key, ok, ok, latencyMs, &generation)
+}
+
+// ObserveHealthOutcomeAtGeneration distinguishes transport reachability from
+// policy eligibility. A transparent proxy is a successful reliability sample,
+// but require-ip-change must keep it unavailable atomically rather than briefly
+// reviving it before a separate SetAvailable call.
+func (p *ProxyPool) ObserveHealthOutcomeAtGeneration(key string, reachable, policyAllowed bool, latencyMs int64, generation uint64) bool {
+	return p.observeHealthOutcome(key, reachable, policyAllowed, latencyMs, &generation)
+}
+
+func (p *ProxyPool) observeHealthOutcome(key string, reachable, policyAllowed bool, latencyMs int64, expectedGeneration *uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if expectedGeneration != nil && p.healthGeneration != *expectedGeneration {
+		return false
+	}
 
 	observed := p.mutateProxyLocked(key, func(px *Proxy) {
 		st := p.statsForKeyLocked(key)
-		if ok {
+		if reachable {
 			st.Successes++
 			st.ConsecutiveHealthFailures = 0
 			if latencyMs > 0 {
 				st.LastLatencyMs = latencyMs
 			}
-			px.Available = true
+			px.HealthInvalidated = false
+			px.PolicyExcluded = !policyAllowed
+			px.Available = policyAllowed && !px.SourceRetired
 			px.LatencyMs = latencyMs
 			return
 		}
 
+		// Reaching a definitive failure under the current generation still
+		// completes this node's criterion recheck. Keep it unavailable, but do
+		// not continue labelling it as "waiting for recheck" or preserve a
+		// policy decision learned under the superseded criterion.
+		if px.HealthInvalidated {
+			px.HealthInvalidated = false
+			px.PolicyExcluded = false
+			px.Available = false
+		}
 		st.Failures++
 		if st.ConsecutiveHealthFailures < healthFailureThreshold {
 			st.ConsecutiveHealthFailures++
@@ -186,6 +232,7 @@ func (p *ProxyPool) ObserveHealthResult(key string, ok bool, latencyMs int64) bo
 		}
 	})
 	if observed {
+		p.statsRevision++
 		p.queuePersistenceLocked()
 	}
 	return observed
@@ -196,7 +243,10 @@ func (p *ProxyPool) ObserveHealthResult(key string, ok bool, latencyMs int64) bo
 // then latency, then measured speed. Nodes with no observations yet get a
 // neutral success-rate so they aren't unfairly buried.
 func (p *ProxyPool) scoreLocked(px Proxy) float64 {
-	st := p.stats[px.Key()]
+	return scoreWithStats(px, p.stats[px.Key()])
+}
+
+func scoreWithStats(px Proxy, st *nodeStats) float64 {
 
 	successRate := 0.75 // neutral-ish prior for unobserved nodes
 	if st != nil {
@@ -290,12 +340,14 @@ func (p *ProxyPool) proxyIndexLookupLocked(key string) (int, bool) {
 func (p *ProxyPool) mutateProxyLocked(key string, fn func(*Proxy)) bool {
 	if i, ok := p.proxyIndexLookupLocked(key); ok {
 		fn(&p.proxies[i])
+		p.routingRevision++
 		return true
 	}
 	for i := range p.proxies {
 		if p.proxies[i].Key() == key {
 			fn(&p.proxies[i])
 			p.rebuildProxyIndexLocked()
+			p.routingRevision++
 			return true
 		}
 	}
@@ -316,10 +368,14 @@ func (p *ProxyPool) UpdateLatency(key string, latencyMs int64) {
 // re-check (every -recheck-interval, cheaper and more frequent than a full
 // scrape). This never removes the node - it only affects whether it's
 // preferred for routing and whether the dashboard hides it by default.
+func proxyHardRoutable(px Proxy) bool {
+	return !px.SourceRetired && !px.HealthInvalidated && !px.PolicyExcluded
+}
+
 func (p *ProxyPool) SetAvailable(key string, available bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.mutateProxyLocked(key, func(px *Proxy) { px.Available = available }) {
+	if p.mutateProxyLocked(key, func(px *Proxy) { px.Available = available && proxyHardRoutable(*px) }) {
 		if available {
 			if st := p.stats[key]; st != nil {
 				st.ConsecutiveHealthFailures = 0
@@ -327,6 +383,292 @@ func (p *ProxyPool) SetAvailable(key string, available bool) {
 		}
 		p.queuePersistenceLocked()
 	}
+}
+
+func (p *ProxyPool) SetPolicyExcludedAtGeneration(key string, excluded bool, generation uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.healthGeneration != generation {
+		return false
+	}
+	updated := p.mutateProxyLocked(key, func(px *Proxy) {
+		px.HealthInvalidated = false
+		px.PolicyExcluded = excluded
+		if excluded {
+			px.Available = false
+		}
+	})
+	if updated {
+		p.queuePersistenceLocked()
+	}
+	return updated
+}
+
+// InvalidateHealth marks every forwarding node ineligible in one atomic pool
+// update. It is used when the health-check URL changes: a success measured
+// against the previous criterion must never remain exposed as current while an
+// exhaustive recheck is still working through the pool. Nodes are retained and
+// can immediately self-heal on their first success under the new criterion.
+func (p *ProxyPool) InvalidateHealth(checkURL ...string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.healthCancel != nil {
+		p.healthCancel()
+		p.healthCancel = nil
+	}
+	p.healthRunID++
+	p.healthGeneration++
+	if len(checkURL) > 0 {
+		p.healthCheckURL = strings.TrimSpace(checkURL[0])
+		p.healthRecheckPending = true
+	}
+	changed := 0
+	for i := range p.proxies {
+		p.proxies[i].HealthInvalidated = true
+		if p.proxies[i].Available {
+			p.proxies[i].Available = false
+			changed++
+		}
+		if st := p.stats[p.proxies[i].Key()]; st != nil {
+			st.ConsecutiveHealthFailures = 0
+		}
+	}
+	p.routingRevision++
+	// The criterion, pending guard, hard-invalidated bits, and reset failure
+	// streaks are durable state even when every node was already unavailable.
+	p.queuePersistenceLocked()
+	return changed
+}
+
+func (p *ProxyPool) SetRequireIPChangePolicy(required bool) bool {
+	fingerprint := healthPolicyFingerprint(required)
+	p.mu.Lock()
+	changed := p.healthPolicyFingerprint != fingerprint
+	p.requireIPChangePolicy = required
+	p.healthPolicyFingerprint = fingerprint
+	p.mu.Unlock()
+	return changed
+}
+
+func healthPolicyFingerprint(requireIPChange bool) string {
+	if !requireIPChange {
+		return "v1:require-ip-change=false"
+	}
+	baseline := BaselineExitIP()
+	if baseline == "" {
+		baseline = "unknown"
+	}
+	return "v1:require-ip-change=true;baseline=" + baseline
+}
+
+func validHealthPolicyFingerprint(value string) bool {
+	if value == healthPolicyFingerprint(false) {
+		return true
+	}
+	const prefix = "v1:require-ip-change=true;baseline="
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	baseline := strings.TrimPrefix(value, prefix)
+	return baseline == "unknown" || net.ParseIP(baseline) != nil
+}
+
+func (p *ProxyPool) HealthPolicyFingerprint() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.healthPolicyFingerprint
+}
+
+func (p *ProxyPool) RequireIPChangePolicy() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.requireIPChangePolicy
+}
+
+func (p *ProxyPool) HealthRecheckPending() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.healthRecheckPending
+}
+
+func (p *ProxyPool) RestoreHealthRecheckPending() {
+	p.mu.Lock()
+	p.healthRecheckPending = true
+	p.mu.Unlock()
+}
+
+// CompleteHealthRecheck clears the destructive-maintenance guard only if the
+// exhaustive pass completed under the still-current criterion.
+func (p *ProxyPool) CompleteHealthRecheck(generation uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.healthGeneration != generation {
+		return false
+	}
+	if !p.healthRecheckPending {
+		return true
+	}
+	p.healthRecheckPending = false
+	p.queuePersistenceLocked()
+	return true
+}
+
+// BeginHealthWork creates a cancellation scope tied to one health generation.
+// InvalidateHealth cancels this scope immediately, so an obsolete large refresh
+// releases the serialized checker instead of merely discarding its results
+// after every timeout has elapsed.
+func (p *ProxyPool) BeginHealthWork(generation uint64) (context.Context, func(), bool) {
+	p.mu.Lock()
+	if p.healthGeneration != generation {
+		p.mu.Unlock()
+		return nil, func() {}, false
+	}
+	if p.healthCancel != nil {
+		p.healthCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.healthRunID++
+	runID := p.healthRunID
+	p.healthCancel = cancel
+	p.mu.Unlock()
+
+	finish := func() {
+		p.mu.Lock()
+		if p.healthRunID == runID {
+			p.healthCancel = nil
+		}
+		p.mu.Unlock()
+		cancel()
+	}
+	return ctx, finish, true
+}
+
+func (p *ProxyPool) HealthGeneration() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.healthGeneration
+}
+
+func (p *ProxyPool) SetHealthCriterion(checkURL string) {
+	p.mu.Lock()
+	p.healthCheckURL = strings.TrimSpace(checkURL)
+	p.mu.Unlock()
+}
+
+func (p *ProxyPool) HealthCriterion() (generation uint64, checkURL string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.healthGeneration, p.healthCheckURL
+}
+
+func (p *ProxyPool) UpdateVerifiedCredentialsAtGeneration(key string, verified Proxy, generation uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.healthGeneration != generation {
+		return false
+	}
+	changed := false
+	found := p.mutateProxyLocked(key, func(px *Proxy) {
+		if px.Username == verified.Username && px.Password == verified.Password && credentialsEqual(px.CredentialAlternates, verified.CredentialAlternates) {
+			return
+		}
+		changed = true
+		px.Username = verified.Username
+		px.Password = verified.Password
+		px.CredentialAlternates = append(px.CredentialAlternates[:0], verified.CredentialAlternates...)
+	})
+	if changed {
+		p.queuePersistenceLocked()
+	}
+	return found
+}
+
+func credentialsEqual(a, b []ProxyCredential) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ApplyEnabledSources removes routing eligibility from nodes whose complete
+// provenance is not currently enabled. A merged endpoint is conservatively
+// retired when any one of its recorded sources disappears: credentials are
+// endpoint-level today, so retaining it merely because another source remains
+// would risk continuing to use credentials supplied only by the removed feed.
+// The next successful refresh rebuilds that endpoint from enabled sources and
+// restores it with the safe credential set. Inventory/history is never deleted.
+func (p *ProxyPool) ApplyEnabledSources(sources []Source) int {
+	enabledIDs, enabledNames := enabledSourceSets(sources)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	retired, changed := p.applyEnabledSourcesLocked(enabledIDs, enabledNames)
+	if changed {
+		p.routingRevision++
+		p.queuePersistenceLocked()
+	}
+	return retired
+}
+
+func enabledSourceSets(sources []Source) (map[string]bool, map[string]bool) {
+	enabledIDs := make(map[string]bool, len(sources))
+	enabledNames := make(map[string]bool, len(sources))
+	for _, source := range sources {
+		if !source.Enabled {
+			continue
+		}
+		enabledIDs[source.ID] = true
+		enabledNames[strings.ToLower(strings.TrimSpace(source.Name))] = true
+	}
+	return enabledIDs, enabledNames
+}
+
+// applyEnabledSourcesLocked performs the source retirement mutation without
+// publishing an intermediate pool state. Caller must hold p.mu for writing.
+func (p *ProxyPool) applyEnabledSourcesLocked(enabledIDs, enabledNames map[string]bool) (retired int, changed bool) {
+	for i := range p.proxies {
+		px := &p.proxies[i]
+		owned := false
+		active := false
+		if len(px.SourceIDs) > 0 {
+			owned = true
+			active = true
+			for _, id := range px.SourceIDs {
+				if !enabledIDs[id] {
+					active = false
+					break
+				}
+			}
+		} else {
+			names := px.SourceNames
+			if len(names) == 0 && strings.TrimSpace(px.SourceName) != "" {
+				names = []string{px.SourceName}
+			}
+			if len(names) > 0 {
+				owned = true
+				active = true
+				for _, name := range names {
+					if !enabledNames[strings.ToLower(strings.TrimSpace(name))] {
+						active = false
+						break
+					}
+				}
+			}
+		}
+		if owned && !active {
+			if !px.SourceRetired || px.Available {
+				retired++
+				changed = true
+			}
+			px.SourceRetired = true
+			px.Available = false
+		}
+	}
+	return retired, changed
 }
 
 // queuePersistenceLocked marks the in-memory state as newer and schedules a
@@ -355,7 +697,7 @@ func (p *ProxyPool) queuePersistenceLocked() {
 // cacheSnapshotLocked returns detached data: neither slice shares its backing
 // array with the live pool, and the stats map contains values rather than the
 // pool's mutable pointers. Caller must hold p.mu (read or write).
-func (p *ProxyPool) cacheSnapshotLocked() (uint64, []Proxy, []Proxy, map[string]nodeStats) {
+func (p *ProxyPool) cacheSnapshotLocked() (uint64, []Proxy, []Proxy, map[string]nodeStats, string, string, bool) {
 	forwarding := cloneProxySlice(p.proxies)
 	proxyip := cloneProxySlice(p.proxyIPNodes)
 	stats := make(map[string]nodeStats, len(p.stats))
@@ -364,7 +706,7 @@ func (p *ProxyPool) cacheSnapshotLocked() (uint64, []Proxy, []Proxy, map[string]
 			stats[key] = *st
 		}
 	}
-	return p.cacheGeneration, forwarding, proxyip, stats
+	return p.cacheGeneration, forwarding, proxyip, stats, p.healthCheckURL, p.healthPolicyFingerprint, p.healthRecheckPending
 }
 
 func cloneProxySlice(in []Proxy) []Proxy {
@@ -377,6 +719,8 @@ func cloneProxySlice(in []Proxy) []Proxy {
 
 func cloneProxy(px Proxy) Proxy {
 	px.SourceNames = append([]string(nil), px.SourceNames...)
+	px.SourceIDs = append([]string(nil), px.SourceIDs...)
+	px.CredentialAlternates = append([]ProxyCredential(nil), px.CredentialAlternates...)
 	return px
 }
 
@@ -400,9 +744,9 @@ func (p *ProxyPool) flushScheduledPersistence(token uint64) {
 		p.mu.Unlock()
 		return
 	}
-	generation, forwarding, proxyip, stats := p.cacheSnapshotLocked()
+	generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
-	cache.save(generation, forwarding, proxyip, stats)
+	cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
 }
 
 // FlushCache synchronously persists a detached snapshot. Normal state changes
@@ -416,9 +760,9 @@ func (p *ProxyPool) FlushCache() {
 		p.mu.Unlock()
 		return
 	}
-	generation, forwarding, proxyip, stats := p.cacheSnapshotLocked()
+	generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
-	cache.save(generation, forwarding, proxyip, stats)
+	cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
 }
 
 // statsSnapshot / restoreStats support persisting scores across restarts.
@@ -439,6 +783,7 @@ func (p *ProxyPool) restoreStats(m map[string]nodeStats) {
 		vv := v
 		p.stats[k] = &vv
 	}
+	p.statsRevision++
 }
 
 // SetCache enables persistence of the live pool to disk (see poolcache.go).
@@ -458,6 +803,16 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 	p.proxies = cloneProxySlice(forwarding)
 	p.rebuildProxyIndexLocked()
 	p.proxyIPNodes = cloneProxySlice(proxyip)
+	// The in-memory recheck cursor is intentionally started at a different
+	// retained node on each process boot. Without this, operators who restart
+	// frequently would repeatedly recheck the sorted head of a pool larger than
+	// MaxCandidates and could starve its tail indefinitely.
+	if len(p.proxies) > 0 {
+		p.recheckCursor = p.proxies[rand.Intn(len(p.proxies))].Key()
+	} else {
+		p.recheckCursor = ""
+	}
+	p.routingRevision++
 	p.mu.Unlock()
 	log.Printf("[pool] primed from cache: %d forwarding, %d proxyip nodes", len(forwarding), len(proxyip))
 }
@@ -488,18 +843,50 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 // Per-group cursors are left as-is; Pick re-anchors automatically against
 // whatever is present in the new list. The merged pool is persisted to the
 // cache (if enabled) for fast recovery on restart.
-func (p *ProxyPool) Update(freshlyAlive []Proxy, failedAddrs map[string]bool) {
+func (p *ProxyPool) Update(freshlyAlive []Proxy, failedAddrs map[string]bool, expectedGeneration ...uint64) bool {
+	return p.update(freshlyAlive, failedAddrs, nil, nil, expectedGeneration...)
+}
+
+// UpdateWithEnabledSources installs one refresh and reconciles source
+// retirement under the same pool lock. This prevents status readers from
+// observing even a momentary revival of a node whose source was disabled while
+// its network check was in flight.
+func (p *ProxyPool) UpdateWithEnabledSources(freshlyAlive []Proxy, failedAddrs map[string]bool, sources []Source, expectedGeneration ...uint64) bool {
+	return p.update(freshlyAlive, failedAddrs, nil, &sources, expectedGeneration...)
+}
+
+// UpdateWithEnabledSourcesAndPolicy publishes one refresh as a single routing
+// state transition. A reachable node rejected by require-ip-change must become
+// hard-excluded under the same pool lock that installs fresh health/source
+// results; publishing first and excluding it in a later call would briefly let
+// Pick and the healthy-proxy APIs advertise a node that already failed policy.
+func (p *ProxyPool) UpdateWithEnabledSourcesAndPolicy(freshlyAlive []Proxy, failedAddrs, policyFiltered map[string]bool, sources []Source, expectedGeneration ...uint64) bool {
+	return p.update(freshlyAlive, failedAddrs, policyFiltered, &sources, expectedGeneration...)
+}
+
+func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map[string]bool, enabledSources *[]Source, expectedGeneration ...uint64) bool {
 	var freshFwd, freshInfo []Proxy
 	for _, px := range freshlyAlive {
 		if px.Protocol == "proxyip" {
 			freshInfo = append(freshInfo, cloneProxy(px))
 		} else {
 			px.Available = true
+			px.SourceRetired = false
+			px.HealthInvalidated = false
+			px.PolicyExcluded = false
 			freshFwd = append(freshFwd, cloneProxy(px))
 		}
 	}
+	var enabledIDs, enabledNames map[string]bool
+	if enabledSources != nil {
+		enabledIDs, enabledNames = enabledSourceSets(*enabledSources)
+	}
 
 	p.mu.Lock()
+	if len(expectedGeneration) > 0 && p.healthGeneration != expectedGeneration[0] {
+		p.mu.Unlock()
+		return false
+	}
 	merged := make(map[string]Proxy, len(p.proxies)+len(freshFwd))
 	for _, existing := range p.proxies {
 		merged[existing.Key()] = existing
@@ -535,6 +922,20 @@ func (p *ProxyPool) Update(freshlyAlive []Proxy, failedAddrs map[string]bool) {
 			merged[key] = existing
 			failed++
 		}
+	}
+	// Policy is a hard routing boundary and wins defensively even if a caller
+	// accidentally supplies the same key in freshlyAlive. New policy-filtered
+	// candidates are not admitted (they are absent from freshlyAlive); retained
+	// nodes are kept for later self-healing but become ineligible atomically.
+	for key := range policyFiltered {
+		existing, ok := merged[key]
+		if !ok {
+			continue
+		}
+		existing.HealthInvalidated = false
+		existing.PolicyExcluded = true
+		existing.Available = false
+		merged[key] = existing
 	}
 
 	fwd := make([]Proxy, 0, len(merged))
@@ -581,16 +982,23 @@ func (p *ProxyPool) Update(freshlyAlive []Proxy, failedAddrs map[string]bool) {
 	p.proxies = fwd
 	p.rebuildProxyIndexLocked()
 	p.proxyIPNodes = info
+	if enabledSources != nil {
+		_, _ = p.applyEnabledSourcesLocked(enabledIDs, enabledNames)
+		// The retirement helper mutates p.proxies, not its order or keys, so the
+		// index built immediately above remains valid.
+	}
+	p.routingRevision++
 	cache := p.cache
 	p.cacheGeneration++
 	p.cancelScheduledPersistenceLocked()
-	generation, snapshotFwd, snapshotInfo, snapshotStats := p.cacheSnapshotLocked()
+	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
 	if cache != nil {
-		cache.save(generation, snapshotFwd, snapshotInfo, snapshotStats)
+		cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
 	}
 	log.Printf("[pool] updated: %d known forwarding proxies total (+%d new, %d revived, %d reached %d-failure unavailable threshold), %d proxyip (info-only) nodes",
 		len(fwd), added, revived, failed, healthFailureThreshold, len(info))
+	return true
 }
 
 // mergeFreshProxy combines a successful health-check result with durable
@@ -641,6 +1049,7 @@ func (p *ProxyPool) ClearUnavailable() int {
 	}
 	p.proxies = kept
 	p.rebuildProxyIndexLocked()
+	p.routingRevision++
 
 	// Stats are keyed by Proxy.Key(), so delete both the nodes removed by this
 	// operation and any older orphan entries left by a protocol reclassification.
@@ -653,6 +1062,7 @@ func (p *ProxyPool) ClearUnavailable() int {
 			delete(p.stats, key)
 		}
 	}
+	p.statsRevision++
 
 	// Drop node references that no longer exist. A removed manual pin must not
 	// leave the group permanently pinned to nowhere; cursors with no remaining
@@ -680,10 +1090,10 @@ func (p *ProxyPool) ClearUnavailable() int {
 	cache := p.cache
 	p.cacheGeneration++
 	p.cancelScheduledPersistenceLocked()
-	generation, snapshotFwd, snapshotInfo, snapshotStats := p.cacheSnapshotLocked()
+	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
 	if cache != nil {
-		cache.save(generation, snapshotFwd, snapshotInfo, snapshotStats)
+		cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
 	}
 	log.Printf("[pool] cleared %d unavailable node(s), %d remaining", removed, len(kept))
 	return removed
@@ -703,7 +1113,7 @@ func (p *ProxyPool) AvailableCount() int {
 	defer p.mu.RUnlock()
 	count := 0
 	for _, px := range p.proxies {
-		if px.Available {
+		if px.Available && proxyHardRoutable(px) {
 			count++
 		}
 	}
@@ -728,10 +1138,6 @@ func (p *ProxyPool) RecheckCandidates(limit int) []Proxy {
 	if limit <= 0 || len(p.proxies) == 0 {
 		return nil
 	}
-	if len(p.proxies) <= limit {
-		return cloneProxySlice(p.proxies)
-	}
-
 	start := 0
 	if p.recheckCursor != "" {
 		for i, px := range p.proxies {
@@ -741,11 +1147,19 @@ func (p *ProxyPool) RecheckCandidates(limit int) []Proxy {
 			}
 		}
 	}
-	out := make([]Proxy, 0, limit)
-	for i := 0; i < limit; i++ {
-		out = append(out, cloneProxy(p.proxies[(start+i)%len(p.proxies)]))
+	out := make([]Proxy, 0, min(limit, len(p.proxies)))
+	lastVisited := ""
+	for scanned := 0; scanned < len(p.proxies) && len(out) < limit; scanned++ {
+		px := p.proxies[(start+scanned)%len(p.proxies)]
+		lastVisited = px.Key()
+		if px.SourceRetired {
+			continue
+		}
+		out = append(out, cloneProxy(px))
 	}
-	p.recheckCursor = out[len(out)-1].Key()
+	if lastVisited != "" {
+		p.recheckCursor = lastVisited
+	}
 	return out
 }
 
@@ -861,6 +1275,17 @@ func proxyMatchesSources(px Proxy, allowed []string) bool {
 // of blackholing traffic.
 func resolveGroup(all []Proxy, groupName string, groups []Group) ([]Proxy, string) {
 	out, strategy := resolveGroupCandidates(all, groupName, groups)
+	// Source retirement is a hard routing boundary, unlike an ordinary failed
+	// health probe. The historical all-unavailable fallback may still use a
+	// temporarily stale node, but it must never resurrect credentials from a
+	// source the operator disabled or deleted.
+	nonRetired := out[:0]
+	for _, px := range out {
+		if proxyHardRoutable(px) {
+			nonRetired = append(nonRetired, px)
+		}
+	}
+	out = nonRetired
 	// The pool keeps every node it's ever seen alive (Update never deletes -
 	// see its docstring), so prefer nodes currently marked Available for
 	// actual routing/selection. This is applied to THIS group's already-
@@ -965,67 +1390,235 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 		return Proxy{}, false, true
 	}
 
-	candidates, strategy := resolveGroup(p.All(), groupName, groups)
-	if exclude != nil {
-		var filtered []Proxy
-		for _, c := range candidates {
-			if !exclude[c.Key()] {
-				filtered = append(filtered, c)
+	selector := newPoolGroupSelector(groupName, groups)
+	// Scan without cloning the pool: the read lock allows concurrent picks and
+	// prevents 500k-node pools from allocating another 500k Proxy values for
+	// every CONNECT. Cursor mutation remains a separate short write section;
+	// the selected key is revalidated there against source/policy retirement.
+	for attempt := 0; attempt < 8; attempt++ {
+		p.mu.RLock()
+		routingRevision := p.routingRevision
+		statsRevision := p.statsRevision
+		cursorSnapshot := groupCursor{}
+		if cursor := p.groupState[groupName]; cursor != nil {
+			cursorSnapshot = *cursor
+		}
+		chosen, preservePin, found := p.selectProxyLocked(selector, cursorSnapshot, exclude)
+		p.mu.RUnlock()
+		if !found {
+			return Proxy{}, false, false
+		}
+
+		p.mu.Lock()
+		if p.routingRevision != routingRevision || selector.strategy == StrategyScore && p.statsRevision != statsRevision {
+			p.mu.Unlock()
+			continue
+		}
+		gc := p.groupState[groupName]
+		if gc == nil {
+			gc = &groupCursor{}
+			p.groupState[groupName] = gc
+		}
+		switch selector.strategy {
+		case StrategyRoundRobin:
+			if gc.rrIdx != cursorSnapshot.rrIdx {
+				p.mu.Unlock()
+				continue
+			}
+		case StrategySticky, "":
+			if gc.stickyKey != cursorSnapshot.stickyKey || gc.pinned != cursorSnapshot.pinned {
+				p.mu.Unlock()
+				continue
 			}
 		}
-		candidates = filtered
-	}
-	if len(candidates) == 0 {
-		return Proxy{}, false, false
+		index, current := p.proxyIndexLookupLocked(chosen.Key())
+		if !current || !p.proxySelectableAtCommitLocked(p.proxies[index], selector, exclude) {
+			p.mu.Unlock()
+			continue
+		}
+		if selector.strategy == StrategyRoundRobin {
+			gc.rrIdx++
+		}
+		if (selector.strategy == StrategySticky || selector.strategy == "") && !preservePin {
+			gc.stickyKey = chosen.Key()
+		}
+		gc.lastPicked = chosen.Key()
+		live := cloneProxy(p.proxies[index])
+		p.mu.Unlock()
+		return live, true, false
 	}
 
+	// A large health pass can update routingRevision continuously enough to
+	// invalidate every optimistic scan. Do not turn that benign contention into
+	// a false "no proxy" result: one rare serialized scan guarantees progress
+	// while still keeping the normal CONNECT path read-concurrent.
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	gc, ok := p.groupState[groupName]
-	if !ok {
+	cursor := groupCursor{}
+	if current := p.groupState[groupName]; current != nil {
+		cursor = *current
+	}
+	chosen, preservePin, found := p.selectProxyLocked(selector, cursor, exclude)
+	if !found {
+		return Proxy{}, false, false
+	}
+	gc := p.groupState[groupName]
+	if gc == nil {
 		gc = &groupCursor{}
 		p.groupState[groupName] = gc
 	}
-
-	var chosen Proxy
-	switch strategy {
-	case StrategyRoundRobin:
-		chosen = candidates[gc.rrIdx%len(candidates)]
+	if selector.strategy == StrategyRoundRobin {
 		gc.rrIdx++
-	case StrategyRandom:
-		chosen = candidates[rand.Intn(len(candidates))]
-	case StrategyLatency:
-		chosen = bestBy(candidates, func(c Proxy) float64 { return float64(c.LatencyMs) }, false)
-	case StrategySpeed:
-		chosen = bestBy(candidates, func(c Proxy) float64 { return c.SpeedKbps }, true)
-	case StrategyScore:
-		chosen = bestBy(candidates, p.scoreLocked, true)
-	default: // sticky
-		chosen = candidates[0]
-		found := false
-		for _, c := range candidates {
-			if c.Key() == gc.stickyKey {
-				chosen = c
-				found = true
-				break
-			}
-		}
-		if !found && gc.pinned {
-			// The manually-locked node isn't a viable candidate for THIS
-			// pick (excluded by a retry, marked unavailable, or
-			// reclassified to a different Key()) - fall back to some
-			// candidate for this one pick only, but do NOT persist that as
-			// the new pin. Leaving stickyKey untouched means the lock
-			// self-heals the moment the pinned node is viable again,
-			// instead of silently and permanently drifting to whatever
-			// candidates[0] happened to be this time.
-			break
-		}
+	}
+	if (selector.strategy == StrategySticky || selector.strategy == "") && !preservePin {
 		gc.stickyKey = chosen.Key()
 	}
-
 	gc.lastPicked = chosen.Key()
-	return chosen, true, false
+	return cloneProxy(chosen), true, false
+}
+
+// proxySelectableAtCommitLocked is a defensive final check around the
+// optimistic read-scan in pick. The revision comparison above is what keeps
+// the hot path O(1) while holding the write lock; these direct predicates make
+// a future mutation path that forgets to bump the revision fail closed. The
+// only scan is the rare all-unavailable fallback, where we must not return a
+// stale node if a healthy eligible member appeared meanwhile.
+func (p *ProxyPool) proxySelectableAtCommitLocked(proxy Proxy, selector poolGroupSelector, exclude map[string]bool) bool {
+	if !proxyHardRoutable(proxy) || !selector.matches(proxy) || exclude != nil && exclude[proxy.Key()] {
+		return false
+	}
+	if proxy.Available {
+		return true
+	}
+	for _, candidate := range p.proxies {
+		if candidate.Available && proxyHardRoutable(candidate) && selector.matches(candidate) && (exclude == nil || !exclude[candidate.Key()]) {
+			return false
+		}
+	}
+	return true
+}
+
+type poolGroupSelector struct {
+	strategy string
+	group    *Group
+	country  string
+	any      bool
+}
+
+func newPoolGroupSelector(groupName string, groups []Group) poolGroupSelector {
+	if groupName == "" || groupName == GroupAny {
+		return poolGroupSelector{strategy: StrategySticky, any: true}
+	}
+	if country, ok := parseCountryGroup(groupName); ok {
+		return poolGroupSelector{strategy: StrategyLatency, country: country}
+	}
+	for i := range groups {
+		if strings.EqualFold(groups[i].Name, groupName) || groups[i].ID == groupName {
+			strategy := groups[i].Strategy
+			if strategy == "" {
+				strategy = StrategySticky
+			}
+			return poolGroupSelector{strategy: strategy, group: &groups[i]}
+		}
+	}
+	return poolGroupSelector{strategy: StrategySticky, any: true}
+}
+
+func (selector poolGroupSelector) matches(proxy Proxy) bool {
+	if selector.any {
+		return true
+	}
+	if selector.country != "" {
+		return strings.EqualFold(proxy.Country, selector.country)
+	}
+	group := selector.group
+	if group == nil {
+		return false
+	}
+	if len(group.Nodes) > 0 && !groupMatchesNode(group.Nodes, proxy) {
+		return false
+	}
+	if len(group.Countries) > 0 && !containsFold(group.Countries, proxy.Country) {
+		return false
+	}
+	if len(group.Protocols) > 0 && !containsFold(group.Protocols, proxy.Protocol) {
+		return false
+	}
+	return len(group.Sources) == 0 || proxyMatchesSources(proxy, group.Sources)
+}
+
+// selectProxyLocked performs at most two allocation-free scans. The first
+// determines whether the group's healthy subset is non-empty; the second
+// applies the configured strategy. Caller holds p.mu for reading.
+func (p *ProxyPool) selectProxyLocked(selector poolGroupSelector, cursor groupCursor, exclude map[string]bool) (Proxy, bool, bool) {
+	requireAvailable := false
+	count := 0
+	availableCount := 0
+	for _, proxy := range p.proxies {
+		if !proxyHardRoutable(proxy) || !selector.matches(proxy) || exclude != nil && exclude[proxy.Key()] {
+			continue
+		}
+		count++
+		if proxy.Available {
+			requireAvailable = true
+			availableCount++
+		}
+	}
+	if count == 0 {
+		return Proxy{}, false, false
+	}
+	eligibleCount := count
+	if requireAvailable {
+		eligibleCount = availableCount
+	}
+	targetIndex := 0
+	if selector.strategy == StrategyRoundRobin {
+		targetIndex = cursor.rrIdx % eligibleCount
+	} else if selector.strategy == StrategyRandom {
+		targetIndex = rand.Intn(eligibleCount)
+	}
+
+	var chosen Proxy
+	found := false
+	stickyFound := false
+	seen := 0
+	bestMetric := 0.0
+	for _, proxy := range p.proxies {
+		if !proxyHardRoutable(proxy) || requireAvailable && !proxy.Available || !selector.matches(proxy) || exclude != nil && exclude[proxy.Key()] {
+			continue
+		}
+		switch selector.strategy {
+		case StrategyRoundRobin, StrategyRandom:
+			if seen == targetIndex {
+				return proxy, false, true
+			}
+			seen++
+			continue
+		case StrategySticky, "":
+			if !found {
+				chosen, found = proxy, true
+			}
+			if proxy.Key() == cursor.stickyKey {
+				chosen, stickyFound = proxy, true
+			}
+			continue
+		}
+
+		metric := 0.0
+		higher := true
+		switch selector.strategy {
+		case StrategyLatency:
+			metric, higher = float64(proxy.LatencyMs), false
+		case StrategySpeed:
+			metric = proxy.SpeedKbps
+		case StrategyScore:
+			metric = p.scoreLocked(proxy)
+		}
+		if !found || bestMetric == 0 && metric != 0 || metric != 0 && ((higher && metric > bestMetric) || (!higher && metric < bestMetric)) {
+			chosen, found, bestMetric = proxy, true, metric
+		}
+	}
+	return chosen, cursor.pinned && !stickyFound, found
 }
 
 // bestBy returns the candidate with the lowest metric value (or highest,
@@ -1048,17 +1641,38 @@ func bestBy(candidates []Proxy, metric func(Proxy) float64, higher bool) Proxy {
 	return best
 }
 
+type forceStickyResult uint8
+
+const (
+	forceStickyOK forceStickyResult = iota
+	forceStickyNotFound
+	forceStickyUnavailable
+)
+
 // ForceSticky pins a specific proxy (by Key) as the sticky choice for a
 // group - used for manual "switch" clicks from the dashboard. It works
 // regardless of the group's configured strategy, but only "sticks" if that
 // strategy is actually "sticky"; otherwise the next Pick recomputes per its
 // own rule and overwrites it.
 func (p *ProxyPool) ForceSticky(groupName, key string) bool {
-	if _, ok := p.Find(key); !ok {
-		return false
-	}
+	return p.forceSticky(groupName, key) == forceStickyOK
+}
+
+// forceSticky retains the reason a manual switch was rejected for the HTTP
+// API. Automatic routing may use a soft-unavailable node only as the historical
+// last-resort fallback; an explicit switch must never claim to have pinned a
+// node that is not currently healthy, because the normal available preference
+// would immediately route the next connection somewhere else.
+func (p *ProxyPool) forceSticky(groupName, key string) forceStickyResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	index, ok := p.proxyIndexLookupLocked(key)
+	if !ok {
+		return forceStickyNotFound
+	}
+	if !p.proxies[index].Available || !proxyHardRoutable(p.proxies[index]) {
+		return forceStickyUnavailable
+	}
 	gc, ok := p.groupState[groupName]
 	if !ok {
 		gc = &groupCursor{}
@@ -1067,7 +1681,7 @@ func (p *ProxyPool) ForceSticky(groupName, key string) bool {
 	gc.stickyKey = key
 	gc.lastPicked = key
 	gc.pinned = true // manual choice: auto-rotation must not override it
-	return true
+	return forceStickyOK
 }
 
 // SetAuto clears a group's manual lock so the periodic auto-rotation timer
@@ -1115,10 +1729,20 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 	// original full-pool fallback means an all-unavailable pool still returns
 	// something and retains the project's no-blackhole behavior.
 	nextIdx := -1
+	hasNonRetired := false
+	for _, px := range p.proxies {
+		if proxyHardRoutable(px) {
+			hasNonRetired = true
+			break
+		}
+	}
+	if !hasNonRetired {
+		return Proxy{}, false
+	}
 	if groupName == GroupAny || groupName == "" {
 		hasAvailable := false
 		for _, px := range p.proxies {
-			if px.Available {
+			if proxyHardRoutable(px) && px.Available {
 				hasAvailable = true
 				break
 			}
@@ -1133,7 +1757,7 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 			}
 			if anchor < 0 {
 				for i, px := range p.proxies {
-					if px.Available {
+					if proxyHardRoutable(px) && px.Available {
 						nextIdx = i
 						break
 					}
@@ -1141,7 +1765,7 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 			} else {
 				for offset := 1; offset <= len(p.proxies); offset++ {
 					i := (anchor + offset) % len(p.proxies)
-					if p.proxies[i].Available {
+					if proxyHardRoutable(p.proxies[i]) && p.proxies[i].Available {
 						nextIdx = i
 						break
 					}
@@ -1157,10 +1781,15 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 				break
 			}
 		}
-		if anchor < 0 {
-			nextIdx = 0
-		} else {
-			nextIdx = (anchor + 1) % len(p.proxies)
+		for offset := 1; offset <= len(p.proxies); offset++ {
+			i := offset - 1
+			if anchor >= 0 {
+				i = (anchor + offset) % len(p.proxies)
+			}
+			if proxyHardRoutable(p.proxies[i]) {
+				nextIdx = i
+				break
+			}
 		}
 	}
 	next := p.proxies[nextIdx]

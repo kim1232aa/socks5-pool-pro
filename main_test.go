@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -79,11 +80,34 @@ func TestDedupeCandidatesFillsMissingMetadataFromDuplicate(t *testing.T) {
 	if px.SourceName != "alpha" {
 		t.Fatalf("primary source = %q, want alpha", px.SourceName)
 	}
-	if px.Username != "user" || px.Password != "secret" {
-		t.Errorf("credentials were not merged: username=%q password=%q", px.Username, px.Password)
+	if px.Username != "" || px.Password != "" {
+		t.Errorf("stable primary credentials changed: username=%q password=%q", px.Username, px.Password)
+	}
+	if want := []ProxyCredential{{Username: "user", Password: "secret"}}; !reflect.DeepEqual(px.CredentialAlternates, want) {
+		t.Errorf("credential alternatives = %#v, want %#v", px.CredentialAlternates, want)
 	}
 	if px.Country != "JP" || px.City != "Tokyo" || px.Continent != "AS" {
 		t.Errorf("geo metadata was not merged: country=%q city=%q continent=%q", px.Country, px.City, px.Continent)
+	}
+}
+
+func TestDedupeCandidatesRetainsBoundedCredentialVariants(t *testing.T) {
+	input := make([]Proxy, 0, maxCredentialAlternates+4)
+	for i := 0; i < maxCredentialAlternates+4; i++ {
+		input = append(input, Proxy{
+			IP: "192.0.2.44", Port: "1080", Protocol: "socks5", SourceName: "feed",
+			Username: fmt.Sprintf("user-%02d", i), Password: fmt.Sprintf("pass-%02d", i),
+		})
+	}
+	got := dedupeCandidates(input)
+	if len(got) != 1 {
+		t.Fatalf("dedupeCandidates() returned %d endpoints, want 1", len(got))
+	}
+	if len(got[0].CredentialAlternates) != maxCredentialAlternates {
+		t.Fatalf("credential alternatives = %d, want cap %d", len(got[0].CredentialAlternates), maxCredentialAlternates)
+	}
+	if candidates := got[0].credentialCandidates(); len(candidates) != 1+maxCredentialAlternates {
+		t.Fatalf("credentialCandidates() = %d, want %d", len(candidates), 1+maxCredentialAlternates)
 	}
 }
 
@@ -174,10 +198,14 @@ func TestRefreshPoolPrioritizesUnseenCandidateWhenCapped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	knownFeedURL := *knownURL
+	knownFeedURL.Host = "localhost:" + knownURL.Port()
+	unseenFeedURL := *unseenURL
+	unseenFeedURL.Host = "localhost:" + unseenURL.Port()
 
 	feed := []map[string]any{
-		{"proxy": knownProxy.URL, "country": "US", "city": "Known"},
-		{"proxy": unseenProxy.URL, "country": "US", "city": "Unseen"},
+		{"proxy": knownFeedURL.String(), "country": "US", "city": "Known"},
+		{"proxy": unseenFeedURL.String(), "country": "US", "city": "Unseen"},
 	}
 	feedBody, err := json.Marshal(feed)
 	if err != nil {
@@ -203,7 +231,7 @@ func TestRefreshPoolPrioritizesUnseenCandidateWhenCapped(t *testing.T) {
 		ScrapeInterval: time.Minute,
 	}
 	known := Proxy{
-		IP: knownURL.Hostname(), Port: knownURL.Port(), Protocol: "http",
+		IP: "localhost", Port: knownURL.Port(), Protocol: "http",
 		SourceName: "test-feed", Country: "US", Available: false,
 	}
 	pool := NewProxyPool()
@@ -220,7 +248,7 @@ func TestRefreshPoolPrioritizesUnseenCandidateWhenCapped(t *testing.T) {
 	if got, ok := pool.Find(known.Key()); !ok || got.Available {
 		t.Errorf("known candidate should remain untouched for the independent recheck: found=%v proxy=%#v", ok, got)
 	}
-	if unseenKey := "http://" + unseenURL.Host; !poolHasKey(pool, unseenKey) {
+	if unseenKey := "http://" + unseenFeedURL.Host; !poolHasKey(pool, unseenKey) {
 		t.Errorf("unseen candidate %q was not added by the capped discovery refresh", unseenKey)
 	}
 }
@@ -253,8 +281,16 @@ func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	feedProxyURL := *proxyURL
+	feedProxyURL.Host = "localhost:" + proxyURL.Port()
+	feedBody, err = json.Marshal([]map[string]any{{
+		"proxy": feedProxyURL.String(), "country": "US", "city": "Threshold",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	known := Proxy{
-		IP: proxyURL.Hostname(), Port: proxyURL.Port(), Protocol: "http",
+		IP: "localhost", Port: proxyURL.Port(), Protocol: "http",
 		SourceName: "threshold-feed", Country: "US", Available: true,
 	}
 	pool := NewProxyPool()
@@ -293,6 +329,44 @@ func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T
 func poolHasKey(pool *ProxyPool, key string) bool {
 	_, ok := pool.Find(key)
 	return ok
+}
+
+func TestPeriodicRecheckDoesNotReviveTransparentProxy(t *testing.T) {
+	proxyServer, _ := newTestConnectProxy(t)
+	proxyURL, err := url.Parse(proxyServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	px := Proxy{
+		IP: proxyURL.Hostname(), Port: proxyURL.Port(), Protocol: "http",
+		Available: false,
+	}
+	store := &ConfigStore{cfg: PoolConfig{CheckURL: "http://health.test/check"}}
+	pool := NewProxyPool()
+	pool.SetHealthCriterion(store.CheckURL())
+	pool.Prime([]Proxy{px}, nil)
+	cfg := &Config{CheckTimeout: time.Second, MaxConcurrent: 1, MaxCandidates: 1, RequireIPChange: true}
+
+	baselineExitMu.Lock()
+	previousBaseline := baselineExitIP
+	baselineExitIP = "203.0.113.77"
+	baselineExitMu.Unlock()
+	previousProbe := recheckProbeExitIP
+	recheckProbeExitIP = func(context.Context, Proxy, time.Duration) string { return "203.0.113.77" }
+	t.Cleanup(func() {
+		recheckProbeExitIP = previousProbe
+		baselineExitMu.Lock()
+		baselineExitIP = previousBaseline
+		baselineExitMu.Unlock()
+	})
+
+	if _, completed := reCheckNodes(cfg, store, pool, []Proxy{px}, 1, "test-recheck", ""); !completed {
+		t.Fatal("periodic recheck did not complete")
+	}
+	got, _ := pool.Find(px.Key())
+	if got.Available || !got.IPChangeKnown || got.IPChanged {
+		t.Fatalf("transparent proxy was revived: %+v", got)
+	}
 }
 
 // newTestConnectProxy implements just enough of an HTTP CONNECT proxy for
