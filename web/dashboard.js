@@ -239,6 +239,7 @@ var candidateContinentFilter = '';
 var candidateCountryTrigger = null;
 var countryPickerScope = 'candidates';
 var selectedCandidateKeys = Object.create(null);
+var selectedNodeURLs = Object.create(null);
 var candidateSpeedResults = Object.create(null);
 var candidateOperationPending = false;
 var lastKnownScrape = '';
@@ -1347,6 +1348,52 @@ function toggleNodeDetails(button) {
   button.textContent = expanded ? '收起' : '详情';
 }
 
+function selectedNodeList() { return Object.keys(selectedNodeURLs); }
+
+function updateNodeSelectionUI(rows) {
+  var keys = selectedNodeList();
+  setText('node-selected-count', '已选 ' + keys.length);
+  var copyButton = document.querySelector('[data-action="copy-selected-nodes"]');
+  if (copyButton) copyButton.disabled = !keys.length;
+  var pageToggle = document.getElementById('node-select-page');
+  if (pageToggle) {
+    var selectedOnPage = rows.filter(function(item){ return !!selectedNodeURLs[String(item.key || '')]; }).length;
+    pageToggle.checked = !!rows.length && selectedOnPage === rows.length;
+    pageToggle.indeterminate = selectedOnPage > 0 && selectedOnPage < rows.length;
+  }
+}
+
+function toggleNodeSelection(button) {
+  var key = rowKey(button);
+  if (!key) return;
+  if (button.checked) {
+    var row = button.closest ? button.closest('tr[data-key]') : null;
+    var node = nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes.filter(function(item){ return String(item.key || '') === key; })[0] : null;
+    selectedNodeURLs[key] = String((node && (node.proxy_url || node.addr)) || (row && row.getAttribute('data-copy-address')) || '');
+  } else {
+    delete selectedNodeURLs[key];
+  }
+  updateNodeSelectionUI(nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes : []);
+}
+
+function toggleNodePageSelection(button) {
+  var rows = nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes : [];
+  rows.forEach(function(node) {
+    var key = String(node.key || '');
+    if (!key) return;
+    if (button.checked) selectedNodeURLs[key] = String(node.proxy_url || node.addr || '');
+    else delete selectedNodeURLs[key];
+  });
+  updateNodeSelectionUI(rows);
+  applyNodeView();
+}
+
+function copySelectedNodes(button) {
+  var urls = selectedNodeList().map(function(key){ return selectedNodeURLs[key]; }).filter(Boolean);
+  if (!urls.length) return;
+  copyAddr(urls.join('\n'), button);
+}
+
 function applyNodeView() {
   var tbody = document.getElementById('node-tbody');
   if (!tbody) return;
@@ -1390,14 +1437,16 @@ function applyNodeView() {
   }
 
   if (!poolTotal) {
-    tbody.innerHTML = '<tr><td colspan="15" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="16" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
+    updateNodeSelectionUI(pageRows);
     renderNodePagers('');
     if (banner) banner.textContent = '无 (代理池为空)';
     restoreNodeFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="15" class="empty">没有匹配的节点</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="16" class="empty">没有匹配的节点</td></tr>';
+    updateNodeSelectionUI(pageRows);
     renderNodePagers('');
   } else {
     var html = '';
@@ -1427,7 +1476,9 @@ function applyNodeView() {
           : '<button type="button" class="btn-sm" data-action="verify" title="立即重新拨号,查看真实出口IP/国家是否和标签一致" aria-label="验证节点 ' + escapeHtml(n.addr) + '">验证</button>') +
         '<button type="button" class="btn-sm danger" data-action="delete-node" aria-label="删除节点 ' + escapeHtml(n.addr) + '">删除</button>' +
         '<button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (rowExpanded ? 'true' : 'false') + '">' + (rowExpanded ? '收起' : '详情') + '</button></div>';
+      var selected = !!selectedNodeURLs[String(n.key || '')];
       html += '<tr class="' + (n.active ? 'active ' : '') + (n.available === false ? 'unavail ' : '') + (rowExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
+        '<td data-label="选择"><input type="checkbox" data-action="node-select" aria-label="选择节点 ' + escapeHtml(n.addr) + '" ' + (selected ? 'checked' : '') + '></td>' +
 		'<td data-label="状态">' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.source_retired ? '<span class="badge-unavail">来源已停用</span>' : (n.health_invalidated ? '<span class="badge-unavail">检测失败，需人工验证恢复</span>' : (n.policy_excluded ? '<span class="badge-unavail">出口策略排除</span>' : (n.available === false ? '<span class="badge-unavail">暂不可用</span>' : '<span class="small">可用</span>'))))) + '</td>' +
         '<td data-label="协议">' + protoBadge(n.protocol) + '</td>' +
         '<td data-label="代理URL" class="mono">' + escapeHtml(n.proxy_url || n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.proxy_url || n.addr) + '" aria-label="复制完整代理URL">复制</button></td>' +
@@ -1454,6 +1505,7 @@ function applyNodeView() {
           '<button type="button" class="btn-sm" data-action="goto-node-page" data-page="' + (page + 1) + '" ' + (page >= pageCount ? 'disabled' : '') + '>下一页</button>');
     }
   }
+  updateNodeSelectionUI(pageRows);
 
   if (banner) {
     var lockUI = anyPinned
@@ -2353,6 +2405,9 @@ document.addEventListener('click', function(event) {
     case 'set-candidate-continent': setCandidateContinentFilter(actionElement.getAttribute('data-continent') || ''); break;
     case 'choose-candidate-country': chooseCandidateCountry(actionElement.getAttribute('data-country') || ''); break;
     case 'proxyip-verify': runProxyIPVerify(actionElement); break;
+    case 'node-select': toggleNodeSelection(actionElement); break;
+    case 'node-select-page': toggleNodePageSelection(actionElement); break;
+    case 'copy-selected-nodes': copySelectedNodes(actionElement); break;
     case 'candidate-select': toggleCandidateSelection(actionElement); break;
     case 'candidate-select-page': toggleCandidatePageSelection(actionElement); break;
     case 'candidate-speedtest': speedtestCandidates([rowKey(actionElement)]); break;

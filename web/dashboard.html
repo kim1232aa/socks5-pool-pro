@@ -117,13 +117,18 @@
     <button type="button" class="btn-sm" data-action="export-nodes" data-format="tme" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
     <span id="node-count" class="small" role="status" aria-live="polite"></span>
   </div>
+    <div class="node-batch-bar" aria-label="节点批量操作">
+      <span id="node-selected-count" role="status" aria-live="polite">已选 0</span>
+      <button type="button" class="btn-sm" data-action="copy-selected-nodes" disabled>复制已选</button>
+      <span class="candidate-speedtest-note">勾选节点后批量复制完整代理URL。</span>
+    </div>
   <div id="node-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
 
   <div class="pager node-pager-top" id="node-pager-top" aria-label="代理池分页（顶部）"></div>
   <div class="table-scroll node-table-scroll" tabindex="0" aria-label="节点表格，可横向滚动">
   <table class="node-table">
-  <thead><tr><th></th><th>协议</th><th>代理URL</th><th>用户名</th><th>密码</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th title="仅统计真实转发请求结果；健康检查和测速不计入">累计成功/失败</th><th>连续健康失败</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
-  <tbody id="node-tbody"><tr><td colspan="15" class="empty">加载中...</td></tr></tbody>
+  <thead><tr><th><input id="node-select-page" type="checkbox" data-action="node-select-page" aria-label="选择本页节点"></th><th>协议</th><th>代理URL</th><th>用户名</th><th>密码</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th title="仅统计真实转发请求结果；健康检查和测速不计入">累计成功/失败</th><th>连续健康失败</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="16" class="empty">加载中...</td></tr></tbody>
   </table>
   </div>
   <div class="pager" id="node-pager"></div>

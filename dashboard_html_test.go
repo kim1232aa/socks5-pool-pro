@@ -76,6 +76,25 @@ func TestDashboardCandidateSummaryCardsDriveServerFilters(t *testing.T) {
 	}
 }
 
+func TestDashboardNodeBatchCopyContract(t *testing.T) {
+	for _, want := range []string{
+		`id="node-select-page"`,
+		`data-action="node-select"`,
+		`data-action="copy-selected-nodes"`,
+		`function toggleNodeSelection(button)`,
+		`function toggleNodePageSelection(button)`,
+		`function copySelectedNodes(button)`,
+		`urls.join('\n')`,
+		`case 'node-select':`,
+		`case 'node-select-page':`,
+		`case 'copy-selected-nodes':`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing node batch copy contract %q", want)
+		}
+	}
+}
+
 func TestDashboardCandidatePageSizeIsResponsive(t *testing.T) {
 	for _, want := range []string{
 		`<option value="10">每页10</option>`,
