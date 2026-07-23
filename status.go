@@ -22,6 +22,7 @@ type StatusServer struct {
 	pool                    *ProxyPool
 	store                   *ConfigStore
 	coordinator             *RefreshCoordinator
+	listenerManager         listenerManagerAPI
 	adminAuthEnabled        bool
 	adminUserHash           [sha256.Size]byte
 	adminPassHash           [sha256.Size]byte
@@ -161,6 +162,9 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/status", requireGet(s.handleAPIStatus))
 	mux.HandleFunc("/api/v1/proxies", requireGet(s.handleV1Proxies))
 	mux.HandleFunc("/api/v1/proxies/pick", requireGet(s.handleV1ProxyPick))
+	mux.HandleFunc("/api/listeners", s.handleListeners)
+	mux.HandleFunc("/api/listeners/update", requirePost(s.handleListenerUpdate))
+	mux.HandleFunc("/api/listeners/delete", requirePost(s.handleListenerDelete))
 	mux.HandleFunc("/api/refresh", requirePost(s.handleRefresh))
 	mux.HandleFunc("/api/refresh/status", requireGet(s.handleRefreshStatus))
 	mux.HandleFunc("/api/health-recheck/status", requireGet(s.handleHealthRecheckStatus))

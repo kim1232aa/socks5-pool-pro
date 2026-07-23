@@ -479,6 +479,75 @@ func TestHandleConnUpstreamConnectFailureBecomesTerminalAndCannotFallback(t *tes
 	}
 }
 
+func TestListenerPoliciesNeverEscapeExplicitTargets(t *testing.T) {
+	unavailable := Proxy{IP: "192.0.2.80", Port: "8080", Protocol: "http", Country: "JP", Available: false}
+	healthyOutside := Proxy{IP: "192.0.2.81", Port: "8080", Protocol: "http", Country: "US", Available: true}
+
+	tests := []struct {
+		name   string
+		policy *listenerRoutePolicy
+	}{
+		{
+			name: "fixed unavailable node",
+			policy: &listenerRoutePolicy{
+				mode: ListenerModeFixed,
+				group: Group{
+					ID: "listener:fixed", Name: "listener:fixed",
+					Strategy: StrategySticky, Nodes: []string{unavailable.Key()},
+				},
+			},
+		},
+		{
+			name: "group with no available member",
+			policy: &listenerRoutePolicy{
+				mode: ListenerModeGroup,
+				group: Group{
+					ID: "listener:jp", Name: "listener:jp",
+					Strategy: StrategyLatency, Countries: []string{"JP"},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := NewProxyPool()
+			pool.Prime([]Proxy{unavailable, healthyOutside}, nil)
+			store := &ConfigStore{cfg: PoolConfig{Rules: []Rule{{Type: RuleMatch, Group: GroupAny}}}}
+			server := NewServerWithSharedAdmissionAndPolicy("", pool, store, "", "", make(chan struct{}, 1), test.policy)
+			serverSide, clientSide := net.Pipe()
+			done := make(chan struct{})
+			go func() {
+				server.handleConn(serverSide)
+				close(done)
+			}()
+
+			_, _ = clientSide.Write([]byte{socks5Version, 1, socks5NoAuth})
+			methodReply := make([]byte, 2)
+			if _, err := io.ReadFull(clientSide, methodReply); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = clientSide.Write(testSOCKSDomainFrame("example.com", 443))
+			reply := make([]byte, 10)
+			if _, err := io.ReadFull(clientSide, reply); err != nil {
+				t.Fatal(err)
+			}
+			_ = clientSide.Close()
+			if reply[1] != replyGeneralFailure {
+				t.Fatalf("SOCKS reply=%d, want general failure", reply[1])
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("SOCKS handler did not finish")
+			}
+			if successes, failures := pool.StatsOf(healthyOutside.Key()); successes != 0 || failures != 0 {
+				t.Fatalf("explicit listener fell back to outside node: stats=%d/%d", successes, failures)
+			}
+		})
+	}
+}
+
 func TestHandleConnTargetRefusalDoesNotMarkUpstreamUnavailable(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

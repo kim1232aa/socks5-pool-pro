@@ -79,7 +79,7 @@ socks5://9:9@8.220.201.169:1080
 
 ## 快速部署：Docker Compose
 
-Compose 是推荐方式。默认只把 SOCKS5 和管理端口发布到宿主机 `127.0.0.1`，数据保存在命名卷 `socks5-pool-pro-data`。
+Compose 是推荐方式。默认把主 SOCKS5 端口 `1080`、附加端口范围 `1081-1180` 和管理端口 `8080` 发布到宿主机 `127.0.0.1`，数据保存在命名卷 `socks5-pool-pro-data`。
 
 ```bash
 cp .env.example .env
@@ -129,9 +129,12 @@ go build -o socks5-pool .
 - **候选库存**：服务端分页浏览完整去重目录，区分待检、失败、策略排除、池内可用/不可用和 ProxyIP；
 - **来源订阅**：新增、启停、删除来源及 `allow_private`、`allow_empty` 高级选项；
 - **分流规则**：按顺序维护域名、CIDR、GEOSITE 与兜底规则；
-- **分组策略**：按国家、协议、来源或指定节点建立策略组。
+- **分组策略**：按国家、协议、来源或指定节点建立策略组；
+- **监听端口**：热增删附加 SOCKS5 端口，每个端口可复用全局规则、按分组策略自动切换，或固定到一个协议感知节点 key。
 
 节点和候选都使用服务端筛选、分页与快照令牌，浏览器不会一次下载完整大池。移动端与桌面端共用相同 API。
+
+附加端口保存在 `pool_config.json`，重启后自动恢复。`rules` 模式对每条新连接使用当前全局规则；`group` 模式只在指定组内按该组策略选择和切换；`fixed` 模式只使用指定节点。`group` 和 `fixed` 都不会回退到 `ANY`，没有可用目标时直接返回 SOCKS5 失败。停用或删除端口会关闭对应监听器。
 
 ## 健康检查与节点生命周期
 
@@ -307,6 +310,9 @@ GET /api/v1/proxies/pick?protocol=socks5&country=JP
 | GET/POST | `/api/sources` | 列出或新增来源 |
 | GET/POST | `/api/rules` | 列出或新增规则 |
 | GET/POST | `/api/groups` | 列出或新增分组 |
+| GET/POST | `/api/listeners` | 列出运行状态或新增附加 SOCKS5 端口 |
+| POST | `/api/listeners/update` | 热更新端口、模式、目标和启用状态 |
+| POST | `/api/listeners/delete` | 删除配置并关闭对应监听器 |
 
 `POST /api/refresh` 返回 `202` 和任务 ID；重复请求最多合并成一个待执行任务，避免无界队列。节点页、候选页与 v1 页都使用快照分页。未知 `/api/*` 返回 JSON `404`，错误响应包含稳定 `code`、可读 `error` 和 `request_id`。
 
@@ -375,6 +381,7 @@ SOCKS_PASS=replace-with-another-password
 | 变量 | Compose 默认值 | 说明 |
 |---|---:|---|
 | `SOCKS_PORT` | `1080` | 宿主机 loopback SOCKS 端口 |
+| `SOCKS_AUX_PORTS` | `1081-1180` | 发布到宿主机 loopback 的附加 SOCKS 端口范围；管理界面创建的端口需落在已发布范围内 |
 | `DASHBOARD_PORT` | `8080` | 宿主机 loopback 管理端口 |
 | `MAX_CONCURRENT` | `50` | 健康检查并发数 |
 | `MAX_CANDIDATES` | `1500` | 每轮检测候选数 |

@@ -23,6 +23,7 @@
     <a id="tab-link-sources" href="#sources" class="tab-link" data-tab="sources" data-icon="⌁" role="tab" aria-controls="tab-sources">来源订阅</a>
     <a id="tab-link-rules" href="#rules" class="tab-link" data-tab="rules" data-icon="⑂" role="tab" aria-controls="tab-rules">分流规则</a>
     <a id="tab-link-groups" href="#groups" class="tab-link" data-tab="groups" data-icon="◇" role="tab" aria-controls="tab-groups">分组策略</a>
+    <a id="tab-link-listeners" href="#listeners" class="tab-link" data-tab="listeners" data-icon="⊟" role="tab" aria-controls="tab-listeners">监听端口</a>
   </nav>
   <div class="sidebar-foot">
     <div id="connection-status" class="system-online" data-connection-status data-state="connecting" role="status" aria-live="polite">正在连接管理 API</div>
@@ -347,6 +348,40 @@
     <button class="btn" type="submit">创建分组</button>
   </form>
   <p class="note">分组是从代理池里筛出的节点子集,配合分流规则使用。<b>要把某个域名精确固定走一个协议节点</b>:在"指定节点"里填 <code>protocol://ip:port</code>(例如 <code>socks5://1.2.3.4:1080</code>),建一个分组,再在分流规则里把该域名指向这个分组即可。裸 <code>ip:port</code> 是旧兼容写法,会匹配该地址的全部协议变体。筛选条件可组合(指定节点 / 国家 / 协议 / 来源)。策略: sticky=固定直到手动切换或失败, round-robin=每次新连接轮换, random=随机, latency=优先延迟最低, speed=优先测速结果最高(需先手动测速)。</p>
+</div>
+
+<div id="tab-listeners" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-listeners">
+  <div class="panel-heading"><div><span class="panel-kicker">SOCKS5 Endpoints</span><h2>监听端口</h2><p>为不同业务在独立 SOCKS5 端口上固定节点、固定分组，或复用全局分流规则。</p></div><button type="button" class="btn-sm" data-action="refresh-listeners">刷新状态</button></div>
+  <div class="scope-intro listener-intro"><span class="scope-icon" aria-hidden="true">⊟</span><div><strong>附加端口即时生效</strong>保存后新连接立即使用新配置；停用或删除会关闭对应监听器。主 <span class="mono">-listen</span> 端口始终沿用全局分流规则。</div></div>
+  <div id="listener-notice" class="list-notice" data-tone="loading" role="status" aria-live="polite">正在读取监听端口…</div>
+  <div class="table-scroll listener-table-scroll" tabindex="0" aria-label="监听端口表格，可横向滚动">
+    <table class="management-table listener-table">
+      <caption class="sr-only">附加 SOCKS5 监听端口管理</caption>
+      <thead><tr><th>名称</th><th>端口 / 地址</th><th>模式</th><th>组 / 固定节点</th><th>启用</th><th>运行状态 / 错误</th><th>操作</th></tr></thead>
+      <tbody id="listener-tbody"></tbody>
+    </table>
+  </div>
+  <form class="inline listener-form" id="form-listener">
+    <div class="form-title"><span id="listener-form-title">新增监听端口</span><span id="listener-form-help">选择分组、固定节点或复用全局分流规则。</span></div>
+    <input type="hidden" name="id" id="listener-id">
+    <label class="sr-only" for="listener-name">名称</label>
+    <input id="listener-name" name="name" placeholder="名称，如 日本业务" required maxlength="128">
+    <label class="sr-only" for="listener-port">端口</label>
+    <input id="listener-port" name="port" type="number" min="1" max="65535" inputmode="numeric" placeholder="端口，如 1081" required>
+    <label class="sr-only" for="listener-mode">路由模式</label>
+    <select id="listener-mode" name="mode" aria-describedby="listener-mode-help">
+      <option value="group">指定分组</option>
+      <option value="fixed">固定节点</option>
+      <option value="rules">全局分流规则</option>
+    </select>
+    <span id="listener-mode-help" class="sr-only">指定分组会从该组选择节点；固定节点始终使用给定节点；全局分流规则复用主端口规则。</span>
+    <label id="listener-group-field" class="listener-field" for="listener-group"><span>目标分组</span><select id="listener-group" name="group" required><option value="">正在加载分组…</option></select></label>
+    <label id="listener-node-field" class="listener-field" for="listener-node-key" hidden><span>固定节点 key</span><input id="listener-node-key" name="node_key" list="listener-node-keys" placeholder="粘贴节点 key 或从节点表复制"></label>
+    <datalist id="listener-node-keys"></datalist>
+    <label class="listener-enabled" for="listener-enabled"><input id="listener-enabled" name="enabled" type="checkbox" checked><span>启用监听</span></label>
+    <div class="listener-form-actions"><button id="listener-submit" class="btn" type="submit">新增监听</button><button id="listener-cancel" class="btn-sm" type="button" data-action="cancel-listener-edit" hidden>取消编辑</button></div>
+  </form>
+  <p class="note">“指定分组”和“固定节点”均不会回退到 <span class="mono">ANY</span>；节点或分组没有可用出口时，该连接会直接失败。“全局分流规则”与主监听端口行为一致。</p>
 </div>
 
 </div>

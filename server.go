@@ -44,12 +44,14 @@ const (
 // incoming request is routed through the configured rules to a Group (or
 // DIRECT), then forwarded via that group's chosen upstream.
 type Server struct {
-	listenAddr string
-	pool       *ProxyPool
-	store      *ConfigStore
-	socksUser  string
-	socksPass  string
-	connSlots  chan struct{}
+	listenAddr  string
+	pool        *ProxyPool
+	store       *ConfigStore
+	socksUser   string
+	socksPass   string
+	connSlots   chan struct{}
+	routePolicy *listenerRoutePolicy
+	onStop      func(error)
 
 	stateMu      sync.Mutex
 	listener     net.Listener
@@ -57,6 +59,20 @@ type Server struct {
 	activeWG     sync.WaitGroup
 	shuttingDown bool
 	shutdownCh   chan struct{}
+}
+
+// listenerRoutePolicy selects the route behavior for an individual SOCKS
+// listener. A nil policy preserves the original global-rules behavior. The
+// group field is a transient, per-listener Group whose ID/Name is
+// "listener:<binding.ID>" so each port keeps its own sticky/round-robin
+// cursor in the pool's groupState, independent of other listeners that
+// target the same logical group. direct short-circuits to a direct dial
+// (group mode bound to DIRECT) and never touches the pool.
+type listenerRoutePolicy struct {
+	mode        string
+	direct      bool
+	targetGroup string
+	group       Group
 }
 
 func NewServer(listenAddr string, pool *ProxyPool, store *ConfigStore) *Server {
@@ -88,6 +104,93 @@ func NewServerWithCredentialsAndLimit(listenAddr string, pool *ProxyPool, store 
 		activeConns: make(map[net.Conn]struct{}),
 		shutdownCh:  make(chan struct{}),
 	}
+}
+
+// NewServerWithSharedAdmissionAndPolicy constructs an additional listener.
+// The caller owns the listener lifecycle; a shared admission channel makes
+// all listeners observe one process-wide connection cap.
+func NewServerWithSharedAdmissionAndPolicy(listenAddr string, pool *ProxyPool, store *ConfigStore, socksUser, socksPass string, slots chan struct{}, policy *listenerRoutePolicy) *Server {
+	s := NewServerWithCredentialsAndLimit(listenAddr, pool, store, socksUser, socksPass, cap(slots))
+	if slots != nil {
+		s.connSlots = slots
+	}
+	s.routePolicy = policy
+	return s
+}
+
+func (s *Server) setRoutePolicy(policy *listenerRoutePolicy) {
+	s.stateMu.Lock()
+	s.routePolicy = policy
+	s.stateMu.Unlock()
+}
+
+func (s *Server) currentRoutePolicy() *listenerRoutePolicy {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.routePolicy
+}
+
+func effectiveListenerGroup(policy *listenerRoutePolicy, groups []Group) Group {
+	effective := policy.group
+	if policy.mode != ListenerModeGroup || policy.targetGroup == "" {
+		return effective
+	}
+	for _, configured := range groups {
+		if configured.Name == policy.targetGroup || configured.ID == policy.targetGroup {
+			configured.ID, configured.Name = policy.group.ID, policy.group.Name
+			return configured
+		}
+	}
+	return effective
+}
+
+func (s *Server) setStopCallback(callback func(error)) {
+	s.stateMu.Lock()
+	s.onStop = callback
+	s.stateMu.Unlock()
+}
+
+// StartListener takes ownership of an already-bound listener. Registration is
+// synchronous, so callers can persist runtime state only after the port is
+// known to be reserved. Serving continues in the background until Shutdown.
+func (s *Server) StartListener(ln net.Listener) error {
+	if ln == nil {
+		return fmt.Errorf("listener is required")
+	}
+	s.stateMu.Lock()
+	if s.shuttingDown {
+		s.stateMu.Unlock()
+		_ = ln.Close()
+		return net.ErrClosed
+	}
+	if s.listener != nil {
+		s.stateMu.Unlock()
+		return fmt.Errorf("SOCKS5 server is already running")
+	}
+	s.listener = ln
+	s.stateMu.Unlock()
+	log.Printf("[server] SOCKS5 proxy listening on %s", ln.Addr())
+	go func() {
+		err := s.serve(ln)
+		_ = ln.Close()
+		s.stateMu.Lock()
+		if s.listener == ln {
+			s.listener = nil
+		}
+		shuttingDown := s.shuttingDown
+		callback := s.onStop
+		s.stateMu.Unlock()
+		if errors.Is(err, net.ErrClosed) && shuttingDown {
+			err = nil
+		}
+		if err != nil {
+			log.Printf("[server] listener %s stopped: %v", ln.Addr(), err)
+		}
+		if callback != nil {
+			callback(err)
+		}
+	}()
+	return nil
 }
 
 func (s *Server) Start() error {
@@ -323,6 +426,17 @@ func (s *Server) handleConn(conn net.Conn) {
 	rules := s.store.Rules()
 	groups := s.store.Groups()
 	groupName := MatchGroup(rules, host)
+	allowAnyFallback := true
+	if policy := s.currentRoutePolicy(); policy != nil && policy.mode != ListenerModeRules {
+		allowAnyFallback = false
+		if policy.direct {
+			groupName = GroupDirect
+		} else {
+			effectiveGroup := effectiveListenerGroup(policy, groups)
+			groupName = effectiveGroup.Name
+			groups = append(groups, effectiveGroup)
+		}
+	}
 
 	if groupName == GroupDirect {
 		remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
@@ -354,12 +468,17 @@ func (s *Server) handleConn(conn net.Conn) {
 			// commonly a country group ("COUNTRY:JP") with no live node in
 			// that country this cycle. Fall back to ANY so the request still
 			// succeeds instead of hard-failing, rather than blackholing it.
-			if groupName != GroupAny {
+			if allowAnyFallback && groupName != GroupAny {
 				log.Printf("[route] group %q has no available node, falling back to ANY", groupName)
 				groupName = GroupAny
 				continue
 			}
 			log.Printf("[server] no proxies available for group %q", groupName)
+			s.sendReply(conn, replyGeneralFailure)
+			return
+		}
+		if !allowAnyFallback && !upstream.Available {
+			log.Printf("[server] listener group %q has no available proxy", groupName)
 			s.sendReply(conn, replyGeneralFailure)
 			return
 		}

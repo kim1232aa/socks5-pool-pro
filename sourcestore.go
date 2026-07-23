@@ -36,6 +36,7 @@ const (
 	maxConfigGroups        = 1024
 	maxConfigListValues    = 4096
 	maxConfigValueBytes    = 8 << 10
+	maxConfigListeners     = 256
 
 	minSourceRefreshIntervalSeconds = 60
 	maxSourceRefreshIntervalSeconds = 7 * 24 * 60 * 60
@@ -105,11 +106,12 @@ func (source *Source) UnmarshalJSON(data []byte) error {
 }
 
 // PoolConfig is the full persisted state: sources, routing rules, custom
-// groups, and the health-check target URL.
+// groups, listener bindings, and the health-check target URL.
 type PoolConfig struct {
-	Sources []Source `json:"sources"`
-	Rules   []Rule   `json:"rules"`
-	Groups  []Group  `json:"groups"`
+	Sources   []Source          `json:"sources"`
+	Rules     []Rule            `json:"rules"`
+	Groups    []Group           `json:"groups"`
+	Listeners []ListenerBinding `json:"listeners"`
 	// CheckURL is the sole criterion for "is this node alive": every
 	// candidate is dialed through and this URL is fetched without following
 	// redirects. The built-in default must return exactly 204; a custom target
@@ -132,7 +134,7 @@ func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("pool config must be an object")
 	}
 	var out PoolConfig
-	seen := make(map[string]bool, 4)
+	seen := make(map[string]bool, 5)
 	for decoder.More() {
 		fieldToken, err := decoder.Token()
 		if err != nil {
@@ -153,6 +155,8 @@ func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
 			out.Rules, err = decodeBoundedJSONArray[Rule](decoder, maxConfigRules)
 		case "groups":
 			out.Groups, err = decodeBoundedJSONArray[Group](decoder, maxConfigGroups)
+		case "listeners":
+			out.Listeners, err = decodeBoundedJSONArray[ListenerBinding](decoder, maxConfigListeners)
 		case "check_url":
 			err = decoder.Decode(&out.CheckURL)
 		default:
@@ -698,10 +702,11 @@ func hasLogControlCharacters(value string) bool {
 
 func clonePoolConfig(cfg PoolConfig) PoolConfig {
 	out := PoolConfig{
-		Sources:  append([]Source(nil), cfg.Sources...),
-		Rules:    append([]Rule(nil), cfg.Rules...),
-		Groups:   make([]Group, len(cfg.Groups)),
-		CheckURL: cfg.CheckURL,
+		Sources:   append([]Source(nil), cfg.Sources...),
+		Rules:     append([]Rule(nil), cfg.Rules...),
+		Groups:    make([]Group, len(cfg.Groups)),
+		Listeners: append([]ListenerBinding(nil), cfg.Listeners...),
+		CheckURL:  cfg.CheckURL,
 	}
 	for i, group := range cfg.Groups {
 		out.Groups[i] = cloneGroup(group)
@@ -772,11 +777,104 @@ func validatePersistedPoolConfig(cfg *PoolConfig) error {
 			}
 		}
 	}
+	if len(cfg.Listeners) > maxConfigListeners {
+		return fmt.Errorf("listener count %d exceeds limit %d", len(cfg.Listeners), maxConfigListeners)
+	}
+	seenListenerIDs := make(map[string]struct{}, len(cfg.Listeners))
+	seenListenerPorts := make(map[int]struct{}, len(cfg.Listeners))
+	for i, listener := range cfg.Listeners {
+		normalized, err := validateListenerBinding(cfg, listener, false)
+		if err != nil {
+			return fmt.Errorf("listener %d: %w", i, err)
+		}
+		if _, exists := seenListenerIDs[normalized.ID]; exists {
+			return fmt.Errorf("listener %d has duplicate id %q", i, normalized.ID)
+		}
+		if _, exists := seenListenerPorts[normalized.Port]; exists {
+			return fmt.Errorf("listener %d has duplicate port %d", i, normalized.Port)
+		}
+		seenListenerIDs[normalized.ID] = struct{}{}
+		seenListenerPorts[normalized.Port] = struct{}{}
+		cfg.Listeners[i] = normalized
+	}
 	if cfg.CheckURL != "" {
 		cfg.CheckURL = strings.TrimSpace(cfg.CheckURL)
 		if err := validateCheckURL(cfg.CheckURL); err != nil {
 			return fmt.Errorf("check url: %w", err)
 		}
+	}
+	return nil
+}
+
+// validateListenerBinding normalizes and validates a persisted auxiliary
+// listener. Fixed node keys are intentionally not checked against the live
+// pool: configuration may be restored before that node is refreshed.
+func validateListenerBinding(cfg *PoolConfig, listener ListenerBinding, allowEmptyID bool) (ListenerBinding, error) {
+	listener.ID = strings.TrimSpace(listener.ID)
+	listener.Name = strings.TrimSpace(listener.Name)
+	listener.Mode = strings.ToLower(strings.TrimSpace(listener.Mode))
+	listener.Group = canonicalReservedGroup(listener.Group)
+	listener.NodeKey = strings.TrimSpace(listener.NodeKey)
+	for _, value := range []string{listener.ID, listener.Name, listener.Mode, listener.Group, listener.NodeKey} {
+		if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
+			return ListenerBinding{}, fmt.Errorf("contains an oversized or control-character value")
+		}
+	}
+	if (!allowEmptyID && listener.ID == "") || listener.ID != strings.TrimSpace(listener.ID) {
+		return ListenerBinding{}, fmt.Errorf("id is required")
+	}
+	if listener.Name == "" {
+		return ListenerBinding{}, fmt.Errorf("name is required")
+	}
+	if listener.Port < 1 || listener.Port > 65535 {
+		return ListenerBinding{}, fmt.Errorf("port must be between 1 and 65535")
+	}
+	if !validListenerMode(listener.Mode) {
+		return ListenerBinding{}, fmt.Errorf("unknown listener mode: %q", listener.Mode)
+	}
+	switch listener.Mode {
+	case ListenerModeGroup:
+		if listener.Group == "" {
+			return ListenerBinding{}, fmt.Errorf("group is required for group mode")
+		}
+		if code, ok := parseCountryGroup(listener.Group); ok {
+			if !validCountryGroupCode(code) {
+				return ListenerBinding{}, fmt.Errorf("country group must use a two-letter ASCII country code")
+			}
+			listener.Group = countryGroupPrefix + strings.ToUpper(code)
+		}
+		if !routingTargetExists(cfg, listener.Group) {
+			return ListenerBinding{}, fmt.Errorf("listener group does not exist: %s", listener.Group)
+		}
+		if listener.NodeKey != "" {
+			return ListenerBinding{}, fmt.Errorf("node_key is only allowed for fixed mode")
+		}
+	case ListenerModeFixed:
+		if listener.NodeKey == "" {
+			return ListenerBinding{}, fmt.Errorf("node_key is required for fixed mode")
+		}
+		if err := validateListenerNodeKey(listener.NodeKey); err != nil {
+			return ListenerBinding{}, err
+		}
+		if listener.Group != "" {
+			return ListenerBinding{}, fmt.Errorf("group is only allowed for group mode")
+		}
+	case ListenerModeRules:
+		if listener.Group != "" || listener.NodeKey != "" {
+			return ListenerBinding{}, fmt.Errorf("group and node_key must be empty for rules mode")
+		}
+	}
+	return listener, nil
+}
+
+func validateListenerNodeKey(key string) error {
+	u, err := url.Parse(key)
+	if err != nil || !isForwardingProtocol(strings.ToLower(u.Scheme)) || u.User != nil || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("node_key must be a protocol-aware proxy key")
+	}
+	port, err := strconv.ParseUint(u.Port(), 10, 16)
+	if err != nil || port == 0 {
+		return fmt.Errorf("node_key must include a port between 1 and 65535")
 	}
 	return nil
 }
@@ -838,6 +936,196 @@ func validateCheckURL(raw string) error {
 		}
 	}
 	return nil
+}
+
+// Listeners returns a defensive copy of all persisted auxiliary listener
+// bindings.
+func (cs *ConfigStore) Listeners() []ListenerBinding {
+	return cloneListeners(cs.Snapshot().Listeners)
+}
+
+// AddListener persists a new auxiliary listener binding. The ID is generated
+// server-side; callers receive the canonicalized binding back.
+func (cs *ConfigStore) AddListener(binding ListenerBinding) (ListenerBinding, error) {
+	binding.ID = generateID("listener")
+	normalized, err := validateListenerBindingForAdd(binding)
+	if err != nil {
+		return ListenerBinding{}, err
+	}
+	normalized.ID = binding.ID
+	err = cs.mutate(func(c *PoolConfig) error {
+		if len(c.Listeners) >= maxConfigListeners {
+			return fmt.Errorf("listener limit reached: at most %d listeners are allowed", maxConfigListeners)
+		}
+		if listenerPortTakenLocked(c, normalized.Port) {
+			return fmt.Errorf("port %d is already in use by another listener", normalized.Port)
+		}
+		finalized, err := validateListenerBinding(c, normalized, false)
+		if err != nil {
+			return err
+		}
+		c.Listeners = append(c.Listeners, finalized)
+		return nil
+	})
+	if err != nil {
+		return ListenerBinding{}, err
+	}
+	return cs.lookupListener(normalized.ID, normalized.Port)
+}
+
+// validateListenerBindingForAdd normalizes an incoming binding before the
+// store mutation runs, so structural failures return before any write.
+func validateListenerBindingForAdd(binding ListenerBinding) (ListenerBinding, error) {
+	binding.Name = strings.TrimSpace(binding.Name)
+	binding.Mode = strings.ToLower(strings.TrimSpace(binding.Mode))
+	binding.Group = canonicalReservedGroup(binding.Group)
+	binding.NodeKey = strings.TrimSpace(binding.NodeKey)
+	if binding.Name == "" {
+		return ListenerBinding{}, fmt.Errorf("name is required")
+	}
+	if binding.Port < 1 || binding.Port > 65535 {
+		return ListenerBinding{}, fmt.Errorf("port must be between 1 and 65535")
+	}
+	if !validListenerMode(binding.Mode) {
+		return ListenerBinding{}, fmt.Errorf("unknown listener mode: %q", binding.Mode)
+	}
+	for _, value := range []string{binding.Name, binding.Group, binding.NodeKey} {
+		if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
+			return ListenerBinding{}, fmt.Errorf("contains an oversized or control-character value")
+		}
+	}
+	return binding, nil
+}
+
+// UpdateListener replaces an existing binding by ID. Port collisions with
+// other listeners are rejected. group-mode references are re-validated against
+// the current group set so an update can never strand a listener on a group
+// that no longer exists.
+func (cs *ConfigStore) UpdateListener(binding ListenerBinding) (ListenerBinding, error) {
+	binding.ID = strings.TrimSpace(binding.ID)
+	if binding.ID == "" {
+		return ListenerBinding{}, fmt.Errorf("id is required")
+	}
+	normalized, err := validateListenerBindingForAdd(binding)
+	if err != nil {
+		return ListenerBinding{}, err
+	}
+	normalized.ID = binding.ID
+	err = cs.mutate(func(c *PoolConfig) error {
+		idx := -1
+		for i, existing := range c.Listeners {
+			if existing.ID == normalized.ID {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			return fmt.Errorf("listener not found: %s", normalized.ID)
+		}
+		for i, existing := range c.Listeners {
+			if i == idx {
+				continue
+			}
+			if existing.Port == normalized.Port {
+				return fmt.Errorf("port %d is already in use by another listener", normalized.Port)
+			}
+		}
+		finalized, err := validateListenerBinding(c, normalized, false)
+		if err != nil {
+			return err
+		}
+		c.Listeners[idx] = finalized
+		return nil
+	})
+	if err != nil {
+		return ListenerBinding{}, err
+	}
+	return cs.lookupListener(normalized.ID, normalized.Port)
+}
+
+// DeleteListener removes the binding with the given ID. Missing IDs are an
+// error so callers can distinguish a no-op from a successful delete.
+func (cs *ConfigStore) DeleteListener(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("id is required")
+	}
+	return cs.mutate(func(c *PoolConfig) error {
+		for i, existing := range c.Listeners {
+			if existing.ID == id {
+				c.Listeners = append(c.Listeners[:i], c.Listeners[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("listener not found: %s", id)
+	})
+}
+
+// ReplaceListeners atomically swaps the entire listener set. It is the
+// rollback path for the listener manager: a failed hot-reload restores the
+// previous bindings in one write. group references must still resolve against
+// the current group set.
+func (cs *ConfigStore) ReplaceListeners(bindings []ListenerBinding) error {
+	if len(bindings) > maxConfigListeners {
+		return fmt.Errorf("listener limit reached: at most %d listeners are allowed", maxConfigListeners)
+	}
+	seenIDs := make(map[string]struct{}, len(bindings))
+	seenPorts := make(map[int]struct{}, len(bindings))
+	normalized := make([]ListenerBinding, 0, len(bindings))
+	for _, binding := range bindings {
+		binding.ID = strings.TrimSpace(binding.ID)
+		// Allow empty IDs here only if every binding carries one; the
+		// manager always supplies stable IDs, so require them.
+		binding.Name = strings.TrimSpace(binding.Name)
+		binding.Mode = strings.ToLower(strings.TrimSpace(binding.Mode))
+		binding.Group = canonicalReservedGroup(binding.Group)
+		binding.NodeKey = strings.TrimSpace(binding.NodeKey)
+		if binding.ID == "" {
+			return fmt.Errorf("listener id is required")
+		}
+		if _, exists := seenIDs[binding.ID]; exists {
+			return fmt.Errorf("duplicate listener id %q", binding.ID)
+		}
+		if _, exists := seenPorts[binding.Port]; exists {
+			return fmt.Errorf("duplicate listener port %d", binding.Port)
+		}
+		seenIDs[binding.ID] = struct{}{}
+		seenPorts[binding.Port] = struct{}{}
+		normalized = append(normalized, binding)
+	}
+	return cs.mutate(func(c *PoolConfig) error {
+		for i, binding := range normalized {
+			finalized, err := validateListenerBinding(c, binding, false)
+			if err != nil {
+				return fmt.Errorf("listener %d: %w", i, err)
+			}
+			normalized[i] = finalized
+		}
+		c.Listeners = normalized
+		return nil
+	})
+}
+
+func (cs *ConfigStore) lookupListener(id string, port int) (ListenerBinding, error) {
+	for _, existing := range cs.Listeners() {
+		if existing.ID == id {
+			return existing, nil
+		}
+	}
+	return ListenerBinding{}, fmt.Errorf("listener not found after write: %s (port %d)", id, port)
+}
+
+func listenerPortTakenLocked(c *PoolConfig, port int) bool {
+	for _, existing := range c.Listeners {
+		if existing.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneListeners(bindings []ListenerBinding) []ListenerBinding {
+	return append([]ListenerBinding(nil), bindings...)
 }
 
 // readPrivateRegularFile treats persisted state as untrusted input. It rejects

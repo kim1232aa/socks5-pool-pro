@@ -306,6 +306,10 @@ func main() {
 	}()
 
 	status := NewStatusServerWithAdminCredentialsAndCoordinator(pool, store, coordinator, cfg.AdminUser, cfg.AdminPass)
+	listenerManager := NewListenerManager(
+		cfg.ListenAddr, pool, store, cfg.SOCKSUser, cfg.SOCKSPass, cfg.MaxClientConnections,
+	)
+	status.SetListenerManager(listenerManager)
 	trustedManagementProxies := make([]string, 0, len(cfg.TrustedManagementProxies))
 	for _, ip := range cfg.TrustedManagementProxies {
 		trustedManagementProxies = append(trustedManagementProxies, ip.String())
@@ -313,9 +317,13 @@ func main() {
 	if err := status.SetTrustedManagementProxies(trustedManagementProxies); err != nil {
 		log.Fatalf("[main] invalid trusted management proxy: %v", err)
 	}
-	server := NewServerWithCredentialsAndLimit(
-		cfg.ListenAddr, pool, store, cfg.SOCKSUser, cfg.SOCKSPass, cfg.MaxClientConnections,
+	server := NewServerWithSharedAdmissionAndPolicy(
+		cfg.ListenAddr, pool, store, cfg.SOCKSUser, cfg.SOCKSPass, listenerManager.slots, nil,
 	)
+
+	if err := listenerManager.Start(); err != nil {
+		log.Fatalf("[main] start additional listeners: %v", err)
+	}
 
 	// Treat both listeners as one service. A bind/runtime failure in either is
 	// fatal, while SIGINT/SIGTERM closes admission, drains handlers to a bounded
@@ -342,6 +350,9 @@ func main() {
 	defer cancelShutdown()
 	if err := status.Shutdown(shutdownContext); err != nil {
 		log.Printf("[status] shutdown: %v", err)
+	}
+	if err := listenerManager.Shutdown(shutdownContext); err != nil {
+		log.Printf("[listeners] shutdown: %v", err)
 	}
 	if err := server.Shutdown(shutdownContext); err != nil {
 		log.Printf("[server] shutdown: %v", err)
@@ -668,7 +679,7 @@ func refreshSource(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator
 	if !exists || currentSource.URL != source.URL || currentSource.Format != source.Format || currentSource.Protocol != source.Protocol {
 		return refreshRunResult{Status: "skipped", Error: "source changed during refresh"}
 	}
-	catalogRefresh := pool.candidates.begin(deduped, labels, retained, len(retained))
+	catalogRefresh := pool.candidates.begin(deduped, labels, retained, 0)
 	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
 		pool.candidates.complete(catalogRefresh, nil, nil, nil)
 		return refreshRunResult{Status: "skipped", Error: "health criterion changed during refresh"}

@@ -12,6 +12,7 @@ services:
     stop_grace_period: 45s
     ports:
       - "127.0.0.1:${SOCKS_PORT:-1080}:1080"
+      - "127.0.0.1:${SOCKS_AUX_PORTS:-1081-1180}:${SOCKS_AUX_PORTS:-1081-1180}"
       - "127.0.0.1:${DASHBOARD_PORT:-8080}:8080"
     environment:
       SOCKS_USER: "${SOCKS_USER:-}"

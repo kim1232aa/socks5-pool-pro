@@ -376,7 +376,7 @@ func (c *CandidateCatalog) begin(candidates []Proxy, sourceLabels map[string]str
 	// failures without turning removed entries from healthy feeds immortal.
 	if previous := c.snapshot.Load(); previous != nil && len(previous.records) > 0 {
 		previous.mu.RLock()
-		if sourceErrors > 0 {
+		if len(failedSources) > 0 {
 			snapshot = mergeCandidateSnapshots(previous, snapshot, failedSources)
 		} else {
 			carryCandidateHistory(previous, snapshot)

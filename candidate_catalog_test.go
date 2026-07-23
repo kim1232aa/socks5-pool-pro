@@ -169,6 +169,35 @@ func TestCandidateCatalogPartialSourceCycleUnionsInsteadOfDeleting(t *testing.T)
 	}
 }
 
+func TestCandidateCatalogRetainsUntouchedSourcesWithoutReportingErrors(t *testing.T) {
+	pool := NewProxyPool()
+	oldA := Proxy{IP: "192.0.2.13", Port: "80", Protocol: "http", SourceName: "source-a"}
+	oldB := Proxy{IP: "192.0.2.14", Port: "80", Protocol: "http", SourceName: "source-b"}
+	first := pool.candidates.begin([]Proxy{oldA, oldB}, nil, nil, 0)
+	pool.candidates.complete(first, nil, nil, nil)
+
+	newA := Proxy{IP: "192.0.2.15", Port: "80", Protocol: "http", SourceName: "source-a"}
+	refresh := pool.candidates.begin(
+		[]Proxy{newA},
+		nil,
+		map[string]bool{legacySourceKey("source-b"): true},
+		0,
+	)
+	pool.candidates.complete(refresh, nil, nil, nil)
+
+	page, _ := getCandidatePage(t, NewStatusServer(pool, &ConfigStore{}).handler(), "/api/candidates/page?page_size=100")
+	if page.Phase != "complete" || page.SourceErrors != 0 {
+		t.Fatalf("single-source refresh phase=%q errors=%d, want complete/0", page.Phase, page.SourceErrors)
+	}
+	keys := make(map[string]bool, len(page.Candidates))
+	for _, candidate := range page.Candidates {
+		keys[candidate.Key] = true
+	}
+	if keys[oldA.Key()] || !keys[newA.Key()] || !keys[oldB.Key()] {
+		t.Fatalf("single-source refresh keys=%v; want new A and retained B", keys)
+	}
+}
+
 func TestCandidateCatalogMergesSourcesOnPartialOverlap(t *testing.T) {
 	pool := NewProxyPool()
 	pxA := Proxy{IP: "192.0.2.20", Port: "1080", Protocol: "socks5", SourceName: "source-a", SourceNames: []string{"source-a"}}

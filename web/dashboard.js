@@ -2028,15 +2028,152 @@ function runVerify(btn) {
     });
 }
 
+var listenerBindings = [];
+var listenerGroupsLoaded = false;
+var listenerRequest = null;
+
+function listenerModeLabel(mode) {
+  return {group:'指定分组', fixed:'固定节点', rules:'全局分流规则'}[mode] || mode || '未知';
+}
+
+function listenerStatus(view) {
+  if (view.error) return '<span class="listener-state error">错误</span><span class="listener-error">' + escapeHtml(view.error) + '</span>';
+  if (!view.enabled) return '<span class="listener-state muted">已停用</span>';
+  return view.listening ? '<span class="listener-state online">监听中</span>' : '<span class="listener-state muted">未监听</span>';
+}
+
+function listenerTarget(view) {
+  if (view.mode === 'group') return '<span class="mono">' + escapeHtml(view.group || '') + '</span>';
+  if (view.mode === 'fixed') return '<span class="mono listener-key">' + escapeHtml(view.node_key || '') + '</span>';
+  return '<span class="small">复用主端口规则</span>';
+}
+
+function renderListeners(listeners) {
+  listenerBindings = Array.isArray(listeners) ? listeners : [];
+  var body = document.getElementById('listener-tbody');
+  if (!body) return;
+  if (!listenerBindings.length) {
+    body.innerHTML = '<tr><td class="empty" colspan="7">尚未配置附加监听端口。可在下方新增一个专用 SOCKS5 入口。</td></tr>';
+    return;
+  }
+  body.innerHTML = listenerBindings.map(function(view) {
+    var address = view.listen_addr || (view.port ? ':' + view.port : '');
+    var enabled = !!view.enabled;
+    return '<tr data-listener-id="' + escapeHtml(view.id) + '">' +
+      '<td data-label="名称"><strong>' + escapeHtml(view.name) + '</strong></td>' +
+      '<td data-label="端口 / 地址" class="mono">' + escapeHtml(String(view.port || '')) + (address ? '<span class="listener-address">' + escapeHtml(address) + '</span>' : '') + '</td>' +
+      '<td data-label="模式">' + escapeHtml(listenerModeLabel(view.mode)) + '</td>' +
+      '<td data-label="组 / 固定节点">' + listenerTarget(view) + '</td>' +
+      '<td data-label="启用"><label class="switch"><input type="checkbox" data-action="toggle-listener" aria-label="' + (enabled ? '停用' : '启用') + '监听端口 ' + escapeHtml(view.name) + '"' + (enabled ? ' checked' : '') + '><span class="slider"></span></label></td>' +
+      '<td data-label="运行状态 / 错误">' + listenerStatus(view) + '</td>' +
+      '<td data-label="操作"><div class="listener-row-actions"><button type="button" class="btn-sm" data-action="edit-listener">编辑</button><button type="button" class="btn-sm danger" data-action="delete-listener">删除</button></div></td></tr>';
+  }).join('');
+}
+
+function requestListenerGroups() {
+  if (listenerGroupsLoaded) return Promise.resolve();
+  return fetchJSON('/api/groups').then(function(groups) {
+    var select = document.getElementById('listener-group');
+    if (!select) return;
+    var reserved = ['ANY', 'DIRECT'];
+    var names = reserved.concat((Array.isArray(groups) ? groups : []).map(function(g) { return g.name; }).filter(Boolean));
+    names = names.filter(function(name, index) { return names.indexOf(name) === index; });
+    select.innerHTML = '<option value="">选择分组</option>' + names.map(function(name) { return '<option value="' + escapeHtml(name) + '">' + escapeHtml(name) + '</option>'; }).join('');
+    listenerGroupsLoaded = true;
+  }).catch(function(err) { notify('无法加载分组：' + String(err), 'error', 7000); });
+}
+
+function updateListenerNodeKeys() {
+  var list = document.getElementById('listener-node-keys');
+  if (!list) return;
+  var nodes = (nodePageData && Array.isArray(nodePageData.nodes)) ? nodePageData.nodes : [];
+  list.innerHTML = nodes.map(function(node) { return '<option value="' + escapeHtml(node.key || '') + '">' + escapeHtml(node.proxy_url || node.addr || node.key || '') + '</option>'; }).join('');
+}
+
+function syncListenerMode() {
+  var form = document.getElementById('form-listener');
+  if (!form) return;
+  var mode = form.mode.value;
+  var groupField = document.getElementById('listener-group-field');
+  var nodeField = document.getElementById('listener-node-field');
+  groupField.hidden = mode !== 'group';
+  nodeField.hidden = mode !== 'fixed';
+  form.group.required = mode === 'group';
+  form.node_key.required = mode === 'fixed';
+  if (mode !== 'group') form.group.value = '';
+  if (mode !== 'fixed') form.node_key.value = '';
+}
+
+function requestListeners(force) {
+  if (listenerRequest && !force) return listenerRequest;
+  setListNotice('listener-notice', 'loading', '正在读取监听端口…');
+  listenerRequest = Promise.all([fetchJSON('/api/listeners'), requestListenerGroups()])
+    .then(function(result) { renderListeners(result[0] && result[0].listeners); updateListenerNodeKeys(); setListNotice('listener-notice', '', ''); })
+    .catch(function(err) { setListNotice('listener-notice', 'error', '无法读取监听端口：' + String(err)); })
+    .finally(function() { listenerRequest = null; });
+  return listenerRequest;
+}
+
+function listenerFromRow(element) {
+  var row = element.closest ? element.closest('tr[data-listener-id]') : null;
+  var id = row ? row.getAttribute('data-listener-id') : '';
+  return listenerBindings.filter(function(item) { return item.id === id; })[0] || null;
+}
+
+function resetListenerForm() {
+  var form = document.getElementById('form-listener');
+  if (!form) return;
+  form.reset(); form.id.value = ''; form.mode.value = 'group'; form.enabled.checked = true;
+  setText('listener-form-title', '新增监听端口'); setText('listener-form-help', '选择分组、固定节点或复用全局分流规则。');
+  setText('listener-submit', '新增监听'); document.getElementById('listener-cancel').hidden = true;
+  syncListenerMode();
+}
+
+function editListener(element) {
+  var item = listenerFromRow(element); if (!item) return;
+  var form = document.getElementById('form-listener');
+  form.id.value = item.id || ''; form.name.value = item.name || ''; form.port.value = item.port || '';
+  form.mode.value = item.mode || 'group'; form.group.value = item.group || ''; form.node_key.value = item.node_key || ''; form.enabled.checked = !!item.enabled;
+  setText('listener-form-title', '编辑监听端口'); setText('listener-form-help', '保存会热更新该端口；新连接立即按新配置路由。');
+  setText('listener-submit', '保存修改'); document.getElementById('listener-cancel').hidden = false;
+  syncListenerMode(); form.scrollIntoView({block:'nearest', behavior:'smooth'}); form.name.focus();
+}
+
+function saveListener(form) {
+  var body = {id:form.id.value.trim(), name:form.name.value.trim(), port:Number(form.port.value), mode:form.mode.value, group:form.mode.value === 'group' ? form.group.value : '', node_key:form.mode.value === 'fixed' ? form.node_key.value.trim() : '', enabled:!!form.enabled.checked};
+  var updating = !!body.id;
+  fetchJSON(updating ? '/api/listeners/update' : '/api/listeners', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+    .then(function() { notify(updating ? '监听端口已更新' : '监听端口已新增', 'success'); resetListenerForm(); return requestListeners(true); })
+    .catch(function(err) { notify(String(err), 'error', 7000); });
+}
+
+function updateListenerEnabled(element) {
+  var item = listenerFromRow(element); if (!item) return;
+  var body = {id:item.id, name:item.name, port:item.port, mode:item.mode, group:item.group || '', node_key:item.node_key || '', enabled:!!element.checked};
+  element.disabled = true;
+  fetchJSON('/api/listeners/update', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+    .then(function() { notify(body.enabled ? '监听端口已启用' : '监听端口已停用', 'success'); return requestListeners(true); })
+    .catch(function(err) { element.checked = !body.enabled; notify(String(err), 'error', 7000); })
+    .finally(function() { element.disabled = false; });
+}
+
+function deleteListener(element) {
+  var item = listenerFromRow(element); if (!item || !confirm('删除监听端口 “' + item.name + '”？对应监听器会立即关闭。')) return;
+  fetchJSON('/api/listeners/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:item.id})})
+    .then(function() { notify('监听端口已删除', 'success'); if (document.getElementById('listener-id').value === item.id) resetListenerForm(); return requestListeners(true); })
+    .catch(function(err) { notify(String(err), 'error', 7000); });
+}
+
 function showTab(name) {
-  var validTabs = ['nodes','candidates','sources','rules','groups'];
+  var validTabs = ['nodes','candidates','sources','rules','groups','listeners'];
   if (validTabs.indexOf(name) < 0) name = 'nodes';
   var viewMeta = {
     nodes: ['转发代理池','健康节点、真实出口与全量复检。'],
     candidates: ['候选库存','按资源类型与来源地区浏览完整快照。'],
     sources: ['来源订阅','抓取入口、格式与库存保留策略。'],
     rules: ['分流规则','从上到下构建可预测的路由决策。'],
-    groups: ['分组策略','组合节点、地区、协议与来源。']
+    groups: ['分组策略','组合节点、地区、协议与来源。'],
+    listeners: ['监听端口','独立 SOCKS5 入口与专属路由方式。']
   };
   document.body.dataset.view = name;
   setText('page-title', viewMeta[name][0]);
@@ -2067,6 +2204,7 @@ function showTab(name) {
   if (leavingCandidates || !pageIsVisible()) abortCandidateRequest();
   if (name === 'nodes' && pageIsVisible()) requestNodes(true);
   if (name === 'candidates' && pageIsVisible()) requestCandidates(true);
+  if (name === 'listeners' && pageIsVisible()) requestListeners(true);
   if (previousTab !== name && target) {
     requestAnimationFrame(function(){ target.scrollIntoView({block:'start', behavior:'auto'}); });
   }
@@ -2074,7 +2212,7 @@ function showTab(name) {
 
 function syncTabFromHash() {
   var requested = (location.hash || '#nodes').slice(1);
-  if (['nodes','candidates','sources','rules','groups'].indexOf(requested) < 0) {
+  if (['nodes','candidates','sources','rules','groups','listeners'].indexOf(requested) < 0) {
     requested = 'nodes';
     history.replaceState(null, '', location.pathname + location.search + '#nodes');
   }
@@ -2175,7 +2313,11 @@ document.addEventListener('click', function(event) {
       break;
     case 'toggle-node-details': toggleNodeDetails(actionElement); break;
     case 'goto-node-page': gotoPage(actionElement.getAttribute('data-page')); break;
-    case 'set-auto': setAuto(); break;
+    case 'refresh-listeners': requestListeners(true); break;
+    case 'edit-listener': editListener(actionElement); break;
+    case 'toggle-listener': updateListenerEnabled(actionElement); break;
+    case 'delete-listener': deleteListener(actionElement); break;
+    case 'cancel-listener-edit': resetListenerForm(); break;
     default: return;
   }
   event.preventDefault();
@@ -2211,7 +2353,14 @@ document.getElementById('form-add-group').addEventListener('submit', function(e)
   var f = e.target;
   function splitList(v) { return v.split(',').map(function(s){ return s.trim(); }).filter(Boolean); }
   postJSON('/api/groups', {
+
     name: f.name.value, strategy: f.strategy.value, nodes: splitList(f.nodes.value),
     countries: splitList(f.countries.value), protocols: splitList(f.protocols.value), sources: splitList(f.sources.value)
   }, function(err) { if (err) { notify(err, 'error', 7000); } else { location.hash = 'groups'; location.reload(); } });
 });
+
+document.getElementById('form-listener').addEventListener('submit', function(e) {
+  e.preventDefault();
+  saveListener(e.target);
+});
+document.getElementById('listener-mode').addEventListener('change', syncListenerMode);

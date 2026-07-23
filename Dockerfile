@@ -17,7 +17,7 @@ WORKDIR /app
 COPY --from=builder /app/socks5-pool .
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-EXPOSE 1080 8080
+EXPOSE 1080 1081-1180 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD su-exec socks5:socks5 wget -q -O /dev/null -T 3 'http://127.0.0.1:8080/healthz' || exit 1

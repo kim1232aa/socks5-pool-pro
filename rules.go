@@ -304,6 +304,11 @@ func (cs *ConfigStore) DeleteGroup(id string) error {
 						return fmt.Errorf("group %q is still referenced by routing rule %q", g.Name, rule.ID)
 					}
 				}
+				for _, listener := range c.Listeners {
+					if listener.Mode == ListenerModeGroup && strings.EqualFold(listener.Group, g.Name) {
+						return fmt.Errorf("group %q is still referenced by listener %q", g.Name, listener.ID)
+					}
+				}
 				c.Groups = append(c.Groups[:i], c.Groups[i+1:]...)
 				return nil
 			}
@@ -353,4 +358,39 @@ func canonicalReservedGroup(group string) string {
 		return GroupDirect
 	}
 	return group
+}
+
+// ListenerBinding is a persisted SOCKS5 listener port binding. The primary
+// -listen port is not represented here; it always uses the global rule table.
+// Each entry adds an extra listening port that routes through either a named
+// group, a single fixed node, or the global rule table.
+//
+// Enabled is persisted explicitly (no omitempty) so a disabled listener is a
+// first-class state rather than "absent".
+type ListenerBinding struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Port    int    `json:"port"`
+	Mode    string `json:"mode"`
+	Group   string `json:"group,omitempty"`
+	NodeKey string `json:"node_key,omitempty"`
+	Enabled bool   `json:"enabled"`
+}
+
+// Listener mode constants. group = pick from a named group (never falls back
+// to ANY); fixed = pin to one node key (never falls back to ANY); rules =
+// reuse the global routing table via store.Rules() + MatchGroup.
+const (
+	ListenerModeGroup = "group"
+	ListenerModeFixed = "fixed"
+	ListenerModeRules = "rules"
+)
+
+// validListenerMode reports whether m is a recognized listener mode.
+func validListenerMode(m string) bool {
+	switch m {
+	case ListenerModeGroup, ListenerModeFixed, ListenerModeRules:
+		return true
+	}
+	return false
 }
