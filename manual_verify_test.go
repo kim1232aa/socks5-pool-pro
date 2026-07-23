@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -184,6 +185,27 @@ func TestManualNodeVerifyRejectsDuplicateAndOverCapacityWork(t *testing.T) {
 	}
 }
 
+func TestManualNodeVerifyAppliesSameNodeCooldown(t *testing.T) {
+	server := NewStatusServer(NewProxyPool(), &ConfigStore{})
+	const key = "socks5://198.51.100.3:1080"
+	if err := server.beginManualNodeVerify(key); err != nil {
+		t.Fatal(err)
+	}
+	server.endManualNodeVerify(key)
+	err := server.beginManualNodeVerify(key)
+	var cooldown *nodeOperationCooldownError
+	if !errors.As(err, &cooldown) || cooldown.Remaining <= 0 || cooldown.Remaining > nodeManualVerifyCooldown {
+		t.Fatalf("verify cooldown error = %#v, want remaining within %s", err, nodeManualVerifyCooldown)
+	}
+	server.nodeVerifyMu.Lock()
+	server.nodeVerifyCooldownUntil[key] = time.Now().Add(-time.Second)
+	server.nodeVerifyMu.Unlock()
+	if err := server.beginManualNodeVerify(key); err != nil {
+		t.Fatalf("manual verify after cooldown = %v", err)
+	}
+	server.endManualNodeVerify(key)
+}
+
 func TestManualNodeVerifyRetriesUntilSuccessAndUsesSuccessfulAttemptLatency(t *testing.T) {
 	px := Proxy{IP: "192.0.2.70", Port: "1080", Protocol: "socks5", Available: false, LatencyMs: 999}
 	pool := NewProxyPool()
@@ -230,15 +252,15 @@ func TestManualNodeVerifyRetriesUntilSuccessAndUsesSuccessfulAttemptLatency(t *t
 	if checks.Load() != 2 || exits.Load() != 1 || geos.Load() != 0 {
 		t.Fatalf("operation calls check/exit/geo = %d/%d/%d", checks.Load(), exits.Load(), geos.Load())
 	}
-	if len(attemptTimeouts) != 2 || attemptTimeouts[0] != 10*time.Second || attemptTimeouts[1] != 8*time.Second {
-		t.Fatalf("attempt timeout sequence = %v, want [10s 8s]", attemptTimeouts)
+	if len(attemptTimeouts) != 2 || attemptTimeouts[0] != 6*time.Second || attemptTimeouts[1] != 4*time.Second {
+		t.Fatalf("attempt timeout sequence = %v, want [6s 4s]", attemptTimeouts)
 	}
 	updated, ok := pool.Find(px.Key())
 	if !ok || !updated.Available || updated.LatencyMs != 137 {
 		t.Fatalf("successful retry pool state = found=%v proxy=%#v", ok, updated)
 	}
-	if successes, failures := pool.StatsOf(px.Key()); successes != 1 || failures != 2 {
-		t.Fatalf("successful retry stats = %d/%d, want 1/2", successes, failures)
+	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 0 {
+		t.Fatalf("manual health observation changed forwarding stats = %d/%d", successes, failures)
 	}
 }
 
@@ -265,21 +287,21 @@ func TestManualNodeVerifyAllAttemptsFailAsOneHealthObservation(t *testing.T) {
 	}
 
 	body, status := invokeManualNodeVerify(t, server, px.Key(), context.Background())
-	if status != http.StatusOK || body.Reachable || !body.Available || body.Attempts != 3 || body.LatencyMs != 0 || body.ConsecutiveFailures != 1 {
+	if status != http.StatusOK || body.Reachable || body.Available || body.Attempts != 3 || body.LatencyMs != 0 || body.ConsecutiveFailures != 1 {
 		t.Fatalf("all-failed response status=%d body=%#v", status, body)
 	}
 	if checks.Load() != 3 || exits.Load() != 0 {
 		t.Fatalf("all-failed calls check/exit = %d/%d", checks.Load(), exits.Load())
 	}
-	if len(attemptTimeouts) != 3 || attemptTimeouts[0] != 10*time.Second || attemptTimeouts[1] != 8*time.Second || attemptTimeouts[2] != 8*time.Second {
-		t.Fatalf("attempt timeout sequence = %v, want [10s 8s 8s]", attemptTimeouts)
+	if len(attemptTimeouts) != 3 || attemptTimeouts[0] != 6*time.Second || attemptTimeouts[1] != 4*time.Second || attemptTimeouts[2] != 4*time.Second {
+		t.Fatalf("attempt timeout sequence = %v, want [6s 4s 4s]", attemptTimeouts)
 	}
 	updated, ok := pool.Find(px.Key())
-	if !ok || !updated.Available || updated.LatencyMs != 321 {
-		t.Fatalf("debounced failed pool state = found=%v proxy=%#v", ok, updated)
+	if !ok || updated.Available || !updated.HealthInvalidated || updated.LatencyMs != 321 {
+		t.Fatalf("terminal failed pool state = found=%v proxy=%#v", ok, updated)
 	}
-	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 1 {
-		t.Fatalf("all attempts counted as %d/%d observations, want 0/1", successes, failures)
+	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 0 {
+		t.Fatalf("manual health observation changed forwarding stats = %d/%d", successes, failures)
 	}
 }
 

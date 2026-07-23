@@ -11,15 +11,14 @@ import (
 )
 
 const (
-	maxManualNodeVerifyConcurrent = 4
+	maxManualNodeVerifyConcurrent = 16
 	manualNodeVerifyMaxAttempts   = 3
-	manualNodeVerifyExitTimeout   = 5 * time.Second
-	manualNodeVerifyGeoTimeout    = 5 * time.Second
-	// Worst case: 10s + 200ms + 8s + 400ms + 8s connectivity, followed by
-	// 5s exit and 5s geo. The 40-second outer guard stays comfortably below
-	// StatusServer's 45s WriteTimeout while preserving the old 10-second first
-	// attempt for genuinely slow nodes.
-	manualNodeVerifyTotalTimeout = 40 * time.Second
+	manualNodeVerifyExitTimeout   = 3 * time.Second
+	manualNodeVerifyGeoTimeout    = 3 * time.Second
+	// Worst case: 6s + 150ms + 4s + 150ms + 4s connectivity, followed by
+	// 3s exit and 3s geo. The outer guard stays below the status server write
+	// timeout while allowing the final successful attempt to finish metadata.
+	manualNodeVerifyTotalTimeout = 22 * time.Second
 )
 
 type manualNodeVerifyCheckFunc func(context.Context, Proxy, string, time.Duration) (bool, time.Duration)
@@ -48,21 +47,47 @@ func defaultManualNodeVerifyOperations() manualNodeVerifyOperations {
 	}
 }
 
-// beginManualNodeVerify bounds the expensive 40-second verification path and
-// rejects duplicate clicks for the same node instead of starting competing
-// probes that would distort its health-failure streak.
+// nodeOperationCooldownError reports a same-node cooldown with an exact retry delay.
+type nodeOperationCooldownError struct {
+	Operation string
+	Remaining time.Duration
+}
+
+func (e *nodeOperationCooldownError) Error() string {
+	return fmt.Sprintf("该节点%s冷却中，请在 %d 秒后重试", e.Operation, retryAfterSeconds(e.Remaining))
+}
+
+func retryAfterSeconds(remaining time.Duration) int {
+	seconds := int((remaining + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+// beginManualNodeVerify also rejects duplicate clicks for the same node instead
+// of starting competing probes that would distort its health-failure streak.
 func (s *StatusServer) beginManualNodeVerify(key string) error {
 	s.nodeVerifyMu.Lock()
 	defer s.nodeVerifyMu.Unlock()
+	now := time.Now()
+	for candidateKey, until := range s.nodeVerifyCooldownUntil {
+		if !until.After(now) {
+			delete(s.nodeVerifyCooldownUntil, candidateKey)
+		}
+	}
 	if _, running := s.nodeVerifyRunning[key]; running {
 		return fmt.Errorf("该节点正在复检")
+	}
+	if until := s.nodeVerifyCooldownUntil[key]; until.After(now) {
+		return &nodeOperationCooldownError{Operation: "复检", Remaining: until.Sub(now)}
 	}
 	select {
 	case s.nodeVerifySlots <- struct{}{}:
 		s.nodeVerifyRunning[key] = struct{}{}
 		return nil
 	default:
-		return fmt.Errorf("复检任务已满,请稍后重试")
+		return fmt.Errorf("复检并发已达上限，请稍后重试")
 	}
 }
 
@@ -70,6 +95,7 @@ func (s *StatusServer) endManualNodeVerify(key string) {
 	s.nodeVerifyMu.Lock()
 	if _, running := s.nodeVerifyRunning[key]; running {
 		delete(s.nodeVerifyRunning, key)
+		s.nodeVerifyCooldownUntil[key] = time.Now().Add(nodeManualVerifyCooldown)
 		<-s.nodeVerifySlots
 	}
 	s.nodeVerifyMu.Unlock()
@@ -124,16 +150,13 @@ func runManualNodeVerifyChecks(ctx context.Context, operations manualNodeVerifyO
 
 func manualNodeVerifyAttemptTimeout(attemptIndex int) time.Duration {
 	if attemptIndex <= 0 {
-		return 10 * time.Second
+		return 6 * time.Second
 	}
-	return 8 * time.Second
+	return 4 * time.Second
 }
 
 func manualNodeVerifyRetryBackoff(completedAttempts int) time.Duration {
-	if completedAttempts <= 1 {
-		return 200 * time.Millisecond
-	}
-	return 400 * time.Millisecond
+	return 150 * time.Millisecond
 }
 
 // manualNodeLabelMatch keeps the historical label_matched boolean compatible

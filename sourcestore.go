@@ -37,6 +37,9 @@ const (
 	maxConfigListValues    = 4096
 	maxConfigValueBytes    = 8 << 10
 
+	minSourceRefreshIntervalSeconds = 60
+	maxSourceRefreshIntervalSeconds = 7 * 24 * 60 * 60
+
 	legacyProxyIPSourceName = "ProxyIP (Cloudflare edge)"
 	legacyProxyIPSourceNote = "这些是 Cloudflare 边缘优选 IP，用于 Worker/VLESS/Trojan 类隧道脚本的反代地址，不支持通用 SOCKS5/HTTP 协议，不会参与本地转发，仅供查看和导出使用"
 
@@ -73,9 +76,32 @@ type Source struct {
 	// authoritative empty inventory. It is deliberately opt-in: by default an
 	// unexpectedly empty feed is treated as a failed refresh so its last-known
 	// good candidates remain available.
-	AllowEmpty bool   `json:"allow_empty,omitempty"`
-	Builtin    bool   `json:"builtin"`
-	Note       string `json:"note,omitempty"`
+	AllowEmpty bool `json:"allow_empty,omitempty"`
+	// AutoRefreshEnabled controls scheduled refreshes for this source.
+	// RefreshIntervalSeconds is zero when the global scrape interval applies.
+	AutoRefreshEnabled     bool   `json:"auto_refresh_enabled"`
+	RefreshIntervalSeconds int    `json:"refresh_interval_seconds"`
+	Builtin                bool   `json:"builtin"`
+	Note                   string `json:"note,omitempty"`
+	autoRefreshMissing     bool
+}
+
+// UnmarshalJSON preserves an explicit false while defaulting legacy records
+// that predate auto_refresh_enabled to automatic refreshes.
+func (source *Source) UnmarshalJSON(data []byte) error {
+	type sourceJSON Source
+	out := sourceJSON{AutoRefreshEnabled: true}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	_, present := fields["auto_refresh_enabled"]
+	out.autoRefreshMissing = !present
+	*source = Source(out)
+	return nil
 }
 
 // PoolConfig is the full persisted state: sources, routing rules, custom
@@ -320,7 +346,10 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 	cs.cfg = cfg
-	migrated := migrateProxyIPSourceMetadata(&cs.cfg)
+	migrated := migrateSourceAutoRefresh(&cs.cfg)
+	if migrateProxyIPSourceMetadata(&cs.cfg) {
+		migrated = true
+	}
 	if cs.cfg.CheckURL == legacyDefaultCheckURL {
 		cs.cfg.CheckURL = defaultCheckURL
 		migrated = true
@@ -331,6 +360,18 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 		}
 	}
 	return cs, nil
+}
+
+func migrateSourceAutoRefresh(cfg *PoolConfig) bool {
+	changed := false
+	for i := range cfg.Sources {
+		if cfg.Sources[i].autoRefreshMissing {
+			cfg.Sources[i].AutoRefreshEnabled = true
+			cfg.Sources[i].autoRefreshMissing = false
+			changed = true
+		}
+	}
+	return changed
 }
 
 // migrateProxyIPSourceMetadata updates only the two obsolete, known metadata
@@ -363,7 +404,7 @@ func migrateProxyIPSourceMetadata(cfg *PoolConfig) bool {
 }
 
 func defaultPoolConfig() PoolConfig {
-	return PoolConfig{
+	cfg := PoolConfig{
 		Sources: []Source{
 			{
 				ID:      "builtin-socks5-github",
@@ -473,6 +514,10 @@ func defaultPoolConfig() PoolConfig {
 		},
 		Groups: []Group{},
 	}
+	for i := range cfg.Sources {
+		cfg.Sources[i].AutoRefreshEnabled = true
+	}
+	return cfg
 }
 
 func (cs *ConfigStore) writeLocked() error {
@@ -527,6 +572,33 @@ func (cs *ConfigStore) Sources() []Source {
 	return cs.Snapshot().Sources
 }
 
+func (cs *ConfigStore) SourceByID(id string) (Source, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	for _, source := range cs.cfg.Sources {
+		if source.ID == id {
+			return source, true
+		}
+	}
+	return Source{}, false
+}
+
+func (cs *ConfigStore) SetSourceAutoRefresh(id string, enabled bool, intervalSeconds int) error {
+	if intervalSeconds != 0 && (intervalSeconds < minSourceRefreshIntervalSeconds || intervalSeconds > maxSourceRefreshIntervalSeconds) {
+		return fmt.Errorf("refresh interval must be 0 or between %d and %d seconds", minSourceRefreshIntervalSeconds, maxSourceRefreshIntervalSeconds)
+	}
+	return cs.mutate(func(c *PoolConfig) error {
+		for i := range c.Sources {
+			if c.Sources[i].ID == id {
+				c.Sources[i].AutoRefreshEnabled = enabled
+				c.Sources[i].RefreshIntervalSeconds = intervalSeconds
+				return nil
+			}
+		}
+		return fmt.Errorf("source not found: %s", id)
+	})
+}
+
 func (cs *ConfigStore) EnabledSources() []Source {
 	var out []Source
 	for _, s := range cs.Sources() {
@@ -550,7 +622,7 @@ func (cs *ConfigStore) AddSource(s Source) (Source, error) {
 	s.ID = generateID("src")
 	s.Builtin = false
 	s.Enabled = true // a source you just added is one you want to use now
-
+	s.AutoRefreshEnabled = true
 	err = cs.mutate(func(c *PoolConfig) error {
 		if len(c.Sources) >= maxConfiguredSources {
 			return fmt.Errorf("source limit reached: at most %d sources are allowed", maxConfiguredSources)
@@ -714,6 +786,9 @@ func validateSourceDefinition(source Source) (Source, error) {
 	source.URL = strings.TrimSpace(source.URL)
 	source.Format = strings.ToLower(strings.TrimSpace(source.Format))
 	source.Protocol = strings.ToLower(strings.TrimSpace(source.Protocol))
+	if source.RefreshIntervalSeconds != 0 && (source.RefreshIntervalSeconds < minSourceRefreshIntervalSeconds || source.RefreshIntervalSeconds > maxSourceRefreshIntervalSeconds) {
+		return Source{}, fmt.Errorf("refresh interval must be 0 or between %d and %d seconds", minSourceRefreshIntervalSeconds, maxSourceRefreshIntervalSeconds)
+	}
 	if source.Name == "" || source.URL == "" {
 		return Source{}, fmt.Errorf("name and url are required")
 	}

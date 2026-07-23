@@ -80,7 +80,7 @@
 
   <div id="group-cards-container" class="group-cards"></div>
 
-  <p class="inline-guidance"><b>出口国家</b>来自穿过节点的实测；不可用节点默认只隐藏并继续保留，成功后可自动恢复。</p>
+  <p class="inline-guidance"><b>出口国家</b>来自穿过节点的实测；自动检测成功后 24 小时内不重复检测，最终失败立即从路由过滤，只有显式人工验证成功才能恢复。</p>
   <div id="scrape-flow" class="scrape-flow" aria-label="最近一轮节点处理链路" hidden>
     <span class="scrape-step">来源原始 <strong id="scrape-raw">0</strong></span><span class="scrape-arrow">→</span>
     <span class="scrape-step">去重候选 <strong id="scrape-candidates">0</strong></span><span class="scrape-arrow">→</span>
@@ -110,6 +110,7 @@
       <option value="100">每页100</option>
     </select>
     <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="onFilterChange()"> 只看真正改IP的</label>
+    <label class="chk"><input type="checkbox" id="f-hide-unavail" onchange="onFilterChange()" checked> 隐藏不可用节点</label>
     <button type="button" class="btn-sm" data-action="export-nodes" data-format="csv" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
     <button type="button" class="btn-sm" data-action="export-nodes" data-format="tme" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
     <span id="node-count" class="small" role="status" aria-live="polite"></span>
@@ -119,9 +120,8 @@
   <div class="pager node-pager-top" id="node-pager-top" aria-label="代理池分页（顶部）"></div>
   <div class="table-scroll node-table-scroll" tabindex="0" aria-label="节点表格，可横向滚动">
   <table class="node-table">
-  <caption class="sr-only">代理节点状态和操作</caption>
-  <thead><tr><th></th><th>协议</th><th>代理URL</th><th>用户名</th><th>密码</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th title="健康检查累计成功/失败次数">成功/失败</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
-  <tbody id="node-tbody"><tr><td colspan="14" class="empty">加载中...</td></tr></tbody>
+  <thead><tr><th></th><th>协议</th><th>代理URL</th><th>用户名</th><th>密码</th><th>出口IP</th><th>匿名</th><th>国家/城市</th><th>评分</th><th title="仅统计真实转发请求结果；健康检查和测速不计入">累计成功/失败</th><th>连续健康失败</th><th>延迟</th><th>速度</th><th>来源</th><th>操作</th></tr></thead>
+  <tbody id="node-tbody"><tr><td colspan="15" class="empty">加载中...</td></tr></tbody>
   </table>
   </div>
   <div class="pager" id="node-pager"></div>
@@ -185,6 +185,12 @@
       <option value="100">每页100</option>
     </select>
     <span id="candidate-count" class="small" role="status" aria-live="polite"></span>
+    <div class="candidate-batch-bar" aria-label="候选批量操作">
+      <span id="candidate-selected-count" role="status" aria-live="polite">已选 0 / 16</span>
+      <button type="button" class="btn-sm" data-action="candidate-speedtest-selected" disabled>批量测速</button>
+      <button type="button" class="btn-sm danger" data-action="candidate-delete-selected" disabled>删除已选</button>
+      <span class="candidate-speedtest-note">测速仅报告本次结果，不改变健康状态，也不会加入转发池。</span>
+    </div>
     <span class="candidate-filter-note">筛选和分页均在服务端执行。ProxyIP 的逐条专用验证只提供外部参考，不改变本地转发池状态。</span>
   </div>
   <div id="candidate-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
@@ -193,8 +199,8 @@
   <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="全部抓取候选表格">
   <table class="candidate-table">
   <caption class="sr-only">所有来源抓取到的去重代理候选</caption>
-  <thead><tr><th>状态</th><th>协议</th><th>候选地址</th><th>用户名</th><th>密码</th><th>来源标注地区</th><th>来源</th><th>专用验证</th></tr></thead>
-  <tbody id="candidate-tbody"><tr><td colspan="8" class="empty">切换到本页后加载完整候选目录...</td></tr></tbody>
+  <thead><tr><th><input id="candidate-select-page" type="checkbox" data-action="candidate-select-page" aria-label="选择本页候选"></th><th>状态</th><th>协议</th><th>候选地址</th><th>用户名</th><th>密码</th><th>来源标注地区</th><th>来源</th><th>测速结果</th><th>操作</th></tr></thead>
+  <tbody id="candidate-tbody"><tr><td colspan="10" class="empty">切换到本页后加载完整候选目录...</td></tr></tbody>
   </table>
   </div>
   <div class="pager" id="candidate-pager"></div>
@@ -203,10 +209,13 @@
 <div id="tab-sources" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-sources">
   <div class="panel-heading"><div><span class="panel-kicker">Subscriptions</span><h2>订阅来源</h2><p>控制抓取入口、数据格式及启用状态；内置与自定义来源统一管理。</p></div></div>
   <div class="scope-intro"><span class="scope-icon" aria-hidden="true">⌁</span><div><strong>来源决定候选目录的边界</strong>停用来源会让相关节点立即退出路由但保留历史库存；下一次刷新按当前启用集合重建候选并重新检测。</div></div>
+  <section class="source-auto-refresh" aria-label="自动更新设置说明">
+    <div class="form-title">自动更新<span>每个来源独立设置，保存到服务端并在重启后继续生效；间隔 0 表示沿用全局抓取间隔。</span></div>
+    <span id="source-auto-status" class="small" role="status" aria-live="polite"></span>
+  </section>
   <div class="table-scroll" tabindex="0" aria-label="来源表格，可横向滚动">
   <table class="management-table">
-  <caption class="sr-only">代理来源管理</caption>
-  <tr><th>名称</th><th>URL</th><th>格式</th><th>类型</th><th>启用</th><th>操作</th></tr>
+  <tr><th>名称</th><th>URL</th><th>格式</th><th>类型</th><th>启用</th><th>自动更新</th><th>操作</th></tr>
   {{range .Sources}}
   <tr>
     <td data-label="来源名称">{{.Name}}{{if .AllowPrivate}}<span class="private-source-badge" title="该来源已显式允许访问局域网或保留地址">允许私网</span>{{end}}{{if .AllowEmpty}}<span class="empty-source-badge" title="HTTP 200 空列表会被视为权威结果，并清空该来源的上一版候选">允许空清单</span>{{end}}{{if .Note}}<div class="note-inline">{{.Note}}</div>{{end}}</td>
@@ -218,7 +227,8 @@
         <input type="checkbox" aria-label="切换来源 {{.Name}}" {{if .Enabled}}checked{{end}} onchange="postJSON('/api/sources/toggle',{id:'{{.ID}}',enabled:this.checked},reloadOrAlert)">
         <span class="slider"></span>
       </label>
-    <td data-label="操作"><button type="button" class="btn-sm danger" data-action="delete-source" data-source-id="{{.ID}}" data-source-name="{{.Name}}">删除</button></td>
+    <td data-label="自动更新"><div class="source-auto-row"><label class="chk"><input type="checkbox" data-source-auto-enabled data-source-id="{{.ID}}" {{if .AutoRefreshEnabled}}checked{{end}}> 自动</label><label>间隔（秒）<input type="number" min="0" step="1" value="{{.RefreshIntervalSeconds}}" data-source-auto-interval data-source-id="{{.ID}}" aria-label="来源 {{.Name}} 自动更新间隔秒数"></label><button type="button" class="btn-sm" data-action="save-source-auto-refresh" data-source-id="{{.ID}}">保存</button></div></td>
+    <td data-label="操作"><div class="source-row-actions"><button type="button" class="btn-sm" data-action="refresh-source" data-source-id="{{.ID}}" data-source-name="{{.Name}}">立即更新</button><button type="button" class="btn-sm danger" data-action="delete-source" data-source-id="{{.ID}}" data-source-name="{{.Name}}">删除</button></div></td>
   </tr>
   {{end}}
   </table>

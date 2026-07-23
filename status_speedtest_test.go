@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -30,21 +31,45 @@ func TestStatusServerDeduplicatesConcurrentSpeedTestForNode(t *testing.T) {
 	}
 
 	server.endSpeedTest(key)
+	server.speedMu.Lock()
+	server.speedCooldownUntil[key] = time.Now().Add(-time.Second)
+	server.speedMu.Unlock()
 	if err := server.beginSpeedTest(key); err != nil {
-		t.Fatalf("beginSpeedTest() after end error = %v", err)
+		t.Fatalf("beginSpeedTest() after cooldown error = %v", err)
 	}
 	server.endSpeedTest(key)
 }
 
-func TestStatusServerLimitsSpeedTestsToFourGlobalSlots(t *testing.T) {
+func TestStatusServerAppliesSameNodeSpeedTestCooldown(t *testing.T) {
 	server := NewStatusServer(NewProxyPool(), &ConfigStore{})
-	const attempts = 12
+	const key = "socks5://198.51.100.2:1080"
+	if err := server.beginSpeedTest(key); err != nil {
+		t.Fatal(err)
+	}
+	server.endSpeedTest(key)
+	err := server.beginSpeedTest(key)
+	var cooldown *nodeOperationCooldownError
+	if !errors.As(err, &cooldown) || cooldown.Remaining <= 0 || cooldown.Remaining > nodeSpeedTestCooldown {
+		t.Fatalf("speed cooldown error = %#v, want remaining within %s", err, nodeSpeedTestCooldown)
+	}
+	server.speedMu.Lock()
+	server.speedCooldownUntil[key] = time.Now().Add(-time.Second)
+	server.speedMu.Unlock()
+	if err := server.beginSpeedTest(key); err != nil {
+		t.Fatalf("speed test after cooldown = %v", err)
+	}
+	server.endSpeedTest(key)
+}
+
+func TestStatusServerLimitsSpeedTestsToConfiguredGlobalSlots(t *testing.T) {
+	server := NewStatusServer(NewProxyPool(), &ConfigStore{})
+	attempts := maxConcurrentNodeSpeedTests + 8
 	start := make(chan struct{})
 	release := make(chan struct{})
 	results := make(chan bool, attempts)
 	var workers sync.WaitGroup
 
-	for i := 0; i < attempts; i++ {
+	for i := range attempts {
 		workers.Add(1)
 		go func(i int) {
 			defer workers.Done()
@@ -62,27 +87,27 @@ func TestStatusServerLimitsSpeedTestsToFourGlobalSlots(t *testing.T) {
 	close(start)
 
 	succeeded := 0
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		if <-results {
 			succeeded++
 		}
 	}
-	if succeeded != 4 {
+	if succeeded != maxConcurrentNodeSpeedTests {
 		close(release)
 		workers.Wait()
-		t.Fatalf("simultaneous speed tests admitted = %d, want 4", succeeded)
+		t.Fatalf("simultaneous speed tests admitted = %d, want %d", succeeded, maxConcurrentNodeSpeedTests)
 	}
-	if got := len(server.speedSlots); got != 4 {
+	if got := len(server.speedSlots); got != maxConcurrentNodeSpeedTests {
 		close(release)
 		workers.Wait()
-		t.Fatalf("occupied global slots = %d, want 4", got)
+		t.Fatalf("occupied global slots = %d, want %d", got, maxConcurrentNodeSpeedTests)
 	}
 	server.speedMu.Lock()
-	if got := len(server.speedRunning); got != 4 {
+	if got := len(server.speedRunning); got != maxConcurrentNodeSpeedTests {
 		server.speedMu.Unlock()
 		close(release)
 		workers.Wait()
-		t.Fatalf("running-node entries = %d, want 4", got)
+		t.Fatalf("running-node entries = %d, want %d", got, maxConcurrentNodeSpeedTests)
 	}
 	server.speedMu.Unlock()
 

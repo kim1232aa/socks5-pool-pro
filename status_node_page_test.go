@@ -125,15 +125,15 @@ func TestHandleNodeVerifyUpdatesHealthStateImmediately(t *testing.T) {
 	if !ok || !updated.Available {
 		t.Fatalf("verified proxy availability = found=%v proxy=%#v, want restored available", ok, updated)
 	}
-	if successes, failures := pool.StatsOf(px.Key()); successes != 1 || failures != 0 {
-		t.Fatalf("verify stats = %d/%d, want 1/0", successes, failures)
+	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 0 {
+		t.Fatalf("manual health observation changed forwarding stats = %d/%d", successes, failures)
 	}
 	if tunnels.Load() == 0 {
 		t.Fatal("manual verification did not dial the proxy")
 	}
 }
 
-func TestHandleNodeVerifyDebouncesThreeFailedManualObservationsWithoutExitProbe(t *testing.T) {
+func TestHandleNodeVerifyMakesFinalManualFailureTerminalWithoutExitProbe(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestHandleNodeVerifyDebouncesThreeFailedManualObservationsWithoutExitProbe(
 				return
 			}
 			accepted.Add(1)
-			_ = conn.Close() // make the HTTP CONNECT health check fail immediately
+			_ = conn.Close()
 		}
 	}()
 
@@ -160,35 +160,32 @@ func TestHandleNodeVerifyDebouncesThreeFailedManualObservationsWithoutExitProbe(
 	pool.Prime([]Proxy{px}, nil)
 	server := NewStatusServer(pool, &ConfigStore{cfg: PoolConfig{CheckURL: "http://health.test/check"}})
 
-	for observation := 1; observation <= healthFailureThreshold; observation++ {
-		recorder := httptest.NewRecorder()
-		request := localTestRequest(http.MethodPost, "/api/nodes/verify", bytes.NewBufferString(`{"key":"`+px.Key()+`"}`))
-		server.handleNodeVerify(recorder, request)
-		if got, want := recorder.Code, http.StatusOK; got != want {
-			t.Fatalf("verify %d status = %d, want %d; body=%s", observation, got, want, recorder.Body.String())
-		}
-		var body struct {
-			Reachable           bool `json:"reachable"`
-			Available           bool `json:"available"`
-			Attempts            int  `json:"attempts"`
-			ConsecutiveFailures int  `json:"consecutive_failures"`
-		}
-		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
-			t.Fatalf("decode verify response: %v", err)
-		}
-		wantAvailable := observation < healthFailureThreshold
-		if body.Reachable || body.Available != wantAvailable || body.Attempts != manualNodeVerifyMaxAttempts || body.ConsecutiveFailures != observation {
-			t.Fatalf("failed observation %d response = %#v", observation, body)
-		}
-		updated, ok := pool.Find(px.Key())
-		if !ok || updated.Available != wantAvailable {
-			t.Fatalf("observation %d availability = found=%v proxy=%#v", observation, ok, updated)
-		}
-		if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != observation {
-			t.Fatalf("observation %d stats = %d/%d, want 0/%d", observation, successes, failures, observation)
-		}
+	recorder := httptest.NewRecorder()
+	request := localTestRequest(http.MethodPost, "/api/nodes/verify", bytes.NewBufferString(`{"key":"`+px.Key()+`"}`))
+	server.handleNodeVerify(recorder, request)
+	if got, want := recorder.Code, http.StatusOK; got != want {
+		t.Fatalf("verify status = %d, want %d; body=%s", got, want, recorder.Body.String())
 	}
-	if got, want := accepted.Load(), int64(healthFailureThreshold*manualNodeVerifyMaxAttempts); got != want {
+	var body struct {
+		Reachable           bool `json:"reachable"`
+		Available           bool `json:"available"`
+		Attempts            int  `json:"attempts"`
+		ConsecutiveFailures int  `json:"consecutive_failures"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode verify response: %v", err)
+	}
+	if body.Reachable || body.Available || body.Attempts != manualNodeVerifyMaxAttempts || body.ConsecutiveFailures != 1 {
+		t.Fatalf("failed observation response = %#v", body)
+	}
+	updated, ok := pool.Find(px.Key())
+	if !ok || updated.Available || !updated.HealthInvalidated {
+		t.Fatalf("terminal failure state = found=%v proxy=%#v", ok, updated)
+	}
+	if successes, failures := pool.StatsOf(px.Key()); successes != 0 || failures != 0 {
+		t.Fatalf("manual health observation changed forwarding stats = %d/%d", successes, failures)
+	}
+	if got, want := accepted.Load(), int64(manualNodeVerifyMaxAttempts); got != want {
 		t.Fatalf("proxy connections = %d, want %d bounded retry attempts and no exit probe", got, want)
 	}
 }

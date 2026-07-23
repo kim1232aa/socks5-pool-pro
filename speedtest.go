@@ -12,14 +12,15 @@ import (
 
 const (
 	// speedTestMaxBytes is both the exact sample size and the upper bound read
-	// from either endpoint.
-	speedTestMaxBytes = 3_000_000 // 3 MB
+	// from either endpoint. One MiB is enough for a responsive operator-facing
+	// comparison without making every click transfer three megabytes.
+	speedTestMaxBytes = 1 << 20
 
-	// The dashboard request stays below the status server's 45-second write
-	// timeout while leaving enough time for a primary attempt and one fallback.
-	speedTestOperationTimeout  = 42 * time.Second
-	speedTestPrimaryMaxBudget  = 20 * time.Second
-	speedTestFallbackMaxBudget = 25 * time.Second
+	// Keep manual dashboard operations responsive. The fallback shares the same
+	// total budget and begins only after the primary endpoint fails.
+	speedTestOperationTimeout  = 18 * time.Second
+	speedTestPrimaryMaxBudget  = 8 * time.Second
+	speedTestFallbackMaxBudget = 10 * time.Second
 )
 
 // Cloudflare remains the preferred anycast target. Some otherwise healthy
@@ -95,7 +96,7 @@ func SpeedTest(px Proxy, timeout time.Duration) (SpeedTestResult, error) {
 // SpeedTestContext is the request-aware form used by the status API. Parent
 // cancellation stops the active endpoint immediately and prevents a fallback
 // from starting, so abandoned browser requests do not occupy a global slot for
-// the rest of the 42-second operation budget.
+// the rest of the operation budget.
 func SpeedTestContext(parent context.Context, px Proxy, timeout time.Duration) (SpeedTestResult, error) {
 	result, _, err := speedTestCredentialCandidatesContext(parent, px, timeout)
 	return result, err

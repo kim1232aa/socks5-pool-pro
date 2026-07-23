@@ -100,6 +100,100 @@ type CandidateCatalog struct {
 	persistMu      sync.Mutex
 }
 
+// FindByKey returns the exact protocol-aware candidate declaration. It is
+// intentionally inventory-only: callers must still validate before admitting a
+// candidate to the forwarding pool.
+func (c *CandidateCatalog) FindByKey(key string) (Proxy, bool) {
+	protocol, addr, ok := strings.Cut(key, "://")
+	if !ok || protocol == "" || addr == "" {
+		return Proxy{}, false
+	}
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return Proxy{}, false
+	}
+	protocol = strings.ToLower(protocol)
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	index := snapshot.find(protocol, addr)
+	if index < 0 {
+		return Proxy{}, false
+	}
+	record := snapshot.records[index]
+	if snapshot.protocols[record.protocolID] == "proxyip" {
+		return Proxy{}, false
+	}
+	host, port, err := net.SplitHostPort(record.addr)
+	if err != nil {
+		return Proxy{}, false
+	}
+	return Proxy{
+		IP: host, Port: port, Protocol: snapshot.protocols[record.protocolID],
+		Username: record.username, Password: record.password,
+		Country: snapshot.countries[record.countryID], City: snapshot.cities[record.cityID],
+		Continent: decodeContinent(record.continent),
+	}, true
+}
+
+// RemoveKeys explicitly removes candidate inventory entries. It rebuilds a
+// fresh snapshot and persists it before returning, so a later disk-cache load
+// cannot resurrect a removed candidate. A subsequent successful source refresh
+// may legitimately rediscover the same address.
+func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string, persistErr error) {
+	if len(keys) == 0 {
+		return nil, nil, nil
+	}
+	wanted := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		wanted[key] = struct{}{}
+	}
+	current := c.snapshot.Load()
+	if current == nil {
+		return nil, keys, nil
+	}
+	current.mu.RLock()
+	builder := newCandidateSnapshotBuilder(len(current.records))
+	found := make(map[string]bool, len(keys))
+	for _, record := range current.records {
+		key := current.protocols[record.protocolID] + "://" + record.addr
+		if _, remove := wanted[key]; remove {
+			found[key] = true
+			continue
+		}
+		builder.appendRecord(current, record, nil)
+	}
+	next := builder.snapshot
+	next.generation = current.generation
+	next.revision = current.revision + 1
+	next.phase = current.phase
+	next.sourceErrors = current.sourceErrors
+	next.seenAt = current.seenAt
+	next.refreshAttempt = current.refreshAttempt
+	next.completedAt = current.completedAt
+	rebuildCandidateSourceFacets(next)
+	for _, key := range keys {
+		if found[key] {
+			removed = append(removed, key)
+		} else {
+			notFound = append(notFound, key)
+		}
+	}
+	if len(removed) == 0 {
+		current.mu.RUnlock()
+		return nil, notFound, nil
+	}
+	// Holding the old snapshot's read lock through the CAS prevents complete
+	// from mutating its revision/status after we copied it but before install.
+	// A source refresh may replace the pointer independently; retry against it.
+	if !c.snapshot.CompareAndSwap(current, next) {
+		current.mu.RUnlock()
+		return c.RemoveKeys(keys)
+	}
+	current.mu.RUnlock()
+	persistErr = c.persistCompletedSnapshot(next)
+	return removed, notFound, persistErr
+}
+
 // ResetHealthOutcomes invalidates criterion-dependent candidate annotations
 // while retaining the full source inventory. Candidate cache format v1 did not
 // persist the CheckURL, so cached checked_failed/policy_filtered labels cannot
@@ -853,7 +947,9 @@ func (c *CandidateCatalog) complete(refresh candidateRefresh, checked, alive []P
 		return
 	}
 	current.mu.Lock()
-	if current.generation != refresh.generation {
+	// Removal can replace the snapshot while completion was waiting for its
+	// write lock. Never mutate or persist a detached old snapshot.
+	if c.snapshot.Load() != current || current.generation != refresh.generation {
 		current.mu.Unlock()
 		return
 	}
@@ -895,7 +991,7 @@ func (c *CandidateCatalog) complete(refresh candidateRefresh, checked, alive []P
 	// Disk compression may take noticeable time for a 500k-row inventory. Keep
 	// it outside the snapshot write lock so API readers never wait on filesystem
 	// IO; the cache takes its own RLock while encoding one consistent image.
-	c.persistCompletedSnapshot(current)
+	_ = c.persistCompletedSnapshot(current)
 }
 
 func (s *candidateSnapshot) find(protocol, addr string) int {

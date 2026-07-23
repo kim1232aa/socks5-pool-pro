@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPoolCacheDropsNonPublicLiteralsPerNodeOnUpgrade(t *testing.T) {
@@ -169,5 +170,26 @@ func TestPoolCacheHealthFailureStreakIsBackwardCompatibleAndPersistent(t *testin
 	_, _, stats = cache.load()
 	if got := stats[key]; got != want {
 		t.Fatalf("persisted health streak = %+v, want %+v", got, want)
+	}
+}
+
+func TestPoolCachePersistsAutomaticHealthTerminalAndCooldown(t *testing.T) {
+	cache := newPoolCache(t.TempDir())
+	px := testProxy("socks5", "8.8.8.91", "1080", false)
+	px.HealthInvalidated = true
+	want := nodeStats{
+		LastLatencyMs:             91,
+		ConsecutiveHealthFailures: 1,
+		LastHealthSuccessAt:       time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC),
+		HealthFailureTerminal:     true,
+	}
+	cache.save(1, []Proxy{px}, nil, map[string]nodeStats{px.Key(): want})
+
+	forwarding, _, stats := cache.load()
+	if len(forwarding) != 1 || forwarding[0].Available || !forwarding[0].HealthInvalidated || forwarding[0].PolicyExcluded {
+		t.Fatalf("terminal proxy round trip = %#v", forwarding)
+	}
+	if got := stats[px.Key()]; got != want {
+		t.Fatalf("terminal stats round trip = %+v, want %+v", got, want)
 	}
 }

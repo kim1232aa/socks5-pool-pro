@@ -49,16 +49,15 @@ var geoCache = struct {
 	inflight: make(map[string]*geoLookupCall),
 }
 
-
 // ipChangePolicy captures the require-ip-change evaluation shared by the
 // refresh checker, the periodic rechecker, and manual verification. All three
 // previously duplicated this exact logic; centralizing it prevents one site
 // from drifting (e.g. a different threshold) while the others stay unchanged.
 type ipChangePolicy struct {
-	ExitIP         string
-	IPChangeKnown  bool
-	IPChanged      bool
-	PolicyAllowed  bool
+	ExitIP        string
+	IPChangeKnown bool
+	IPChanged     bool
+	PolicyAllowed bool
 }
 
 // evaluateIPChangePolicy computes whether a proxy whose exit IP was just
@@ -76,6 +75,7 @@ func evaluateIPChangePolicy(exitIP, baseline string, requireIPChange bool) ipCha
 		PolicyAllowed: policyAllowed,
 	}
 }
+
 // CheckProxies concurrently verifies a list of candidate proxies against
 // testURL - the sole criterion for "alive" is a real HTTP round-trip to
 // testURL through DialUpstream. The built-in connectivity endpoint must return

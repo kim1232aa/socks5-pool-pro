@@ -260,38 +260,62 @@ func TestDashboardProxyIPVerifyIsExplicitResourceOnlyAction(t *testing.T) {
 	}
 }
 
-func TestDashboardCandidateVerifyColumnKeepsTableShape(t *testing.T) {
-	if !strings.Contains(dashboardClientSource(), `<thead><tr><th>状态</th><th>协议</th><th>候选地址</th><th>用户名</th><th>密码</th><th>来源标注地区</th><th>来源</th><th>专用验证</th></tr></thead>`) {
-		t.Fatal("candidate verify and credential headers are missing")
+func TestDashboardCandidateManagementKeepsTenColumnShape(t *testing.T) {
+	for _, want := range []string{
+		`id="candidate-select-page"`,
+		`<th>测速结果</th><th>操作</th>`,
+		`data-action="candidate-speedtest-selected"`,
+		`data-action="candidate-delete-selected"`,
+		`fetchJSON('/api/candidates/speedtest'`,
+		`fetchJSON('/api/candidates/delete'`,
+		`测速仅报告本次结果，不改变健康状态，也不会加入转发池。`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing candidate management contract %q", want)
+		}
 	}
-	if strings.Contains(dashboardClientSource(), `colspan="5"`) || strings.Contains(dashboardClientSource(), `colspan="6"`) {
-		t.Fatal("candidate empty rows still use a pre-credential colspan")
-	}
-	if got := strings.Count(dashboardClientSource(), `colspan="8"`); got != 3 {
-		t.Fatalf("candidate eight-column empty-state colspan count = %d, want 3", got)
+	if got := strings.Count(dashboardClientSource(), `colspan="10"`); got != 3 {
+		t.Fatalf("candidate ten-column empty-state colspan count = %d, want 3", got)
 	}
 }
 
-func TestDashboardManualVerifyShowsDebouncedHealthObservation(t *testing.T) {
+func TestDashboardWiresInventoryManagementActions(t *testing.T) {
+	for _, want := range []string{
+		`data-action="refresh-source"`,
+		`fetchJSON('/api/sources/refresh'`,
+		`data-action="save-source-auto-refresh"`,
+		`fetchJSON('/api/sources/auto-refresh'`,
+		`auto_refresh_enabled`,
+		`refresh_interval_seconds`,
+		`data-action="delete-node"`,
+		`fetchJSON('/api/nodes/delete'`,
+		`case 'verify': runVerify(actionElement);`,
+		`case 'candidate-select': toggleCandidateSelection(actionElement);`,
+		`最多选择 16 个不同 key`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing inventory management action %q", want)
+		}
+	}
+}
+
+func TestDashboardManualVerifyShowsImmediateFailureFiltering(t *testing.T) {
 	for _, want := range []string{
 		`function manualVerifyObservationSummary(result)`,
 		`本次连通尝试：`,
 		`当前节点状态：`,
-		`连续失败观察：`,
+		`健康失败观察：`,
 		`本次手动复检未能连通目标。`,
-		`内部最多 3 次连通尝试`,
-		`只记为 1 次健康观察`,
-		`连续 3 次失败观察才会下线`,
+		`内部最多尝试 3 次`,
+		`最终失败后节点已立即从可路由池过滤`,
+		`不会继续自动复检`,
 		`typeof result.attempts === 'number'`,
 		`typeof result.available === 'boolean'`,
 		`typeof result.consecutive_failures === 'number'`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
-			t.Fatalf("dashboard is missing manual verify observation text/compatibility guard %q", want)
+			t.Fatalf("dashboard is missing immediate manual-failure contract %q", want)
 		}
-	}
-	if strings.Contains(dashboardClientSource(), `可能已失效`) {
-		t.Fatal("dashboard still describes one failed manual verification as a possibly dead node")
 	}
 }
 

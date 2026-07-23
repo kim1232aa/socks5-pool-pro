@@ -78,12 +78,12 @@ func (c *CandidateCatalog) LoadDiskCache() (bool, error) {
 	return true, nil
 }
 
-func (c *CandidateCatalog) persistCompletedSnapshot(snapshot *candidateSnapshot) {
+func (c *CandidateCatalog) persistCompletedSnapshot(snapshot *candidateSnapshot) error {
 	c.cacheMu.RLock()
 	cache := c.cache
 	c.cacheMu.RUnlock()
 	if cache == nil || snapshot == nil {
-		return
+		return nil
 	}
 
 	c.persistMu.Lock()
@@ -92,13 +92,14 @@ func (c *CandidateCatalog) persistCompletedSnapshot(snapshot *candidateSnapshot)
 	generation, revision := snapshot.generation, snapshot.revision
 	snapshot.mu.RUnlock()
 	if generation < cache.savedGeneration || generation == cache.savedGeneration && revision <= cache.savedRevision {
-		return
+		return nil
 	}
 	if err := cache.save(snapshot); err != nil {
 		log.Printf("[candidate-cache] save failed: %v", err)
-		return
+		return err
 	}
 	cache.savedGeneration, cache.savedRevision = generation, revision
+	return nil
 }
 
 func (cache *candidateCatalogCache) load() (*candidateSnapshot, error) {

@@ -8,33 +8,34 @@ import (
 // ---- view models ----
 
 type NodeView struct {
-	Key               string  `json:"key"`
-	Addr              string  `json:"addr"`
-	Protocol          string  `json:"protocol"`
-	ProxyURL          string  `json:"proxy_url"`
-	Username          string  `json:"username"`
-	Password          string  `json:"password"`
-	Country           string  `json:"country"`
-	City              string  `json:"city"`
-	Continent         string  `json:"continent"` // AS/NA/EU/AF/SA/OC/AN - groups the dashboard's country filter
-	Source            string  `json:"source"`
-	ExitIP            string  `json:"exit_ip"`
-	IPChanged         bool    `json:"ip_changed"`
-	IPChangeKnown     bool    `json:"ip_change_known"`
-	Anonymity         string  `json:"anonymity"`
-	LatencyMs         int64   `json:"latency_ms"`
-	SpeedKbps         float64 `json:"speed_kbps"`
-	SpeedTestedAt     int64   `json:"speed_tested_at,omitempty"`
-	SpeedBytes        int64   `json:"speed_bytes,omitempty"`
-	SpeedDurationMs   int64   `json:"speed_duration_ms,omitempty"`
-	Score             float64 `json:"score"`
-	Successes         int     `json:"successes"`
-	Failures          int     `json:"failures"`
-	Active            bool    `json:"active"`    // this node is the ANY group's current upstream
-	Available         bool    `json:"available"` // false = last check failed; kept in the pool, hidden by default
-	SourceRetired     bool    `json:"source_retired,omitempty"`
-	HealthInvalidated bool    `json:"health_invalidated,omitempty"`
-	PolicyExcluded    bool    `json:"policy_excluded,omitempty"`
+	Key                 string  `json:"key"`
+	Addr                string  `json:"addr"`
+	Protocol            string  `json:"protocol"`
+	ProxyURL            string  `json:"proxy_url"`
+	Username            string  `json:"username"`
+	Password            string  `json:"password"`
+	Country             string  `json:"country"`
+	City                string  `json:"city"`
+	Continent           string  `json:"continent"` // AS/NA/EU/AF/SA/OC/AN - groups the dashboard's country filter
+	Source              string  `json:"source"`
+	ExitIP              string  `json:"exit_ip"`
+	IPChanged           bool    `json:"ip_changed"`
+	IPChangeKnown       bool    `json:"ip_change_known"`
+	Anonymity           string  `json:"anonymity"`
+	LatencyMs           int64   `json:"latency_ms"`
+	SpeedKbps           float64 `json:"speed_kbps"`
+	SpeedTestedAt       int64   `json:"speed_tested_at,omitempty"`
+	SpeedBytes          int64   `json:"speed_bytes,omitempty"`
+	SpeedDurationMs     int64   `json:"speed_duration_ms,omitempty"`
+	Score               float64 `json:"score"`
+	Successes           int     `json:"successes"`
+	Failures            int     `json:"failures"`
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+	Active              bool    `json:"active"`    // this node is the ANY group's current upstream
+	Available           bool    `json:"available"` // false = last check failed; kept in the pool, hidden by default
+	SourceRetired       bool    `json:"source_retired,omitempty"`
+	HealthInvalidated   bool    `json:"health_invalidated,omitempty"`
+	PolicyExcluded      bool    `json:"policy_excluded,omitempty"`
 }
 
 // NodeCountrySummary is the small, pool-wide country index used by the
@@ -396,6 +397,7 @@ func (s *StatusServer) nodeViews() []NodeView {
 		nv := nodeViewOf(px, activeKey)
 		nv.Score = s.pool.Score(px)
 		nv.Successes, nv.Failures = s.pool.StatsOf(px.Key())
+		_, nv.ConsecutiveFailures, _ = s.pool.HealthStateOf(px.Key())
 		nodes = append(nodes, nv)
 	}
 	return nodes

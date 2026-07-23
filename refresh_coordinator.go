@@ -15,19 +15,25 @@ type RefreshCoordinator struct {
 	lastScrapeInfo ScrapeInfo
 	scrapeMu       sync.RWMutex
 
-	refreshChan     chan struct{}
-	recheckChan     chan struct{}
-	fullRecheckChan chan struct{}
-	healthCycleMu   sync.Mutex
+	refreshChan       chan struct{}
+	recheckChan       chan struct{}
+	fullRecheckChan   chan struct{}
+	sourceRefreshChan chan string
+	healthCycleMu     sync.Mutex
 	// sourceLifecycleMu makes source changes and the final pool install one
 	// ordered transaction, preventing stale refresh results from reviving nodes.
 	sourceLifecycleMu sync.Mutex
 
-	refreshOpMu    sync.RWMutex
-	refreshOpSeq   uint64
-	refreshActive  *RefreshOperation
-	refreshPending *RefreshOperation
-	refreshLast    *RefreshOperation
+	refreshOpMu          sync.RWMutex
+	refreshOpSeq         uint64
+	refreshActive        *RefreshOperation
+	refreshPending       *RefreshOperation
+	refreshLast          *RefreshOperation
+	sourceRefreshMu      sync.Mutex
+	sourceRefreshSeq     uint64
+	sourceRefreshPending map[string]*SourceRefreshOperation
+	sourceRefreshActive  map[string]*SourceRefreshOperation
+	sourceRefreshLast    map[string]time.Time
 
 	healthRecheckOpMu    sync.RWMutex
 	healthRecheckOpSeq   uint64
@@ -38,9 +44,13 @@ type RefreshCoordinator struct {
 
 func newRefreshCoordinator() *RefreshCoordinator {
 	return &RefreshCoordinator{
-		refreshChan:     make(chan struct{}, 1),
-		recheckChan:     make(chan struct{}, 1),
-		fullRecheckChan: make(chan struct{}, 1),
+		refreshChan:          make(chan struct{}, 1),
+		recheckChan:          make(chan struct{}, 1),
+		fullRecheckChan:      make(chan struct{}, 1),
+		sourceRefreshChan:    make(chan string, maxConfiguredSources),
+		sourceRefreshPending: make(map[string]*SourceRefreshOperation),
+		sourceRefreshActive:  make(map[string]*SourceRefreshOperation),
+		sourceRefreshLast:    make(map[string]time.Time),
 	}
 }
 
@@ -166,6 +176,91 @@ func (c *RefreshCoordinator) refreshOperationStatus() RefreshOperationStatus {
 		state = "running"
 	}
 	return RefreshOperationStatus{State: state, Active: clone(c.refreshActive), Pending: clone(c.refreshPending), Last: clone(c.refreshLast)}
+}
+
+func (c *RefreshCoordinator) requestSourceRefresh(source Source, trigger string) (SourceRefreshOperation, bool) {
+	c.sourceRefreshMu.Lock()
+	defer c.sourceRefreshMu.Unlock()
+	if active := c.sourceRefreshActive[source.ID]; active != nil {
+		return *active, false
+	}
+	if pending := c.sourceRefreshPending[source.ID]; pending != nil {
+		return *pending, false
+	}
+	c.sourceRefreshSeq++
+	now := time.Now().UTC()
+	operation := &SourceRefreshOperation{ID: fmt.Sprintf("source-refresh-%d-%d", now.UnixNano(), c.sourceRefreshSeq), SourceID: source.ID, SourceName: source.Name, Status: "queued", Trigger: trigger, RequestedAt: now.Format(time.RFC3339Nano)}
+	c.sourceRefreshPending[source.ID] = operation
+	select {
+	case c.sourceRefreshChan <- source.ID:
+		return *operation, true
+	default:
+		delete(c.sourceRefreshPending, source.ID)
+		operation.Status = "rejected"
+		operation.Error = "source refresh capacity reached"
+		return *operation, false
+	}
+}
+
+func (c *RefreshCoordinator) beginSourceRefresh(sourceID string) (SourceRefreshOperation, bool) {
+	c.sourceRefreshMu.Lock()
+	defer c.sourceRefreshMu.Unlock()
+	operation := c.sourceRefreshPending[sourceID]
+	if operation == nil {
+		return SourceRefreshOperation{}, false
+	}
+	delete(c.sourceRefreshPending, sourceID)
+	operation.Status = "running"
+	operation.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	c.sourceRefreshActive[sourceID] = operation
+	return *operation, true
+}
+
+func (c *RefreshCoordinator) finishSourceRefresh(sourceID string, result refreshRunResult) {
+	c.sourceRefreshMu.Lock()
+	defer c.sourceRefreshMu.Unlock()
+	operation := c.sourceRefreshActive[sourceID]
+	if operation == nil {
+		return
+	}
+	operation.Status, operation.Error = result.Status, result.Error
+	if operation.Status == "" {
+		operation.Status = "complete"
+	}
+	operation.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	c.sourceRefreshLast[sourceID] = time.Now()
+	delete(c.sourceRefreshActive, sourceID)
+}
+
+func (c *RefreshCoordinator) markSourcesRefreshed(sources []Source, at time.Time) {
+	c.sourceRefreshMu.Lock()
+	defer c.sourceRefreshMu.Unlock()
+	for _, source := range sources {
+		c.sourceRefreshLast[source.ID] = at
+	}
+}
+
+func (c *RefreshCoordinator) queueDueSourceRefreshes(store *ConfigStore, globalInterval time.Duration, now time.Time) int {
+	queued := 0
+	for _, source := range store.Sources() {
+		if !source.Enabled || !source.AutoRefreshEnabled {
+			continue
+		}
+		interval := globalInterval
+		if source.RefreshIntervalSeconds > 0 {
+			interval = time.Duration(source.RefreshIntervalSeconds) * time.Second
+		}
+		c.sourceRefreshMu.Lock()
+		last := c.sourceRefreshLast[source.ID]
+		c.sourceRefreshMu.Unlock()
+		if !last.IsZero() && now.Sub(last) < interval {
+			continue
+		}
+		if _, accepted := c.requestSourceRefresh(source, "scheduled"); accepted {
+			queued++
+		}
+	}
+	return queued
 }
 
 func (c *RefreshCoordinator) triggerRecheck() {

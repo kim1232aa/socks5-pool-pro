@@ -174,75 +174,53 @@ func assertProxyIndexInvariant(t *testing.T, p *ProxyPool) {
 	}
 }
 
-func TestObserveHealthResultUsesConsecutiveFailureThresholdAndSuccessReset(t *testing.T) {
+func TestHealthOutcomeTerminalFailureAndManualRecovery(t *testing.T) {
 	p := NewProxyPool()
 	px := testProxy("socks5", "192.0.2.230", "1080", true)
 	p.Prime([]Proxy{px}, nil)
 
-	for attempt := 1; attempt < healthFailureThreshold; attempt++ {
-		if !p.ObserveHealthResult(px.Key(), false, int64(100+attempt)) {
-			t.Fatalf("ObserveHealthResult failure %d did not find node", attempt)
-		}
-		got, _ := p.Find(px.Key())
-		if !got.Available {
-			t.Fatalf("node unavailable after transient failure %d/%d", attempt, healthFailureThreshold)
-		}
-		if streak := p.stats[px.Key()].ConsecutiveHealthFailures; streak != attempt {
-			t.Fatalf("failure streak after attempt %d = %d", attempt, streak)
-		}
+	if !p.EligibleForAutoRecheck(px) {
+		t.Fatal("new node was not eligible for its first automatic health check")
 	}
-
 	if !p.ObserveHealthResult(px.Key(), false, 103) {
-		t.Fatal("third failure did not find node")
+		t.Fatal("completed health failure did not find node")
 	}
 	got, _ := p.Find(px.Key())
-	if got.Available {
-		t.Fatal("node remained available after third consecutive background failure")
-	}
-
-	if !p.ObserveHealthResult(px.Key(), true, 47) {
-		t.Fatal("successful observation did not find node")
-	}
-	got, _ = p.Find(px.Key())
-	if !got.Available || got.LatencyMs != 47 {
-		t.Fatalf("successful observation did not immediately restore node: %+v", got)
-	}
 	st := p.stats[px.Key()]
-	if st.ConsecutiveHealthFailures != 0 || st.Successes != 1 || st.Failures != healthFailureThreshold || st.LastLatencyMs != 47 {
-		t.Fatalf("stats after recovery = %+v", st)
+	if got.Available || !got.HealthInvalidated || !st.HealthFailureTerminal || st.ConsecutiveHealthFailures != 1 {
+		t.Fatalf("terminal failure state = proxy=%+v stats=%+v", got, st)
+	}
+	if p.EligibleForAutoRecheck(got) {
+		t.Fatal("terminal failure remained eligible for automatic recheck")
+	}
+	if _, ok, _ := p.Pick(GroupAny, nil); ok {
+		t.Fatal("terminal failure remained routable through all-unavailable fallback")
+	}
+	if p.ObserveHealthResult(px.Key(), true, 47) {
+		t.Fatal("automatic success bypassed terminal admission guard")
 	}
 
-	// A new streak starts from zero after success; two more misses remain
-	// tolerated instead of inheriting the previous failure history.
-	p.ObserveHealthResult(px.Key(), false, 0)
-	p.ObserveHealthResult(px.Key(), false, 0)
+	generation := p.HealthGeneration()
+	if !p.ObserveManualHealthOutcomeAtGeneration(px.Key(), true, true, 47, generation) {
+		t.Fatal("successful manual observation did not recover terminal node")
+	}
 	got, _ = p.Find(px.Key())
-	if !got.Available || p.stats[px.Key()].ConsecutiveHealthFailures != 2 {
-		t.Fatalf("post-recovery failure streak was not reset: proxy=%+v stats=%+v", got, p.stats[px.Key()])
+	st = p.stats[px.Key()]
+	if !got.Available || got.HealthInvalidated || st.HealthFailureTerminal || st.LastHealthSuccessAt.IsZero() || p.EligibleForAutoRecheck(got) {
+		t.Fatalf("manual recovery state = proxy=%+v stats=%+v", got, st)
+	}
+	if st.Successes != 0 || st.Failures != 0 {
+		t.Fatalf("health observation changed forwarding counters: %+v", st)
 	}
 
-	// Live client failures and policy decisions use this path and remain
-	// immediate, independent of the background threshold.
-	p.SetAvailable(px.Key(), false)
-	got, _ = p.Find(px.Key())
-	if got.Available {
-		t.Fatal("SetAvailable(false) was incorrectly delayed by health threshold")
+	if !p.ObserveManualHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation) {
+		t.Fatal("manual final failure was not applied")
 	}
-	p.SetAvailable(px.Key(), true)
-	if p.stats[px.Key()].ConsecutiveHealthFailures != 0 {
-		t.Fatalf("explicit successful recovery did not reset streak: %+v", p.stats[px.Key()])
-	}
-
-	p.ObserveHealthResult(px.Key(), false, 0)
-	p.ObserveHealthResult(px.Key(), false, 0)
 	p.RecordResult(px.Key(), true, 33)
-	if p.stats[px.Key()].ConsecutiveHealthFailures != 0 {
-		t.Fatalf("successful real/manual result did not reset background streak: %+v", p.stats[px.Key()])
-	}
-	p.ObserveHealthResult(px.Key(), false, 0)
 	got, _ = p.Find(px.Key())
-	if !got.Available {
-		t.Fatal("one background failure inherited the streak cleared by RecordResult success")
+	st = p.stats[px.Key()]
+	if !st.HealthFailureTerminal || !got.HealthInvalidated || got.Available || st.Successes != 1 {
+		t.Fatalf("forwarding success cleared terminal health state: proxy=%+v stats=%+v", got, st)
 	}
 }
 
@@ -323,15 +301,7 @@ func TestUpdateKeepsProtocolsAtSameAddressIndependent(t *testing.T) {
 	freshHTTP := httpProxy
 	freshHTTP.Country = "CA"
 	freshHTTP.LatencyMs = 75
-	for attempt := 1; attempt <= healthFailureThreshold; attempt++ {
-		p.Update([]Proxy{freshHTTP}, map[string]bool{socksProxy.Key(): true})
-		if attempt < healthFailureThreshold {
-			gotSOCKS, ok := p.Find(socksProxy.Key())
-			if !ok || !gotSOCKS.Available {
-				t.Fatalf("SOCKS variant became unavailable after refresh failure %d/%d: %+v, ok=%v", attempt, healthFailureThreshold, gotSOCKS, ok)
-			}
-		}
-	}
+	p.Update([]Proxy{freshHTTP}, map[string]bool{socksProxy.Key(): true})
 
 	if p.Size() != 2 {
 		t.Fatalf("same-address protocol variants collapsed; size=%d", p.Size())
@@ -340,47 +310,41 @@ func TestUpdateKeepsProtocolsAtSameAddressIndependent(t *testing.T) {
 	if !ok || !gotHTTP.Available || gotHTTP.Country != "CA" || gotHTTP.LatencyMs != 75 {
 		t.Fatalf("HTTP variant was not independently refreshed: %+v, ok=%v", gotHTTP, ok)
 	}
-	gotSOCKS, ok := p.Find(socksProxy.Key())
-	if !ok || gotSOCKS.Available || gotSOCKS.Country != "JP" {
-		t.Fatalf("SOCKS failure affected the wrong variant or lost its data: %+v, ok=%v", gotSOCKS, ok)
+	if p.EligibleForAutoRecheck(gotHTTP) {
+		t.Fatal("successful HTTP variant did not enter cooldown")
 	}
-	if got := p.stats[socksProxy.Key()].ConsecutiveHealthFailures; got != healthFailureThreshold {
-		t.Fatalf("SOCKS refresh failure streak = %d, want %d", got, healthFailureThreshold)
+	gotSOCKS, ok := p.Find(socksProxy.Key())
+	st := p.stats[socksProxy.Key()]
+	if !ok || gotSOCKS.Available || !gotSOCKS.HealthInvalidated || gotSOCKS.Country != "JP" || !st.HealthFailureTerminal || st.ConsecutiveHealthFailures != 1 {
+		t.Fatalf("SOCKS terminal failure affected wrong variant or lost data: proxy=%+v stats=%+v ok=%v", gotSOCKS, st, ok)
 	}
 }
 
-func TestUpdateRefreshSuccessResetsStreakAndFailedNewCandidateStaysOut(t *testing.T) {
+func TestUpdateTerminalFailureRequiresManualRecoveryAndFailedNewCandidateStaysOut(t *testing.T) {
 	p := NewProxyPool()
 	known := testProxy("http", "192.0.2.26", "8080", true)
 	p.Prime([]Proxy{known}, nil)
 
 	p.Update(nil, map[string]bool{known.Key(): true})
-	p.Update(nil, map[string]bool{known.Key(): true})
-	if got, _ := p.Find(known.Key()); !got.Available {
-		t.Fatal("known node became unavailable before refresh threshold")
-	}
-	if got := p.stats[known.Key()].ConsecutiveHealthFailures; got != 2 {
-		t.Fatalf("pre-recovery refresh streak = %d, want 2", got)
+	got, _ := p.Find(known.Key())
+	if got.Available || !got.HealthInvalidated || !p.stats[known.Key()].HealthFailureTerminal {
+		t.Fatalf("refresh failure was not terminal: proxy=%+v stats=%+v", got, p.stats[known.Key()])
 	}
 
 	fresh := known
-	fresh.Available = false // Update owns the successful observation state.
+	fresh.Available = false
 	fresh.LatencyMs = 42
 	p.Update([]Proxy{fresh}, nil)
-	got, _ := p.Find(known.Key())
-	if !got.Available || got.LatencyMs != 42 || p.stats[known.Key()].ConsecutiveHealthFailures != 0 {
-		t.Fatalf("successful refresh did not revive/reset node: proxy=%+v stats=%+v", got, p.stats[known.Key()])
+	got, _ = p.Find(known.Key())
+	if got.Available || !p.stats[known.Key()].HealthFailureTerminal {
+		t.Fatalf("automatic refresh recovered terminal node: proxy=%+v stats=%+v", got, p.stats[known.Key()])
 	}
 	if p.stats[known.Key()].Successes != 0 || p.stats[known.Key()].Failures != 0 {
-		t.Fatalf("refresh unexpectedly changed score counters: %+v", p.stats[known.Key()])
+		t.Fatalf("refresh unexpectedly changed forwarding counters: %+v", p.stats[known.Key()])
 	}
 
 	unknown := testProxy("socks5", "192.0.2.27", "1080", false)
-	p.Update(nil, map[string]bool{known.Key(): true, unknown.Key(): true})
-	got, _ = p.Find(known.Key())
-	if !got.Available || p.stats[known.Key()].ConsecutiveHealthFailures != 1 {
-		t.Fatalf("new refresh streak after success = proxy=%+v stats=%+v", got, p.stats[known.Key()])
-	}
+	p.Update(nil, map[string]bool{unknown.Key(): true})
 	if _, ok := p.Find(unknown.Key()); ok {
 		t.Fatal("failed new candidate was admitted to pool")
 	}
@@ -492,12 +456,13 @@ func TestCurrentGenerationFailureClearsWaitingForRecheckWithoutReviving(t *testi
 		t.Fatal("current-generation failure was not observed")
 	}
 	got, ok := p.Find(px.Key())
-	if !ok || got.Available || got.HealthInvalidated || got.PolicyExcluded {
-		t.Fatalf("failed current-generation result = %+v, found=%v; want ordinary unavailable", got, ok)
+	st := p.stats[px.Key()]
+	if !ok || got.Available || !got.HealthInvalidated || got.PolicyExcluded || !st.HealthFailureTerminal {
+		t.Fatalf("failed current-generation result = proxy=%+v stats=%+v found=%v; want terminal unavailable", got, st, ok)
 	}
 	_, failures := p.StatsOf(px.Key())
-	if failures != 1 {
-		t.Fatalf("failure count = %d, want 1", failures)
+	if failures != 0 {
+		t.Fatalf("health failure changed forwarding failure count = %d", failures)
 	}
 }
 
@@ -536,6 +501,36 @@ func TestUpdateWithEnabledSourcesAndPolicyMakesHardExclusionWin(t *testing.T) {
 	}
 }
 
+func TestRecheckCandidatesSkipsSuccessCooldownAndTerminalFailure(t *testing.T) {
+	p := NewProxyPool()
+	newNode := testProxy("http", "192.0.2.81", "80", false)
+	cooled := testProxy("http", "192.0.2.82", "80", true)
+	expired := testProxy("socks5", "192.0.2.83", "1080", true)
+	terminal := testProxy("socks5", "192.0.2.84", "1080", false)
+	p.Prime([]Proxy{newNode, cooled, expired, terminal}, nil)
+	now := time.Now().UTC()
+	p.stats[cooled.Key()] = &nodeStats{LastHealthSuccessAt: now.Add(-time.Hour)}
+	p.stats[expired.Key()] = &nodeStats{LastHealthSuccessAt: now.Add(-automaticHealthSuccessCooldown - time.Minute)}
+	p.stats[terminal.Key()] = &nodeStats{HealthFailureTerminal: true}
+
+	got := p.RecheckCandidates(10)
+	keys := make(map[string]bool, len(got))
+	for _, px := range got {
+		keys[px.Key()] = true
+	}
+	if !keys[newNode.Key()] || !keys[expired.Key()] || keys[cooled.Key()] || keys[terminal.Key()] {
+		t.Fatalf("eligible candidates = %v; want new+expired only", keys)
+	}
+	refreshInput := []Proxy{newNode, cooled, expired, terminal}
+	refreshEligible := p.FilterAutoRecheckCandidates(refreshInput)
+	refreshKeys := make(map[string]bool, len(refreshEligible))
+	for _, px := range refreshEligible {
+		refreshKeys[px.Key()] = true
+	}
+	if !refreshKeys[newNode.Key()] || !refreshKeys[expired.Key()] || refreshKeys[cooled.Key()] || refreshKeys[terminal.Key()] {
+		t.Fatalf("refresh-eligible candidates = %v; want new+expired only", refreshKeys)
+	}
+}
 func TestRecheckCandidatesRotatesBoundedKnownPool(t *testing.T) {
 	p := NewProxyPool()
 	all := []Proxy{
@@ -656,8 +651,8 @@ func TestReachablePolicyFilteredObservationStaysUnavailable(t *testing.T) {
 		t.Fatalf("policy-excluded node remained routable: %+v", selected)
 	}
 	successes, failures := p.StatsOf(px.Key())
-	if successes != 1 || failures != 0 {
-		t.Fatalf("policy reachability stats = %d/%d", successes, failures)
+	if successes != 0 || failures != 0 {
+		t.Fatalf("health observation changed forwarding stats = %d/%d", successes, failures)
 	}
 }
 
@@ -872,7 +867,6 @@ func TestImportantMutationsArePersistedInBatch(t *testing.T) {
 
 	p.RecordResult(px.Key(), true, 87)
 	p.ObserveHealthResult(px.Key(), false, 0)
-	p.ObserveHealthResult(px.Key(), false, 0)
 	p.SetAvailable(px.Key(), false)
 	p.UpdateLatency(px.Key(), 91)
 	if !p.UpdateGeo(px.Key(), "203.0.113.50", "SG", "Singapore", "AS", true, true) {
@@ -892,8 +886,8 @@ func TestImportantMutationsArePersistedInBatch(t *testing.T) {
 			if !got.Available && got.LatencyMs == 91 && got.ExitIP == "203.0.113.50" &&
 				got.Country == "SG" && got.IPChanged && got.IPChangeKnown && got.SpeedKbps == 2500.5 &&
 				got.SpeedBytes == 3_000_000 && got.SpeedDurationMs == 9600 &&
-				got.SpeedTestedAt >= before && st.Successes == 1 && st.Failures == 2 && st.LastLatencyMs == 87 &&
-				st.ConsecutiveHealthFailures == 2 {
+				got.SpeedTestedAt >= before && st.Successes == 1 && st.Failures == 0 && st.LastLatencyMs == 87 &&
+				st.ConsecutiveHealthFailures == 1 && st.HealthFailureTerminal {
 				break
 			}
 		}

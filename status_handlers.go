@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // handleHealthz is intentionally independent of pool state, scrape state,
@@ -364,6 +367,7 @@ func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
 		view.Score = s.pool.scoreLocked(px)
 		if stats := s.pool.stats[px.Key()]; stats != nil {
 			view.Successes, view.Failures = stats.Successes, stats.Failures
+			view.ConsecutiveFailures = stats.ConsecutiveHealthFailures
 		}
 		views = append(views, view)
 	}
@@ -527,8 +531,7 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.beginManualNodeVerify(in.Key); err != nil {
-		w.Header().Set("Retry-After", "2")
-		writeErrCode(w, http.StatusTooManyRequests, "node_verify_busy", err)
+		writeNodeOperationBusy(w, "node_verify_busy", err)
 		return
 	}
 	defer s.endManualNodeVerify(in.Key)
@@ -574,11 +577,10 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	ipChanged := policy.IPChanged
 	policyAllowed := policy.PolicyAllowed
 
-	// Three transport attempts form one explicit health observation, not three
-	// independent failures. A success revives immediately; a final failure joins
-	// the same three-observation debounce used by background health work so one
-	// unlucky manual click cannot evict an intermittently reachable node.
-	if !s.pool.ObserveHealthOutcomeAtGeneration(in.Key, reachable, policyAllowed, latencyMs, healthGeneration) {
+	// The transport retries form one explicit health observation. A final
+	// failure becomes terminal immediately; only a later explicit manual
+	// success may recover that terminal state.
+	if !s.pool.ObserveManualHealthOutcomeAtGeneration(in.Key, reachable, policyAllowed, latencyMs, healthGeneration) {
 		if s.pool.HealthGeneration() != healthGeneration {
 			writeErrCode(w, http.StatusConflict, "health_criterion_changed", fmt.Errorf("检测标准已改变，结果未应用"))
 			return
@@ -643,11 +645,11 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.beginSpeedTest(in.Key); err != nil {
-		w.Header().Set("Retry-After", "2")
-		writeErr(w, http.StatusTooManyRequests, err)
+		writeNodeOperationBusy(w, "node_speedtest_busy", err)
 		return
 	}
-	defer s.endSpeedTest(in.Key)
+	completed := false
+	defer func() { s.endSpeedTest(in.Key, completed) }()
 
 	result, verified, err := speedTestCredentialCandidatesContext(r.Context(), px, speedTestOperationTimeout)
 	if err != nil {
@@ -659,6 +661,7 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while speed test was running"))
 		return
 	}
+	completed = true
 	// Speed test results are explicit user actions, so persist them before
 	// replying rather than leaving them in the normal debounce window.
 	s.pool.FlushCache()
@@ -666,26 +669,49 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 		"kbps": result.Kbps, "bytes": result.Bytes, "duration_ms": result.DurationMs,
 	})
 }
+func writeNodeOperationBusy(w http.ResponseWriter, code string, err error) {
+	retryAfter := 2
+	var cooldown *nodeOperationCooldownError
+	if errors.As(err, &cooldown) {
+		retryAfter = retryAfterSeconds(cooldown.Remaining)
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writeErrCode(w, http.StatusTooManyRequests, code, err)
+}
 
 func (s *StatusServer) beginSpeedTest(key string) error {
 	s.speedMu.Lock()
 	defer s.speedMu.Unlock()
+	now := time.Now()
+	for candidateKey, until := range s.speedCooldownUntil {
+		if !until.After(now) {
+			delete(s.speedCooldownUntil, candidateKey)
+		}
+	}
 	if _, running := s.speedRunning[key]; running {
 		return fmt.Errorf("该节点正在测速")
+	}
+	if until := s.speedCooldownUntil[key]; until.After(now) {
+		return &nodeOperationCooldownError{Operation: "测速", Remaining: until.Sub(now)}
 	}
 	select {
 	case s.speedSlots <- struct{}{}:
 		s.speedRunning[key] = struct{}{}
 		return nil
 	default:
-		return fmt.Errorf("测速任务已满,请稍后重试")
+		return fmt.Errorf("测速并发已达上限，请稍后重试")
 	}
 }
 
-func (s *StatusServer) endSpeedTest(key string) {
+func (s *StatusServer) endSpeedTest(key string, completed ...bool) {
 	s.speedMu.Lock()
-	delete(s.speedRunning, key)
-	<-s.speedSlots
+	if _, running := s.speedRunning[key]; running {
+		delete(s.speedRunning, key)
+		if len(completed) == 0 || completed[0] {
+			s.speedCooldownUntil[key] = time.Now().Add(nodeSpeedTestCooldown)
+		}
+		<-s.speedSlots
+	}
 	s.speedMu.Unlock()
 }
 

@@ -429,6 +429,56 @@ func TestHandleConnRetriesAuthenticationCandidateAndPromotesIt(t *testing.T) {
 	}
 }
 
+func TestHandleConnUpstreamConnectFailureBecomesTerminalAndCannotFallback(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	_ = listener.Close()
+	upstream := Proxy{IP: host, Port: port, Protocol: "http", Available: true}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{upstream}, nil)
+	store := &ConfigStore{cfg: PoolConfig{Rules: []Rule{{Type: RuleMatch, Group: GroupAny}}}}
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	done := make(chan struct{})
+	go func() {
+		NewServer("", pool, store).handleConn(serverSide)
+		close(done)
+	}()
+	_, _ = clientSide.Write([]byte{socks5Version, 1, socks5NoAuth})
+	methodReply := make([]byte, 2)
+	if _, err := io.ReadFull(clientSide, methodReply); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = clientSide.Write(testSOCKSDomainFrame("example.com", 443))
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(clientSide, reply); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientSide.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SOCKS handler did not finish")
+	}
+	got, ok := pool.Find(upstream.Key())
+	if !ok || got.Available || !got.HealthInvalidated {
+		t.Fatalf("upstream failure state = found=%v proxy=%+v", ok, got)
+	}
+	if _, ok, _ := pool.Pick(GroupAny, nil); ok {
+		t.Fatal("terminal upstream returned through ANY fallback")
+	}
+	if successes, failures := pool.StatsOf(upstream.Key()); successes != 0 || failures != 1 {
+		t.Fatalf("forwarding counters = %d/%d, want 0/1", successes, failures)
+	}
+}
+
 func TestHandleConnTargetRefusalDoesNotMarkUpstreamUnavailable(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

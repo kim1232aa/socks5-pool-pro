@@ -371,10 +371,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			log.Printf("[server] upstream %s (group %s) failed: %v, switching...", upstream.Addr(), groupName, err)
 			if upstreamFailureAffectsHealth(err) {
 				s.pool.RecordResult(upstream.Key(), false, 0)
-				// Failures connecting/authenticating/speaking to the upstream itself
-				// make it immediately ineligible. A target-specific CONNECT refusal is
-				// excluded only from this request and must not poison global health.
-				s.pool.SetAvailable(upstream.Key(), false)
+				// A completed upstream connect/auth/protocol failure is terminal for
+				// automatic routing. Target-specific refusals stay request-local.
+				s.pool.ObserveHealthResultAtGeneration(upstream.Key(), false, 0, healthGeneration)
 			}
 			exclude[upstream.Key()] = true
 			continue

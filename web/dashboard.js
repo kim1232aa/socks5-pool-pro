@@ -19,7 +19,9 @@ function fetchJSON(url, options) {
         }
       }
       if (!r.ok) {
-        var requestError = new Error((data && data.error) || ('请求失败 (HTTP ' + r.status + ')'));
+        var detail = data && data.error;
+        if (detail && typeof detail === 'object') detail = detail.message || detail.code || JSON.stringify(detail);
+        var requestError = new Error(detail || ('请求失败 (HTTP ' + r.status + ')'));
         requestError.status = r.status;
         requestError.code = data && data.code ? data.code : '';
         requestError.requestId = data && data.request_id ? data.request_id : '';
@@ -236,6 +238,9 @@ var expandedCandidateRows = Object.create(null);
 var candidateContinentFilter = '';
 var candidateCountryTrigger = null;
 var countryPickerScope = 'candidates';
+var selectedCandidateKeys = Object.create(null);
+var candidateSpeedResults = Object.create(null);
+var candidateOperationPending = false;
 var lastKnownScrape = '';
 var lastKnownNextScrape = '';
 var lastCompactViewport = compactViewport();
@@ -799,6 +804,7 @@ function runProxyIPVerify(button) {
 }
 
 function onCandidatePageFetched(pageData) {
+  var previousSnapshotID = candidateSnapshotID;
   candidatePageData = pageData && typeof pageData === 'object' ? pageData : {};
   if (!Array.isArray(candidatePageData.candidates)) candidatePageData.candidates = [];
   ['statuses','sources','protocols','countries'].forEach(function(name) {
@@ -806,6 +812,16 @@ function onCandidatePageFetched(pageData) {
   });
   candidatePage = Number(candidatePageData.page) > 0 ? Number(candidatePageData.page) : 1;
   candidateSnapshotID = String(candidatePageData.snapshot_id || '');
+  if (previousSnapshotID && candidateSnapshotID && previousSnapshotID !== candidateSnapshotID) {
+    selectedCandidateKeys = Object.create(null);
+    candidateSpeedResults = Object.create(null);
+  }
+  var validKeys = candidatePageData.all_keys;
+  if (Array.isArray(validKeys)) {
+    var valid = Object.create(null);
+    validKeys.forEach(function(key){ valid[String(key)] = true; });
+    selectedCandidateList().forEach(function(key){ if (!valid[key]) { delete selectedCandidateKeys[key]; delete candidateSpeedResults[key]; } });
+  }
   var returnedPageSize = Number(candidatePageData.page_size) > 0 ? Number(candidatePageData.page_size) : candidatePageSize;
   var responsivePageSize = defaultCandidatePageSize();
   if (!candidatePageSizeTouched && returnedPageSize !== responsivePageSize) {
@@ -920,6 +936,122 @@ function restoreCandidateFocus(saved) {
   }
 }
 
+function selectedCandidateList() { return Object.keys(selectedCandidateKeys); }
+
+function updateCandidateSelectionUI() {
+  var keys = selectedCandidateList();
+  setText('candidate-selected-count', '已选 ' + keys.length + ' / 16');
+  var speedButton = document.querySelector('[data-action="candidate-speedtest-selected"]');
+  var deleteButton = document.querySelector('[data-action="candidate-delete-selected"]');
+  if (speedButton) speedButton.disabled = candidateOperationPending || !keys.length;
+  if (deleteButton) deleteButton.disabled = candidateOperationPending || !keys.length;
+  var pageToggle = document.getElementById('candidate-select-page');
+  var rows = candidatePageData && Array.isArray(candidatePageData.candidates) ? candidatePageData.candidates : [];
+  if (pageToggle) {
+    var selectedOnPage = rows.filter(function(item){ return !!selectedCandidateKeys[String(item.key || '')]; }).length;
+    pageToggle.checked = !!rows.length && selectedOnPage === rows.length;
+    pageToggle.indeterminate = selectedOnPage > 0 && selectedOnPage < rows.length;
+  }
+}
+
+function toggleCandidateSelection(button) {
+  var key = rowKey(button);
+  if (!key) return;
+  if (button.checked) {
+    if (!selectedCandidateKeys[key] && selectedCandidateList().length >= 16) {
+      button.checked = false;
+      notify('候选测速一次最多选择 16 个不同 key', 'error', 7000);
+      return;
+    }
+    selectedCandidateKeys[key] = true;
+  } else delete selectedCandidateKeys[key];
+  updateCandidateSelectionUI();
+}
+
+function toggleCandidatePageSelection(button) {
+  var rows = candidatePageData && Array.isArray(candidatePageData.candidates) ? candidatePageData.candidates : [];
+  if (!button.checked) {
+    rows.forEach(function(item){ delete selectedCandidateKeys[String(item.key || '')]; });
+  } else {
+    var available = 16 - selectedCandidateList().length;
+    var added = 0;
+    rows.forEach(function(item) {
+      var key = String(item.key || '');
+      if (key && !selectedCandidateKeys[key] && added < available) { selectedCandidateKeys[key] = true; added++; }
+    });
+    if (rows.some(function(item){ return !selectedCandidateKeys[String(item.key || '')]; })) notify('最多选择 16 个不同 key，已选到上限', 'error', 7000);
+  }
+  applyCandidateView();
+}
+
+function candidateResultText(key) {
+  var result = candidateSpeedResults[key];
+  if (!result) return '<span class="candidate-readonly">尚未测速</span>';
+  if (result.pending) return '<span class="candidate-speed-pending">测速中…</span>';
+  if (result.error) {
+    var errorMessage = typeof result.error === 'object' ? (result.error.message || result.error.code || JSON.stringify(result.error)) : result.error;
+    return '<span class="candidate-speed-error" role="status">失败：' + escapeHtml(errorMessage) + '</span>';
+  }
+  var duration = Number(result.duration_ms);
+  var speed = Number(result.kbps);
+  var parts = [];
+  if (isFinite(duration)) parts.push('用时 ' + Math.round(duration) + ' ms');
+  if (isFinite(speed)) parts.push(formatCount(Math.round(speed)) + ' KB/s');
+  return '<span class="candidate-speed-success" role="status">' + escapeHtml(parts.join(' · ') || '测速完成') + '</span>';
+}
+
+function normalizeCandidateResults(payload, keys) {
+  var rows = payload && Array.isArray(payload.results) ? payload.results : [];
+  var byKey = Object.create(null);
+  rows.forEach(function(item){ if (item && item.key) byKey[String(item.key)] = item; });
+  keys.forEach(function(key) {
+    var item = byKey[key];
+    if (!item) candidateSpeedResults[key] = {error:'服务端未返回该项结果'};
+    else if (item.error || item.ok === false) candidateSpeedResults[key] = {error:item.error || '测速失败'};
+    else candidateSpeedResults[key] = item;
+  });
+}
+
+function speedtestCandidates(keys) {
+  keys = keys.filter(Boolean).filter(function(key, index, all){ return all.indexOf(key) === index; });
+  if (!keys.length || candidateOperationPending) return;
+  if (keys.length > 16) { notify('候选测速一次最多 16 个不同 key', 'error', 7000); return; }
+  candidateOperationPending = true;
+  keys.forEach(function(key){ candidateSpeedResults[key] = {pending:true}; });
+  applyCandidateView();
+  fetchJSON('/api/candidates/speedtest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keys:keys})})
+    .then(function(payload){ normalizeCandidateResults(payload, keys); notify('候选测速完成；结果不改变健康状态，也不会加入转发池', 'success', 7000); })
+    .catch(function(err){ keys.forEach(function(key){ candidateSpeedResults[key] = {error:String(err)}; }); notify('候选测速失败：' + String(err), 'error', 7000); })
+    .finally(function(){ candidateOperationPending = false; applyCandidateView(); });
+}
+
+function deleteCandidates(keys) {
+  keys = keys.filter(Boolean).filter(function(key, index, all){ return all.indexOf(key) === index; });
+  if (!keys.length || candidateOperationPending) return;
+  if (!confirm('永久删除 ' + keys.length + ' 个候选？此操作不可撤销。')) return;
+  candidateOperationPending = true;
+  updateCandidateSelectionUI();
+  fetchJSON('/api/candidates/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keys:keys})})
+    .then(function(payload) {
+      var removed = payload && Array.isArray(payload.removed) ? payload.removed.map(String) : [];
+      var notFound = payload && Array.isArray(payload.not_found) ? payload.not_found.map(String) : [];
+      removed.forEach(function(key){ delete selectedCandidateKeys[key]; delete candidateSpeedResults[key]; });
+      var lines = keys.map(function(key) {
+        if (removed.indexOf(key) >= 0) return key + '：已删除';
+        if (notFound.indexOf(key) >= 0) return key + '：未找到，未从选择中清理';
+        return key + '：服务端未返回结果';
+      });
+      showResultDialog('候选删除结果', lines.join('\n'));
+      candidateSnapshotID = '';
+      candidatePage = 1;
+      return requestCandidates(true);
+    })
+    .catch(function(err){ notify('删除候选失败：' + String(err), 'error', 7000); })
+    .finally(function(){ candidateOperationPending = false; updateCandidateSelectionUI(); });
+}
+
+function deleteCandidate(button) { var key = rowKey(button); if (key) deleteCandidates([key]); }
+
 function applyCandidateView() {
   var tbody = document.getElementById('candidate-tbody');
   var pager = document.getElementById('candidate-pager');
@@ -962,13 +1094,13 @@ function applyCandidateView() {
     var emptyMessage = data.phase === 'loading' || data.phase === 'checking'
       ? '候选快照正在生成，完成后会自动显示。'
       : '完整候选快照尚未生成，请确认已启用来源后刷新。';
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">' + emptyMessage + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">' + emptyMessage + '</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合当前筛选条件的候选</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有符合当前筛选条件的候选</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
@@ -982,15 +1114,18 @@ function applyCandidateView() {
     var status = candidate.status || (candidate.routable === false ? 'resource' : 'deferred');
     var candidateKey = String(candidate.key || '');
     var candidateExpanded = !!expandedCandidateRows[candidateKey];
+    var selected = !!selectedCandidateKeys[candidateKey];
     return '<tr class="' + (candidateExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(candidateKey) + '">' +
+      '<td data-label="选择"><input type="checkbox" data-action="candidate-select" aria-label="选择候选 ' + escapeHtml(candidateKey) + '" ' + (selected ? 'checked' : '') + '></td>' +
       '<td data-label="状态">' + candidateStatusBadge(status) + '</td>' +
       '<td data-label="协议">' + protoBadge(candidate.protocol || '') + (candidate.has_auth ? '<span class="auth-badge" title="该上游候选使用下列用户名和密码">需认证</span>' : '') + '</td>' +
       '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.proxy_url || candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(String(candidate.proxy_url || candidate.addr || '')) + '" aria-label="复制候选代理URL">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
       '<td data-label="用户名" class="mono mobile-secondary">' + escapeHtml(candidate.username || '') + '</td>' +
       '<td data-label="密码" class="mono mobile-secondary">' + escapeHtml(candidate.password || '') + '</td>' +
       '<td data-label="来源标注地区">' + escapeHtml(location) + '</td>' +
-      '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '<span class="candidate-readonly"> · 只读候选</span></td>' +
-      '<td data-label="专用验证" class="candidate-verify-cell mobile-secondary">' + proxyIPVerifyCellHTML(candidate.key, candidate.protocol) + '</td></tr>';
+      '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '</td>' +
+      '<td data-label="测速结果" class="candidate-speed-cell mobile-secondary">' + candidateResultText(candidateKey) + '</td>' +
+      '<td data-label="操作" class="candidate-action-cell"><div class="candidate-row-actions"><button type="button" class="btn-sm" data-action="candidate-speedtest" aria-label="测速候选 ' + escapeHtml(candidateKey) + '">测速</button>' + (String(candidate.protocol || '').toLowerCase() === 'proxyip' ? proxyIPVerifyCellHTML(candidate.key, candidate.protocol) : '') + '<button type="button" class="btn-sm danger" data-action="candidate-delete" aria-label="删除候选 ' + escapeHtml(candidateKey) + '">删除</button></div></td></tr>';
   }).join('');
 
   if (total <= pageSize) {
@@ -1001,6 +1136,7 @@ function applyCandidateView() {
       '<span class="small">第 ' + page + ' / ' + pageCount + ' 页</span>' +
       '<button type="button" class="btn-sm" data-action="goto-candidate-page" data-page="' + (page + 1) + '" ' + (page >= pageCount ? 'disabled' : '') + '>下一页</button>');
   }
+  updateCandidateSelectionUI();
   restoreCandidateFocus(savedFocus);
 }
 
@@ -1202,14 +1338,14 @@ function applyNodeView() {
   }
 
   if (!poolTotal) {
-    tbody.innerHTML = '<tr><td colspan="14" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
     renderNodePagers('');
     if (banner) banner.textContent = '无 (代理池为空)';
     restoreNodeFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="14" class="empty">没有匹配的节点</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">没有匹配的节点</td></tr>';
     renderNodePagers('');
   } else {
     var html = '';
@@ -1237,9 +1373,10 @@ function applyNodeView() {
         (ops.verify
           ? '<button type="button" class="btn-sm" data-action="verify" aria-disabled="true">验证中...</button>'
           : '<button type="button" class="btn-sm" data-action="verify" title="立即重新拨号,查看真实出口IP/国家是否和标签一致" aria-label="验证节点 ' + escapeHtml(n.addr) + '">验证</button>') +
+        '<button type="button" class="btn-sm danger" data-action="delete-node" aria-label="删除节点 ' + escapeHtml(n.addr) + '">删除</button>' +
         '<button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (rowExpanded ? 'true' : 'false') + '">' + (rowExpanded ? '收起' : '详情') + '</button></div>';
       html += '<tr class="' + (n.active ? 'active ' : '') + (n.available === false ? 'unavail ' : '') + (rowExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
-        '<td data-label="状态">' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.source_retired ? '<span class="badge-unavail">来源已停用</span>' : (n.health_invalidated ? '<span class="badge-unavail">等待当前标准复检</span>' : (n.policy_excluded ? '<span class="badge-unavail">出口策略排除</span>' : (n.available === false ? '<span class="badge-unavail">暂不可用</span>' : '<span class="small">可用</span>'))))) + '</td>' +
+		'<td data-label="状态">' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.source_retired ? '<span class="badge-unavail">来源已停用</span>' : (n.health_invalidated ? '<span class="badge-unavail">检测失败，需人工验证恢复</span>' : (n.policy_excluded ? '<span class="badge-unavail">出口策略排除</span>' : (n.available === false ? '<span class="badge-unavail">暂不可用</span>' : '<span class="small">可用</span>'))))) + '</td>' +
         '<td data-label="协议">' + protoBadge(n.protocol) + '</td>' +
         '<td data-label="代理URL" class="mono">' + escapeHtml(n.proxy_url || n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.proxy_url || n.addr) + '" aria-label="复制完整代理URL">复制</button></td>' +
         '<td data-label="用户名" class="mono mobile-secondary">' + escapeHtml(n.username || '') + '</td>' +
@@ -1248,7 +1385,8 @@ function applyNodeView() {
         '<td data-label="匿名" class="mobile-secondary">' + anonBadge(n.anonymity) + '</td>' +
         '<td data-label="国家/城市">' + (loc || '<span class="small">-</span>') + '</td>' +
         '<td data-label="评分">' + scoreCell(n.score) + '</td>' +
-        '<td data-label="成功/失败" class="small mobile-secondary">' + sf + '</td>' +
+		'<td data-label="累计成功/失败" class="small mobile-secondary" title="仅统计真实转发请求结果；健康检查和测速不计入">' + sf + '</td>' +
+		'<td data-label="连续健康失败" class="small mobile-secondary">' + Math.max(0, Number(n.consecutive_failures || 0)) + (n.health_invalidated ? '（终态）' : '') + '</td>' +
         '<td data-label="延迟">' + lat + '</td>' +
         '<td data-label="速度" class="speed-cell mobile-secondary">' + spd + '</td>' +
         '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(n.source || '') + '</td>' +
@@ -1332,6 +1470,47 @@ function switchNode(btn) {
   postJSON('/api/nodes/switch', {key: rowKey(btn)}, function(err) {
     if (err) { notify(err, 'error', 7000); } else { notify('已切换并锁定当前节点', 'success'); pollStatus(true); }
   });
+}
+function deleteNode(btn) {
+  var key = rowKey(btn);
+  if (!key || !confirm('永久删除节点 ' + key + '？此操作不可撤销。')) return;
+  fetchJSON('/api/nodes/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keys:[key]})})
+    .then(function(result){ var removed = result && Array.isArray(result.removed) ? result.removed : []; if (!removed.length) throw new Error('服务端未确认删除该节点'); notify('节点已删除', 'success'); nodeSnapshotID = ''; return pollStatus(true); })
+    .catch(function(err){ notify('删除节点失败：' + String(err), 'error', 7000); });
+}
+
+function refreshSource(button) {
+  var id = String(button.getAttribute('data-source-id') || '');
+  if (!id) return;
+  button.setAttribute('aria-disabled', 'true');
+  fetchJSON('/api/sources/refresh', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id})})
+    .then(function(result){ var merged = result && result.accepted === false; notify(merged ? '该来源已有更新任务，已合并到现有任务' : ('来源“' + (button.getAttribute('data-source-name') || id) + '”更新任务已提交'), 'success'); })
+    .catch(function(err){ notify('来源更新失败：' + String(err), 'error', 7000); })
+    .finally(function(){ button.removeAttribute('aria-disabled'); });
+}
+
+function saveSourceAutoRefresh(button) {
+  var id = String(button.getAttribute('data-source-id') || '');
+  var row = button.closest('tr');
+  var enabledInput = row && row.querySelector('[data-source-auto-enabled]');
+  var intervalInput = row && row.querySelector('[data-source-auto-interval]');
+  if (!id || !enabledInput || !intervalInput) { notify('无法读取该来源的自动更新设置', 'error'); return; }
+  var intervalSeconds = Math.max(0, parseInt(intervalInput.value, 10) || 0);
+  intervalInput.value = String(intervalSeconds);
+  button.setAttribute('aria-disabled', 'true');
+  setText('source-auto-status', '正在保存来源设置…');
+  fetchJSON('/api/sources/auto-refresh', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id, enabled:!!enabledInput.checked, interval_seconds:intervalSeconds})})
+    .then(function(result) {
+      var source = result && result.source;
+      if (source) {
+        enabledInput.checked = !!source.auto_refresh_enabled;
+        intervalInput.value = String(Math.max(0, Number(source.refresh_interval_seconds) || 0));
+      }
+      setText('source-auto-status', '设置已保存到服务端');
+      notify('该来源的自动更新设置已保存', 'success');
+    })
+    .catch(function(err){ setText('source-auto-status', '保存失败：' + String(err)); notify('自动更新设置保存失败：' + String(err), 'error', 7000); })
+    .finally(function(){ button.removeAttribute('aria-disabled'); });
 }
 
 function pageIsVisible() { return document.visibilityState !== 'hidden'; }
@@ -1555,6 +1734,9 @@ function requestCandidates(force) {
       if (err && err.status === 409 && err.code === 'snapshot_changed') {
         candidateSnapshotID = '';
         candidatePage = 1;
+        selectedCandidateKeys = Object.create(null);
+        candidateSpeedResults = Object.create(null);
+        updateCandidateSelectionUI();
         queuedCandidateRefresh = true;
         setListNotice('candidate-notice', 'loading', '候选目录已生成新快照，正在从第一页继续浏览…');
         return null;
@@ -1807,7 +1989,7 @@ function manualVerifyObservationSummary(result) {
   }
   var failures = Number(result && result.consecutive_failures);
   if (result && typeof result.consecutive_failures === 'number' && isFinite(failures) && failures >= 0) {
-    lines.push('连续失败观察：' + Math.round(failures) + '/3');
+    lines.push('健康失败观察：' + Math.round(failures) + (failures > 0 ? '（已终态过滤，需人工验证成功恢复）' : ''));
   }
   return lines;
 }
@@ -1823,9 +2005,7 @@ function runVerify(btn) {
       if (!j.reachable) {
         var failedMessage = '验证失败：本次手动复检未能连通目标。';
         if (observation.length) failedMessage += '\n' + observation.join('\n');
-        if (typeof j.available === 'boolean' || typeof j.consecutive_failures === 'number') {
-          failedMessage += '\n本次手动请求（内部最多 3 次连通尝试）只记为 1 次健康观察；连续 3 次失败观察才会下线。';
-        }
+        failedMessage += '\n本次手动请求内部最多尝试 3 次；最终失败后节点已立即从可路由池过滤，不会继续自动复检。';
         showResultDialog('节点复检未通过', failedMessage);
         return;
       }
@@ -1951,6 +2131,8 @@ document.addEventListener('click', function(event) {
     case 'open-candidate-country-picker': openCandidateCountryPicker(); break;
     case 'export-nodes': exportNodes(actionElement.getAttribute('data-format')); break;
     case 'clear-unavailable': clearUnavailable(); break;
+    case 'refresh-source': refreshSource(actionElement); break;
+    case 'save-source-auto-refresh': saveSourceAutoRefresh(actionElement); break;
     case 'delete-source':
       if (confirm('删除来源 ' + (actionElement.getAttribute('data-source-name') || '') + '?')) postJSON('/api/sources/delete', {id:actionElement.getAttribute('data-source-id')}, reloadOrAlert);
       break;
@@ -1967,17 +2149,26 @@ document.addEventListener('click', function(event) {
       break;
     case 'candidate-country-backdrop': candidateCountryBackdrop(event); break;
     case 'close-candidate-country-picker': closeCandidateCountryPicker(); break;
+
     case 'result-dialog-backdrop': resultDialogBackdrop(event); break;
     case 'close-result-dialog': closeResultDialog(); break;
     case 'choose-candidate-protocol': chooseCandidateProtocol(actionElement.getAttribute('data-protocol') || ''); break;
     case 'set-candidate-continent': setCandidateContinentFilter(actionElement.getAttribute('data-continent') || ''); break;
     case 'choose-candidate-country': chooseCandidateCountry(actionElement.getAttribute('data-country') || ''); break;
     case 'proxyip-verify': runProxyIPVerify(actionElement); break;
+    case 'candidate-select': toggleCandidateSelection(actionElement); break;
+    case 'candidate-select-page': toggleCandidatePageSelection(actionElement); break;
+    case 'candidate-speedtest': speedtestCandidates([rowKey(actionElement)]); break;
+    case 'candidate-speedtest-selected': speedtestCandidates(selectedCandidateList()); break;
+    case 'candidate-delete': deleteCandidate(actionElement); break;
+    case 'candidate-delete-selected': deleteCandidates(selectedCandidateList()); break;
     case 'copy': copyAddrFrom(actionElement); break;
     case 'toggle-candidate-details': toggleCandidateDetails(actionElement); break;
     case 'goto-candidate-page': gotoCandidatePage(actionElement.getAttribute('data-page')); break;
     case 'switch-node': switchNode(actionElement); break;
     case 'speedtest': runSpeedtest(actionElement); break;
+    case 'verify': runVerify(actionElement); break;
+    case 'delete-node': deleteNode(actionElement); break;
     case 'details':
       if (actionElement.closest('#candidate-tbody')) toggleCandidateDetails(actionElement);
       else toggleNodeDetails(actionElement);
@@ -1995,6 +2186,7 @@ syncCandidatePageSizeSelect();
 syncTabFromHash();
 pollStatus(false);
 schedulePoll(15000);
+
 
 document.getElementById('form-add-source').addEventListener('submit', function(e) {
   e.preventDefault();

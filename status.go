@@ -12,25 +12,33 @@ import (
 	"time"
 )
 
+const (
+	maxConcurrentNodeSpeedTests = 16
+	nodeSpeedTestCooldown       = 5 * time.Minute
+	nodeManualVerifyCooldown    = 2 * time.Minute
+)
+
 type StatusServer struct {
-	pool                 *ProxyPool
-	store                *ConfigStore
-	coordinator          *RefreshCoordinator
-	adminAuthEnabled     bool
-	adminUserHash        [sha256.Size]byte
-	adminPassHash        [sha256.Size]byte
-	serverMu             sync.Mutex
-	server               *http.Server
-	speedMu              sync.Mutex
-	speedRunning         map[string]struct{}
-	speedSlots           chan struct{}
-	proxyIPVerifyMu      sync.Mutex
-	proxyIPVerifyRunning map[string]*proxyIPVerifyCall
-	proxyIPVerifySlots   chan struct{}
-	nodeVerifyMu         sync.Mutex
-	nodeVerifyRunning    map[string]struct{}
-	nodeVerifySlots      chan struct{}
-	nodeVerifyOps        manualNodeVerifyOperations
+	pool                    *ProxyPool
+	store                   *ConfigStore
+	coordinator             *RefreshCoordinator
+	adminAuthEnabled        bool
+	adminUserHash           [sha256.Size]byte
+	adminPassHash           [sha256.Size]byte
+	serverMu                sync.Mutex
+	server                  *http.Server
+	speedMu                 sync.Mutex
+	speedRunning            map[string]struct{}
+	speedCooldownUntil      map[string]time.Time
+	speedSlots              chan struct{}
+	proxyIPVerifyMu         sync.Mutex
+	proxyIPVerifyRunning    map[string]*proxyIPVerifyCall
+	proxyIPVerifySlots      chan struct{}
+	nodeVerifyMu            sync.Mutex
+	nodeVerifyRunning       map[string]struct{}
+	nodeVerifySlots         chan struct{}
+	nodeVerifyCooldownUntil map[string]time.Time
+	nodeVerifyOps           manualNodeVerifyOperations
 	// trustedManagementProxies is an explicit, exact-IP allowlist for a local
 	// reverse proxy or container bridge. It never accepts CIDRs and is consulted
 	// only when admin authentication is disabled.
@@ -72,13 +80,15 @@ func newStatusServer(pool *ProxyPool, store *ConfigStore, coordinator *RefreshCo
 	}
 	s := &StatusServer{
 		pool: pool, store: store, coordinator: coordinator,
-		speedRunning:         make(map[string]struct{}),
-		speedSlots:           make(chan struct{}, 4),
-		proxyIPVerifyRunning: make(map[string]*proxyIPVerifyCall),
-		proxyIPVerifySlots:   make(chan struct{}, maxProxyIPVerifyConcurrent),
-		nodeVerifyRunning:    make(map[string]struct{}),
-		nodeVerifySlots:      make(chan struct{}, maxManualNodeVerifyConcurrent),
-		nodeVerifyOps:        defaultManualNodeVerifyOperations(),
+		speedRunning:            make(map[string]struct{}),
+		speedCooldownUntil:      make(map[string]time.Time),
+		speedSlots:              make(chan struct{}, maxConcurrentNodeSpeedTests),
+		proxyIPVerifyRunning:    make(map[string]*proxyIPVerifyCall),
+		proxyIPVerifySlots:      make(chan struct{}, maxProxyIPVerifyConcurrent),
+		nodeVerifyRunning:       make(map[string]struct{}),
+		nodeVerifyCooldownUntil: make(map[string]time.Time),
+		nodeVerifySlots:         make(chan struct{}, maxManualNodeVerifyConcurrent),
+		nodeVerifyOps:           defaultManualNodeVerifyOperations(),
 	}
 	if pool != nil && store != nil {
 		_, criterion := pool.HealthCriterion()
@@ -159,17 +169,22 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/nodes", requireGet(s.handleNodes))
 	mux.HandleFunc("/api/nodes/page", s.handleNodesPage)
 	mux.HandleFunc("/api/candidates/page", s.handleCandidatesPage)
+	mux.HandleFunc("/api/candidates/speedtest", requirePost(s.handleCandidateSpeedtest))
+	mux.HandleFunc("/api/candidates/delete", requirePost(s.handleCandidatesDelete))
 	mux.HandleFunc("/api/proxyip/verify", requirePost(s.handleProxyIPVerify))
 	mux.HandleFunc("/api/nodes/switch", requirePost(s.handleNodeSwitch))
 	mux.HandleFunc("/api/nodes/auto", requirePost(s.handleNodeAuto))
 	mux.HandleFunc("/api/nodes/verify", requirePost(s.handleNodeVerify))
 	mux.HandleFunc("/api/nodes/clear-unavailable", requirePost(s.handleNodesClearUnavailable))
+	mux.HandleFunc("/api/nodes/delete", requirePost(s.handleNodesDelete))
 	mux.HandleFunc("/api/nodes/speedtest", requirePost(s.handleNodeSpeedtest))
 	mux.HandleFunc("/api/nodes/export", requireGet(s.handleNodeExport))
 
 	mux.HandleFunc("/api/sources", s.handleSources)
 	mux.HandleFunc("/api/sources/toggle", requirePost(s.handleSourceToggle))
 	mux.HandleFunc("/api/sources/delete", requirePost(s.handleSourceDelete))
+	mux.HandleFunc("/api/sources/refresh", requirePost(s.handleSourceRefresh))
+	mux.HandleFunc("/api/sources/auto-refresh", requirePost(s.handleSourceAutoRefresh))
 
 	mux.HandleFunc("/api/rules", s.handleRules)
 	mux.HandleFunc("/api/rules/delete", requirePost(s.handleRuleDelete))

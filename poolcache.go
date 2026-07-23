@@ -100,19 +100,24 @@ func (c *poolCache) loadWithHealthState() (forwarding, proxyip []Proxy, stats ma
 	return f.Proxies, f.ProxyIPNodes, f.Stats, f.HealthCheckURL, f.HealthPolicy, f.HealthRecheckPending
 }
 
-// Older builds could persist HealthInvalidated=true after an exhaustive pass
-// had already completed unsuccessfully for that node. With no recheck pending,
-// that bit no longer means "waiting"; retain the failed node and its history,
-// but migrate it to the ordinary unavailable state. A genuine policy exclusion
-// produced by a completed current-generation check has HealthInvalidated=false
-// and is deliberately left untouched.
+// normalizeCompletedCachedHealthState distinguishes the old transient
+// HealthInvalidated marker from the terminal state now persisted in nodeStats.
+// Old caches decode the new terminal field as false and retain their historical
+// normalization; terminal failures keep the hard-routing mirror across restart.
 func normalizeCompletedCachedHealthState(f *poolCacheFile) int {
-	if f == nil || f.HealthRecheckPending {
+	if f == nil {
 		return 0
 	}
 	reset := 0
 	for i := range f.Proxies {
-		if !f.Proxies[i].HealthInvalidated {
+		stats := f.Stats[f.Proxies[i].Key()]
+		if stats.HealthFailureTerminal {
+			f.Proxies[i].HealthInvalidated = true
+			f.Proxies[i].PolicyExcluded = false
+			f.Proxies[i].Available = false
+			continue
+		}
+		if f.HealthRecheckPending || !f.Proxies[i].HealthInvalidated {
 			continue
 		}
 		f.Proxies[i].HealthInvalidated = false
@@ -154,18 +159,18 @@ func filterNonPublicPoolCacheNodes(f *poolCacheFile) (removedForwarding, removed
 }
 
 func (c *poolCache) save(generation uint64, forwarding, proxyip []Proxy, stats map[string]nodeStats) {
-	c.saveWithHealthCriterion(generation, forwarding, proxyip, stats, "")
+	_ = c.saveWithHealthCriterion(generation, forwarding, proxyip, stats, "")
 }
 
-func (c *poolCache) saveWithHealthCriterion(generation uint64, forwarding, proxyip []Proxy, stats map[string]nodeStats, healthCheckURL string) {
-	c.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, "", false)
+func (c *poolCache) saveWithHealthCriterion(generation uint64, forwarding, proxyip []Proxy, stats map[string]nodeStats, healthCheckURL string) error {
+	return c.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, "", false)
 }
 
-func (c *poolCache) saveWithHealthState(generation uint64, forwarding, proxyip []Proxy, stats map[string]nodeStats, healthCheckURL, healthPolicy string, healthRecheckPending bool) {
+func (c *poolCache) saveWithHealthState(generation uint64, forwarding, proxyip []Proxy, stats map[string]nodeStats, healthCheckURL, healthPolicy string, healthRecheckPending bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.hasLastGeneration && generation <= c.lastGeneration {
-		return
+		return nil
 	}
 	f := poolCacheFile{
 		Proxies: forwarding, ProxyIPNodes: proxyip, Stats: stats,
@@ -173,46 +178,39 @@ func (c *poolCache) saveWithHealthState(generation uint64, forwarding, proxyip [
 		HealthRecheckPending: healthRecheckPending,
 	}
 	if err := validatePoolCacheFile(&f); err != nil {
-		log.Printf("[cache] validation failed: %v", err)
-		return
+		return fmt.Errorf("validate pool cache: %w", err)
 	}
 	data, err := json.Marshal(f)
 	if err != nil {
-		log.Printf("[cache] marshal failed: %v", err)
-		return
+		return fmt.Errorf("marshal pool cache: %w", err)
 	}
 	if len(data) > maxPoolCacheDecodedBytes {
-		log.Printf("[cache] decoded snapshot exceeds %d byte limit", maxPoolCacheDecodedBytes)
-		return
+		return fmt.Errorf("decoded snapshot exceeds %d byte limit", maxPoolCacheDecodedBytes)
 	}
 	var compressed bytes.Buffer
 	writer, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
 	if err != nil {
-		log.Printf("[cache] create compressor failed: %v", err)
-		return
+		return fmt.Errorf("create compressor: %w", err)
 	}
 	if _, err := writer.Write(data); err != nil {
 		_ = writer.Close()
-		log.Printf("[cache] compress failed: %v", err)
-		return
+		return fmt.Errorf("compress pool cache: %w", err)
 	}
 	if err := writer.Close(); err != nil {
-		log.Printf("[cache] finish compression failed: %v", err)
-		return
+		return fmt.Errorf("finish compression: %w", err)
 	}
 	if compressed.Len() > maxPoolCacheBytes {
-		log.Printf("[cache] compressed snapshot exceeds %d byte limit", maxPoolCacheBytes)
-		return
+		return fmt.Errorf("compressed snapshot exceeds %d byte limit", maxPoolCacheBytes)
 	}
 	// Pool snapshots can contain upstream credentials. The shared atomic writer
 	// uses a random 0600 temporary file, fsyncs it, renames it, then fsyncs the
 	// directory; it never follows the legacy predictable .tmp path.
 	if err := writePrivateFileAtomic(c.path, compressed.Bytes()); err != nil {
-		log.Printf("[cache] write failed: %v", err)
-		return
+		return fmt.Errorf("write pool cache: %w", err)
 	}
 	c.lastGeneration = generation
 	c.hasLastGeneration = true
+	return nil
 }
 
 func decodePoolCacheBytes(data []byte) ([]byte, error) {
@@ -482,8 +480,8 @@ func validatePoolCacheFile(f *poolCacheFile) error {
 		if len(key) > maxSourceProxyURLBytes || hasLogControlCharacters(key) {
 			return fmt.Errorf("invalid stats key")
 		}
-		if stats.Successes < 0 || stats.Failures < 0 || stats.LastLatencyMs < 0 || stats.ConsecutiveHealthFailures < 0 || stats.ConsecutiveHealthFailures > healthFailureThreshold {
-			return fmt.Errorf("stats %q contains invalid negative/out-of-range values", key)
+		if stats.Successes < 0 || stats.Failures < 0 || stats.LastLatencyMs < 0 || stats.ConsecutiveHealthFailures < 0 {
+			return fmt.Errorf("stats %q contains invalid negative values", key)
 		}
 	}
 	return nil

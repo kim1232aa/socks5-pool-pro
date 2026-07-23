@@ -28,19 +28,20 @@ const (
 	StrategyScore      = "score"       // prefer the highest composite quality score
 )
 
-// nodeStats accumulates observed reliability for one node across
-// connections and background re-checks, keyed by Proxy.Key().
+// nodeStats accumulates observed reliability and durable automatic health-check
+// state for one node, keyed by Proxy.Key().  The health fields intentionally do
+// not share the forwarding success/failure counters: a real routed request is
+// not an automatic health observation.
 type nodeStats struct {
-	Successes                 int   `json:"successes"`
-	Failures                  int   `json:"failures"`
-	LastLatencyMs             int64 `json:"last_latency_ms"`
-	ConsecutiveHealthFailures int   `json:"consecutive_health_failures,omitempty"`
+	Successes                 int       `json:"successes"`
+	Failures                  int       `json:"failures"`
+	LastLatencyMs             int64     `json:"last_latency_ms"`
+	ConsecutiveHealthFailures int       `json:"consecutive_health_failures,omitempty"`
+	LastHealthSuccessAt       time.Time `json:"last_health_success_at,omitempty"`
+	HealthFailureTerminal     bool      `json:"health_failure_terminal,omitempty"`
 }
 
-// Background checks are deliberately tolerant of brief DNS, scheduler, and
-// upstream stalls. Live client dials and explicit policy decisions still take
-// effect immediately through SetAvailable.
-const healthFailureThreshold = 3
+const automaticHealthSuccessCooldown = 24 * time.Hour
 
 // Group is a user-defined named subset of the pool plus a selection
 // strategy. GroupAny and GroupDirect are reserved built-ins that always
@@ -167,69 +168,106 @@ func (p *ProxyPool) statsForKeyLocked(key string) *nodeStats {
 	return st
 }
 
-// ObserveHealthResult atomically applies one health observation shared by
-// periodic background checks and bounded manual verification. A success
-// immediately restores routing eligibility and clears the failure streak;
-// transient failures remain visible in reliability stats but only the third
-// consecutive observation marks the known node unavailable.
-//
-// This intentionally counts Successes/Failures exactly as the former
-// RecordResult call in reCheckAlive did, preserving score semantics while
-// replacing three independently locked mutations with one.
+func statsEligibleForAutoRecheck(st *nodeStats, now time.Time) bool {
+	if st == nil {
+		return true
+	}
+	if st.HealthFailureTerminal {
+		return false
+	}
+	return st.LastHealthSuccessAt.IsZero() || !now.Before(st.LastHealthSuccessAt.Add(automaticHealthSuccessCooldown))
+}
+
+// eligibleForAutoRecheckLocked decides whether a retained node may enter an
+// automatic health-check worker. New nodes are eligible; terminal failures are
+// deliberately never retried automatically.
+func (p *ProxyPool) eligibleForAutoRecheckLocked(px Proxy, now time.Time) bool {
+	return !px.SourceRetired && statsEligibleForAutoRecheck(p.stats[px.Key()], now)
+}
+
+// EligibleForAutoRecheck exposes the pool's automatic-health admission rule
+// for periodic and exhaustive workers. Manual verification intentionally
+// bypasses this method so operators can explicitly retest a terminal node.
+func (p *ProxyPool) EligibleForAutoRecheck(px Proxy) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.eligibleForAutoRecheckLocked(px, time.Now().UTC())
+}
+
+// FilterAutoRecheckCandidates removes known nodes still in their success
+// cooldown or terminally failed before refresh sampling. Unseen candidates are
+// retained and therefore cannot be crowded out by an ineligible known node.
+func (p *ProxyPool) FilterAutoRecheckCandidates(candidates []Proxy) []Proxy {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now().UTC()
+	out := candidates[:0]
+	for _, px := range candidates {
+		if statsEligibleForAutoRecheck(p.stats[px.Key()], now) {
+			out = append(out, px)
+		}
+	}
+	return out
+}
+
+// ObserveHealthResult applies one completed automatic health observation.
 func (p *ProxyPool) ObserveHealthResult(key string, ok bool, latencyMs int64) bool {
-	return p.observeHealthOutcome(key, ok, ok, latencyMs, nil)
+	return p.observeHealthOutcome(key, ok, ok, latencyMs, nil, false)
 }
 
 func (p *ProxyPool) ObserveHealthResultAtGeneration(key string, ok bool, latencyMs int64, generation uint64) bool {
-	return p.observeHealthOutcome(key, ok, ok, latencyMs, &generation)
+	return p.observeHealthOutcome(key, ok, ok, latencyMs, &generation, false)
 }
 
-// ObserveHealthOutcomeAtGeneration distinguishes transport reachability from
-// policy eligibility. A transparent proxy is a successful reliability sample,
-// but require-ip-change must keep it unavailable atomically rather than briefly
-// reviving it before a separate SetAvailable call.
+// ObserveHealthOutcomeAtGeneration applies an automatic health observation.
+// Automatic workers cannot recover a terminal failure; eligibility filtering
+// prevents that state from entering them in the first place.
 func (p *ProxyPool) ObserveHealthOutcomeAtGeneration(key string, reachable, policyAllowed bool, latencyMs int64, generation uint64) bool {
-	return p.observeHealthOutcome(key, reachable, policyAllowed, latencyMs, &generation)
+	return p.observeHealthOutcome(key, reachable, policyAllowed, latencyMs, &generation, false)
 }
 
-func (p *ProxyPool) observeHealthOutcome(key string, reachable, policyAllowed bool, latencyMs int64, expectedGeneration *uint64) bool {
+// ObserveManualHealthOutcomeAtGeneration applies an explicit operator health
+// observation. A usable manual success is the sole recovery path from a
+// terminal failure and starts a fresh 24-hour automatic cooldown.
+func (p *ProxyPool) ObserveManualHealthOutcomeAtGeneration(key string, reachable, policyAllowed bool, latencyMs int64, generation uint64) bool {
+	return p.observeHealthOutcome(key, reachable, policyAllowed, latencyMs, &generation, true)
+}
+
+func (p *ProxyPool) observeHealthOutcome(key string, reachable, policyAllowed bool, latencyMs int64, expectedGeneration *uint64, manual bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if expectedGeneration != nil && p.healthGeneration != *expectedGeneration {
+		return false
+	}
+	if st := p.stats[key]; reachable && st != nil && st.HealthFailureTerminal && !manual {
 		return false
 	}
 
 	observed := p.mutateProxyLocked(key, func(px *Proxy) {
 		st := p.statsForKeyLocked(key)
 		if reachable {
-			st.Successes++
 			st.ConsecutiveHealthFailures = 0
+			st.LastHealthSuccessAt = time.Now().UTC()
+			if manual && policyAllowed {
+				st.HealthFailureTerminal = false
+			}
 			if latencyMs > 0 {
 				st.LastLatencyMs = latencyMs
 			}
-			px.HealthInvalidated = false
+			px.HealthInvalidated = st.HealthFailureTerminal
 			px.PolicyExcluded = !policyAllowed
-			px.Available = policyAllowed && !px.SourceRetired
+			px.Available = policyAllowed && !px.SourceRetired && !st.HealthFailureTerminal
 			px.LatencyMs = latencyMs
 			return
 		}
 
-		// Reaching a definitive failure under the current generation still
-		// completes this node's criterion recheck. Keep it unavailable, but do
-		// not continue labelling it as "waiting for recheck" or preserve a
-		// policy decision learned under the superseded criterion.
-		if px.HealthInvalidated {
-			px.HealthInvalidated = false
-			px.PolicyExcluded = false
-			px.Available = false
-		}
-		st.Failures++
-		if st.ConsecutiveHealthFailures < healthFailureThreshold {
-			st.ConsecutiveHealthFailures++
-		}
-		if st.ConsecutiveHealthFailures >= healthFailureThreshold {
-			px.Available = false
-		}
+		// Mirror the durable terminal state in the existing hard-routing bit so
+		// every routing fallback excludes it without changing Proxy's wire shape.
+		px.HealthInvalidated = true
+		px.Available = false
+		px.PolicyExcluded = false
+		st.ConsecutiveHealthFailures++
+		st.HealthFailureTerminal = true
 	})
 	if observed {
 		p.statsRevision++
@@ -372,6 +410,9 @@ func proxyHardRoutable(px Proxy) bool {
 	return !px.SourceRetired && !px.HealthInvalidated && !px.PolicyExcluded
 }
 
+// SetAvailable flips a node's soft availability. It deliberately does not
+// alter automatic health cooldown or terminal state; only a successful manual
+// health observation may recover a terminal failure.
 func (p *ProxyPool) SetAvailable(key string, available bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -392,9 +433,13 @@ func (p *ProxyPool) SetPolicyExcludedAtGeneration(key string, excluded bool, gen
 		return false
 	}
 	updated := p.mutateProxyLocked(key, func(px *Proxy) {
-		px.HealthInvalidated = false
+		terminal := false
+		if st := p.stats[key]; st != nil {
+			terminal = st.HealthFailureTerminal
+		}
+		px.HealthInvalidated = terminal
 		px.PolicyExcluded = excluded
-		if excluded {
+		if excluded || terminal {
 			px.Available = false
 		}
 	})
@@ -431,6 +476,7 @@ func (p *ProxyPool) InvalidateHealth(checkURL ...string) int {
 		}
 		if st := p.stats[p.proxies[i].Key()]; st != nil {
 			st.ConsecutiveHealthFailures = 0
+			st.LastHealthSuccessAt = time.Time{}
 		}
 	}
 	p.routingRevision++
@@ -746,7 +792,7 @@ func (p *ProxyPool) flushScheduledPersistence(token uint64) {
 	}
 	generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
-	cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
+	_ = cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
 }
 
 // FlushCache synchronously persists a detached snapshot. Normal state changes
@@ -762,7 +808,7 @@ func (p *ProxyPool) FlushCache() {
 	}
 	generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
-	cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
+	_ = cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
 }
 
 // statsSnapshot / restoreStats support persisting scores across restarts.
@@ -822,23 +868,16 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 // (protocol + address) and are never dropped here; the same endpoint can
 // legitimately expose HTTP and SOCKS independently:
 //   - an address present in freshlyAlive is marked Available=true and gets
-//     its newly-observed connection data, while on-demand speed results and
-//     trustworthy exit/geo metadata survive a partial probe result.
+//     its newly-observed connection data, while durable measurements survive.
 //   - an already-known address in failedAddrs (dialed and genuinely failed to
-//     connect - see CheckProxies) increments its background failure streak and
-//     is marked Available=false only at healthFailureThreshold. A failed new
-//     candidate is absent from the merged pool and therefore is not admitted.
-//     A node that was dialed successfully but excluded from freshlyAlive for a
-//     policy reason (transparent proxy, blocked country) is neither here nor
-//     in freshlyAlive, so it's left untouched by the next branch.
-//   - an address in neither (deferred this cycle by bounded candidate
-//     sampling, never re-scraped, or excluded for policy) is left
-//     completely untouched, including its previous Available value.
+//     connect - see CheckProxies) is immediately marked terminally unavailable.
+//     A failed new candidate is absent from the merged pool and is not admitted.
+//   - a reachable candidate excluded for policy is kept but hard-excluded.
+//   - an address in neither (deferred this cycle or absent from the source) is
+//     left completely untouched, including its previous Available value.
 //
-// This means the known-node list only grows (or self-heals a node back to
-// Available=true) - hiding currently-dead nodes is left to the dashboard
-// filter (see NodeView.Available), not to deletion. Use ClearUnavailable
-// for an explicit, user-triggered purge of the ones marked unavailable.
+// The retained-node list only grows here; terminal failures remain as history
+// for explanation and manual recovery. ClearUnavailable is the explicit purge.
 //
 // Per-group cursors are left as-is; Pick re-anchors automatically against
 // whatever is present in the new list. The merged pool is persisted to the
@@ -895,6 +934,9 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 	added, revived, failed := 0, 0, 0
 	for _, px := range freshFwd {
 		key := px.Key()
+		if st := p.stats[key]; st != nil && st.HealthFailureTerminal {
+			continue
+		}
 		freshKeys[key] = true
 		if existing, ok := merged[key]; !ok {
 			added++
@@ -904,9 +946,9 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 			}
 			px = mergeFreshProxy(existing, px)
 		}
-		if st := p.stats[key]; st != nil {
-			st.ConsecutiveHealthFailures = 0
-		}
+		st := p.statsForKeyLocked(key)
+		st.ConsecutiveHealthFailures = 0
+		st.LastHealthSuccessAt = time.Now().UTC()
 		merged[key] = px
 	}
 	for key, existing := range merged {
@@ -914,14 +956,18 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 			continue
 		}
 		st := p.statsForKeyLocked(key)
-		if st.ConsecutiveHealthFailures < healthFailureThreshold {
-			st.ConsecutiveHealthFailures++
-		}
-		if st.ConsecutiveHealthFailures >= healthFailureThreshold && existing.Available {
+		st.ConsecutiveHealthFailures++
+		st.HealthFailureTerminal = true
+		// Mirror the durable terminal state into the hard-routing bit so every
+		// fallback (all-unavailable included) excludes it without a Proxy schema
+		// change. A later successful observation clears this in one place.
+		if existing.Available || !existing.HealthInvalidated {
+			existing.HealthInvalidated = true
+			existing.PolicyExcluded = false
 			existing.Available = false
 			merged[key] = existing
-			failed++
 		}
+		failed++
 	}
 	// Policy is a hard routing boundary and wins defensively even if a caller
 	// accidentally supplies the same key in freshlyAlive. New policy-filtered
@@ -994,10 +1040,10 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
 	if cache != nil {
-		cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
+		_ = cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
 	}
-	log.Printf("[pool] updated: %d known forwarding proxies total (+%d new, %d revived, %d reached %d-failure unavailable threshold), %d proxyip (info-only) nodes",
-		len(fwd), added, revived, failed, healthFailureThreshold, len(info))
+	log.Printf("[pool] updated: %d known forwarding proxies total (+%d new, %d revived, %d marked terminally unavailable), %d proxyip (info-only) nodes",
+		len(fwd), added, revived, failed, len(info))
 	return true
 }
 
@@ -1097,10 +1143,88 @@ func (p *ProxyPool) ClearUnavailable() int {
 	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
 	if cache != nil {
-		cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
+		_ = cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
 	}
 	log.Printf("[pool] cleared %d unavailable node(s), %d remaining", removed, len(kept))
 	return removed
+}
+
+// RemoveKeys explicitly removes forwarding nodes by protocol-aware key. It is
+// the inventory-management counterpart to ClearUnavailable: a deliberate
+// operator action, not an automatic health outcome. The resulting snapshot is
+// synchronously persisted so a restart cannot revive an acknowledged removal.
+// Each requested key is reported as removed or not_found so partial hits are
+// unambiguous.
+func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persistErr error) {
+	if len(keys) == 0 {
+		return nil, nil, nil
+	}
+	wanted := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		wanted[key] = struct{}{}
+	}
+	p.mu.Lock()
+	kept := make([]Proxy, 0, len(p.proxies))
+	found := make(map[string]bool, len(keys))
+	for _, px := range p.proxies {
+		key := px.Key()
+		if _, remove := wanted[key]; remove {
+			found[key] = true
+			removed = append(removed, key)
+			delete(p.stats, key)
+			continue
+		}
+		kept = append(kept, px)
+	}
+	for _, key := range keys {
+		if !found[key] {
+			notFound = append(notFound, key)
+		}
+	}
+	if len(removed) == 0 {
+		p.mu.Unlock()
+		return nil, notFound, nil
+	}
+	p.proxies = kept
+	p.rebuildProxyIndexLocked()
+	p.routingRevision++
+	p.statsRevision++
+	liveKeys := make(map[string]bool, len(kept))
+	for _, px := range kept {
+		liveKeys[px.Key()] = true
+	}
+	for name, cursor := range p.groupState {
+		if cursor == nil {
+			delete(p.groupState, name)
+			continue
+		}
+		orphaned := false
+		if cursor.stickyKey != "" && !liveKeys[cursor.stickyKey] {
+			cursor.stickyKey = ""
+			cursor.pinned = false
+			orphaned = true
+		}
+		if cursor.lastPicked != "" && !liveKeys[cursor.lastPicked] {
+			cursor.lastPicked = ""
+			orphaned = true
+		}
+		if orphaned && cursor.stickyKey == "" && cursor.lastPicked == "" {
+			delete(p.groupState, name)
+		}
+	}
+	cache := p.cache
+	p.cacheGeneration++
+	p.cancelScheduledPersistenceLocked()
+	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
+	p.mu.Unlock()
+	if cache != nil {
+		persistErr = cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
+	}
+	if persistErr != nil {
+		log.Printf("[cache] node removal persistence failed: %v", persistErr)
+		return removed, notFound, persistErr
+	}
+	return removed, notFound, nil
 }
 
 func (p *ProxyPool) Size() int {
@@ -1130,12 +1254,9 @@ func (p *ProxyPool) All() []Proxy {
 	return cloneProxySlice(p.proxies)
 }
 
-// RecheckCandidates returns a bounded, rotating slice of known forwarding
-// nodes for the periodic health worker. Keeping every discovered node is
-// useful, but re-dialing an ever-growing pool in one five-minute pass can
-// otherwise take longer than the interval and block fresh scrapes. The cursor
-// follows the stable pool order and advances even across unavailable entries,
-// giving them a chance to self-heal without starving newer nodes.
+// RecheckCandidates returns a bounded, rotating slice of nodes eligible for an
+// automatic health check. It advances across every node, including cooled and
+// terminal entries, so a later newly eligible node cannot be starved.
 func (p *ProxyPool) RecheckCandidates(limit int) []Proxy {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1151,12 +1272,13 @@ func (p *ProxyPool) RecheckCandidates(limit int) []Proxy {
 			}
 		}
 	}
+	now := time.Now().UTC()
 	out := make([]Proxy, 0, min(limit, len(p.proxies)))
 	lastVisited := ""
 	for scanned := 0; scanned < len(p.proxies) && len(out) < limit; scanned++ {
 		px := p.proxies[(start+scanned)%len(p.proxies)]
 		lastVisited = px.Key()
-		if px.SourceRetired {
+		if !p.eligibleForAutoRecheckLocked(px, now) {
 			continue
 		}
 		out = append(out, cloneProxy(px))

@@ -42,6 +42,18 @@ type RefreshOperation struct {
 	Error        string `json:"error,omitempty"`
 }
 
+type SourceRefreshOperation struct {
+	ID          string `json:"id"`
+	SourceID    string `json:"source_id"`
+	SourceName  string `json:"source_name"`
+	Status      string `json:"status"`
+	Trigger     string `json:"trigger"`
+	RequestedAt string `json:"requested_at"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
 type RefreshOperationStatus struct {
 	State   string            `json:"state"` // idle, queued, running
 	Active  *RefreshOperation `json:"active,omitempty"`
@@ -181,23 +193,28 @@ func main() {
 		}
 
 		run("startup", false)
-		timer := time.NewTimer(cfg.ScrapeInterval)
+		coordinator.markSourcesRefreshed(store.Sources(), time.Now())
+		scanInterval := cfg.ScrapeInterval
+		if scanInterval > time.Minute {
+			scanInterval = time.Minute
+		}
+		timer := time.NewTimer(scanInterval)
 		defer timer.Stop()
 		for {
 			select {
 			case <-timer.C:
-				run("scheduled", false)
+				coordinator.queueDueSourceRefreshes(store, cfg.ScrapeInterval, time.Now())
+				timer.Reset(scanInterval)
 			case <-coordinator.refreshChan:
 				run("manual", true)
+			case sourceID := <-coordinator.sourceRefreshChan:
+				operation, ok := coordinator.beginSourceRefresh(sourceID)
+				if !ok {
+					continue
+				}
+				result := refreshSource(cfg, store, pool, coordinator, sourceID, operation.Trigger)
+				coordinator.finishSourceRefresh(sourceID, result)
 			}
-			// Completion-based scheduling: refreshPool may have set a shorter
-			// next scrape deadline when all sources failed, so read it back rather
-			// than unconditionally using the full interval.
-			_, next := coordinator.scrapeTimes()
-			if next.IsZero() || time.Until(next) <= 0 {
-				next = time.Now().Add(cfg.ScrapeInterval)
-			}
-			timer.Reset(time.Until(next))
 		}
 	}()
 
@@ -347,7 +364,7 @@ func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinat
 	all := pool.All()
 	nodes := all[:0]
 	for _, px := range all {
-		if !px.SourceRetired {
+		if pool.EligibleForAutoRecheck(px) {
 			nodes = append(nodes, px)
 		}
 	}
@@ -524,6 +541,10 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 	// scarce forwarding health-check slots or enter the routable pool.
 	healthInventory, resourceCount := splitHealthInventory(deduped)
 	deduped = nil
+	// Automatic refreshes share the same durable admission rule as periodic
+	// rechecks. Filter before sampling so a cooled or terminal known node cannot
+	// consume a scarce slot that should discover an unseen candidate.
+	healthInventory = pool.FilterAutoRecheckCandidates(healthInventory)
 
 	// Some sources (e.g. large community-aggregated lists) return well
 	// over 100k raw entries. Checking all of them every cycle would make
@@ -588,6 +609,73 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 		status = "partial"
 	}
 	return refreshRunResult{Status: status, SourceErrors: sourceErrors}
+}
+
+// refreshSource fetches exactly one configured source. Other source
+// attributions are retained as last-good inventory by the catalog merge.
+func refreshSource(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, sourceID, trigger string) refreshRunResult {
+	source, ok := store.SourceByID(sourceID)
+	if !ok {
+		return refreshRunResult{Status: "skipped", Error: "source no longer exists"}
+	}
+	proxies, err := FetchSource(source)
+	if err != nil {
+		log.Printf("[error] source refresh %s failed: %v", source.Name, err)
+		return refreshRunResult{Status: "failed", SourceErrors: 1, Error: err.Error()}
+	}
+	for i := range proxies {
+		proxies[i].SourceName = source.ID
+	}
+	deduped := dedupeCandidates(proxies)
+	if len(deduped) > maxCandidateCacheRecords {
+		return refreshRunResult{Status: "failed", SourceErrors: 1, Error: "source exceeded candidate budget"}
+	}
+	labels := make(map[string]string)
+	retained := make(map[string]bool)
+	for _, configured := range store.Sources() {
+		labels[configured.ID] = configured.Name
+		if configured.ID != source.ID {
+			retained[configured.ID] = true
+		}
+	}
+	captureCandidateSourceIDs(deduped)
+	restoreCandidateSourceLabels(deduped, labels)
+	healthInventory, _ := splitHealthInventory(deduped)
+	if trigger == "scheduled" {
+		healthInventory = pool.FilterAutoRecheckCandidates(healthInventory)
+	}
+	candidates := healthInventory
+	if len(candidates) > cfg.MaxCandidates {
+		known := make(map[string]bool, pool.Size())
+		for _, px := range pool.All() {
+			known[px.Key()] = true
+		}
+		candidates = newCandidateSampler(cfg.DataDir).selectCandidates(healthInventory, known, cfg.MaxCandidates)
+	}
+	coordinator.healthCycleMu.Lock()
+	defer coordinator.healthCycleMu.Unlock()
+	healthGeneration, testURL := currentHealthCriterion(pool, store)
+	healthContext, finishHealthWork, current := pool.BeginHealthWork(healthGeneration)
+	if !current {
+		return refreshRunResult{Status: "skipped", Error: "health criterion changed before checking"}
+	}
+	alive, unreachable, policyFiltered := checkProxiesDetailedContext(healthContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	finishHealthWork()
+
+	coordinator.sourceLifecycleMu.Lock()
+	defer coordinator.sourceLifecycleMu.Unlock()
+	currentSource, exists := store.SourceByID(sourceID)
+	if !exists || currentSource.URL != source.URL || currentSource.Format != source.Format || currentSource.Protocol != source.Protocol {
+		return refreshRunResult{Status: "skipped", Error: "source changed during refresh"}
+	}
+	catalogRefresh := pool.candidates.begin(deduped, labels, retained, len(retained))
+	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
+		pool.candidates.complete(catalogRefresh, nil, nil, nil)
+		return refreshRunResult{Status: "skipped", Error: "health criterion changed during refresh"}
+	}
+	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
+	pool.FlushCache()
+	return refreshRunResult{Status: "complete"}
 }
 
 // applyRefreshHealthResults closes the source-toggle race at the one point a

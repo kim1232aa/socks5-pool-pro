@@ -182,7 +182,7 @@ func TestRefreshPoolPrioritizesUnseenCandidateWhenCapped(t *testing.T) {
 	}
 }
 
-func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T) {
+func TestRefreshPoolTerminalFailureIsFilteredFromLaterAutomaticRefreshes(t *testing.T) {
 	var proxyAttempts atomic.Int64
 	failingProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxyAttempts.Add(1)
@@ -190,12 +190,18 @@ func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T
 			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
 			return
 		}
-		http.Error(w, "temporary proxy failure", http.StatusBadGateway)
+		http.Error(w, "proxy failure", http.StatusBadGateway)
 	}))
 	defer failingProxy.Close()
 
+	proxyURL, err := url.Parse(failingProxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedProxyURL := *proxyURL
+	feedProxyURL.Host = "localhost:" + proxyURL.Port()
 	feedBody, err := json.Marshal([]map[string]any{{
-		"proxy": failingProxy.URL, "country": "US", "city": "Threshold",
+		"proxy": feedProxyURL.String(), "country": "US", "city": "Terminal",
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -206,27 +212,15 @@ func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T
 	}))
 	defer feedServer.Close()
 
-	proxyURL, err := url.Parse(failingProxy.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	feedProxyURL := *proxyURL
-	feedProxyURL.Host = "localhost:" + proxyURL.Port()
-	feedBody, err = json.Marshal([]map[string]any{{
-		"proxy": feedProxyURL.String(), "country": "US", "city": "Threshold",
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	known := Proxy{
 		IP: "localhost", Port: proxyURL.Port(), Protocol: "http",
-		SourceName: "threshold-feed", Country: "US", Available: true,
+		SourceName: "terminal-feed", Country: "US", Available: true,
 	}
 	pool := NewProxyPool()
 	pool.Prime([]Proxy{known}, nil)
 	store := &ConfigStore{cfg: PoolConfig{
 		Sources: []Source{{
-			ID: "threshold-feed", Name: "threshold-feed", URL: feedServer.URL,
+			ID: "terminal-feed", Name: "terminal-feed", URL: feedServer.URL,
 			Format: FormatEDTJSON, Enabled: true, AllowPrivate: true,
 		}},
 		CheckURL: "http://health.test/check",
@@ -236,22 +230,20 @@ func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T
 		MaxConcurrent: 1, MaxCandidates: 10, ScrapeInterval: time.Minute,
 	}
 
-	for attempt := 1; attempt <= healthFailureThreshold; attempt++ {
-		refreshPool(cfg, store, pool, newRefreshCoordinator())
-		got, ok := pool.Find(known.Key())
-		if !ok {
-			t.Fatalf("known node disappeared after refresh %d", attempt)
-		}
-		wantAvailable := attempt < healthFailureThreshold
-		if got.Available != wantAvailable {
-			t.Fatalf("availability after refresh failure %d/%d = %v, want %v", attempt, healthFailureThreshold, got.Available, wantAvailable)
-		}
+	refreshPool(cfg, store, pool, newRefreshCoordinator())
+	got, ok := pool.Find(known.Key())
+	st := pool.stats[known.Key()]
+	if !ok || got.Available || !got.HealthInvalidated || !st.HealthFailureTerminal {
+		t.Fatalf("first refresh failure = proxy=%+v stats=%+v found=%v", got, st, ok)
 	}
-	if got := pool.stats[known.Key()].ConsecutiveHealthFailures; got != healthFailureThreshold {
-		t.Fatalf("refresh failure streak = %d, want %d", got, healthFailureThreshold)
+	firstAttempts := proxyAttempts.Load()
+	if firstAttempts == 0 {
+		t.Fatal("first refresh did not health-check known node")
 	}
-	if got := proxyAttempts.Load(); got != int64(healthFailureThreshold) {
-		t.Fatalf("proxy attempts = %d, want one per refresh (%d)", got, healthFailureThreshold)
+
+	refreshPool(cfg, store, pool, newRefreshCoordinator())
+	if got := proxyAttempts.Load(); got != firstAttempts {
+		t.Fatalf("terminal node was automatically retried: attempts=%d want=%d", got, firstAttempts)
 	}
 }
 
