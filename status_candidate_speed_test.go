@@ -77,8 +77,14 @@ func TestCandidateSpeedtestDeduplicatesAndPassesProtocolCredentials(t *testing.T
 	if gotSocks.Protocol != "socks5" || gotSocks.Username != "socks-user" || gotSocks.Password != "socks-secret" {
 		t.Fatalf("SOCKS candidate passed to speed test = %#v", gotSocks)
 	}
-	if pool.Size() != 0 {
-		t.Fatalf("successful candidate speedtest added %d node(s) to forwarding pool", pool.Size())
+	if pool.Size() != 2 {
+		t.Fatalf("successful candidate speedtest pool size = %d, want 2", pool.Size())
+	}
+	for _, candidate := range []Proxy{httpCandidate, socksCandidate} {
+		promoted, ok := pool.Find(candidate.Key())
+		if !ok || !promoted.Available || promoted.SpeedKbps != 2048 || promoted.SpeedBytes != speedTestMaxBytes || promoted.SpeedDurationMs != 4000 || promoted.SpeedTestedAt == 0 {
+			t.Fatalf("promoted candidate %q = %#v, ok=%v", candidate.Key(), promoted, ok)
+		}
 	}
 }
 func TestCandidateSpeedtestRequiresExactProtocolAwareKey(t *testing.T) {
@@ -187,8 +193,8 @@ func TestCandidateSpeedtestRunsSixteenConcurrentlyAndNeverQueuesOverflow(t *test
 	case <-time.After(time.Second):
 		t.Fatal("concurrent candidate speedtest did not complete after release")
 	}
-	if pool.Size() != 0 {
-		t.Fatalf("batch candidate speedtest added %d node(s) to forwarding pool", pool.Size())
+	if pool.Size() != maxConcurrentNodeSpeedTests {
+		t.Fatalf("batch candidate speedtest added %d node(s), want %d", pool.Size(), maxConcurrentNodeSpeedTests)
 	}
 }
 
@@ -229,20 +235,17 @@ func TestCandidateSpeedtestReturnsPartialFailuresWithoutCancellingPeers(t *testi
 	}
 	server.speedMu.Lock()
 	_, failedRunning := server.speedRunning[candidates[1].Key()]
-	failedCooldown := server.speedCooldownUntil[candidates[1].Key()]
+	_, failedCooldown := server.speedCooldownUntil[candidates[1].Key()]
 	server.speedMu.Unlock()
-	if failedRunning || len(server.speedSlots) != 0 {
-		t.Fatalf("failed candidate retained running state=%v slots=%d", failedRunning, len(server.speedSlots))
-	}
-	if !failedCooldown.After(time.Now()) {
-		t.Fatalf("failed candidate cooldown = %s, want future deadline", failedCooldown)
+	if failedRunning || failedCooldown || len(server.speedSlots) != 0 {
+		t.Fatalf("failed candidate retained running=%v cooldown=%v slots=%d", failedRunning, failedCooldown, len(server.speedSlots))
 	}
 	retry := invokeCandidateSpeedtest(t, server, []string{candidates[1].Key()}, context.Background())
-	if retry.status != http.StatusOK || len(retry.body.Results) != 1 || retry.body.Results[0].Error == nil || retry.body.Results[0].Error.Code != "candidate_speedtest_cooldown" {
-		t.Fatalf("failed candidate immediate retry = %d %#v raw=%s", retry.status, retry.body, retry.raw)
+	if retry.status != http.StatusOK || len(retry.body.Results) != 1 || retry.body.Results[0].Error == nil || retry.body.Results[0].Error.Code != "speedtest_failed" {
+		t.Fatalf("failed candidate immediate manual retry = %d %#v raw=%s", retry.status, retry.body, retry.raw)
 	}
-	if pool.Size() != 0 {
-		t.Fatalf("partial candidate speedtest added %d node(s) to forwarding pool", pool.Size())
+	if pool.Size() != 2 {
+		t.Fatalf("partial candidate speedtest pool size = %d, want 2 successes", pool.Size())
 	}
 }
 
@@ -325,25 +328,21 @@ func TestCandidateSpeedtestInternalTimeoutIsAnItemFailure(t *testing.T) {
 	if item.OK || item.Error == nil || item.Error.Code != "speedtest_failed" || !strings.Contains(item.Error.Message, context.DeadlineExceeded.Error()) {
 		t.Fatalf("internally timed-out candidate item = %#v", item)
 	}
-	if err := server.beginSpeedTest(candidate.Key()); err == nil {
-		server.endSpeedTest(candidate.Key(), false)
-		t.Fatal("completed timeout did not apply candidate cooldown")
-	} else {
-		var cooldown *nodeOperationCooldownError
-		if !errors.As(err, &cooldown) {
-			t.Fatalf("completed timeout next begin error = %v, want cooldown", err)
-		}
+	if err := server.beginCandidateSpeedTest(candidate.Key()); err != nil {
+		t.Fatalf("manual candidate retry was cooled down: %v", err)
 	}
+	server.endSpeedTest(candidate.Key(), false)
 }
 
-func TestCandidateSpeedtestReportsRunningAndCooldownPerItem(t *testing.T) {
+func TestCandidateSpeedtestRejectsRunningButBypassesNodeCooldown(t *testing.T) {
 	candidate := Proxy{IP: "198.51.100.50", Port: "8080", Protocol: "http"}
 	pool := NewProxyPool()
 	seedCandidateSpeedCatalog(pool, []Proxy{candidate})
 	server := NewStatusServer(pool, &ConfigStore{})
+	var calls atomic.Int64
 	installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
-		t.Fatal("busy or cooldown candidate unexpectedly reached SpeedTestContext")
-		return SpeedTestResult{}, px, nil
+		calls.Add(1)
+		return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 3000}, px, nil
 	})
 
 	if err := server.beginSpeedTest(candidate.Key()); err != nil {
@@ -356,9 +355,9 @@ func TestCandidateSpeedtestReportsRunningAndCooldownPerItem(t *testing.T) {
 	}
 	server.endSpeedTest(candidate.Key())
 
-	cooldown := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
-	if cooldown.status != http.StatusOK || len(cooldown.body.Results) != 1 || cooldown.body.Results[0].Error == nil || cooldown.body.Results[0].Error.Code != "candidate_speedtest_cooldown" {
-		t.Fatalf("cooldown candidate speedtest = %d %#v raw=%s", cooldown.status, cooldown.body, cooldown.raw)
+	retry := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+	if retry.status != http.StatusOK || len(retry.body.Results) != 1 || !retry.body.Results[0].OK || calls.Load() != 1 {
+		t.Fatalf("candidate manual retry bypassing node cooldown = %d calls=%d %#v raw=%s", retry.status, calls.Load(), retry.body, retry.raw)
 	}
 }
 

@@ -127,12 +127,30 @@ func (c *CandidateCatalog) FindByKey(key string) (Proxy, bool) {
 	if err != nil {
 		return Proxy{}, false
 	}
-	return Proxy{
+	sourceNames := make([]string, 0, record.sourceCount)
+	sourceIDs := make([]string, 0, record.sourceCount)
+	for i := uint32(0); i < uint32(record.sourceCount); i++ {
+		ref := snapshot.sourceRefs[record.sourceOffset+i]
+		key, name := snapshot.sourceKeys[ref], snapshot.sources[ref]
+		if strings.TrimSpace(name) != "" && !strings.EqualFold(name, "Unknown") {
+			sourceNames = append(sourceNames, name)
+		}
+		if !strings.HasPrefix(key, "legacy-name:") {
+			sourceIDs = append(sourceIDs, key)
+		}
+	}
+	sort.Strings(sourceNames)
+	sort.Strings(sourceIDs)
+	px := Proxy{
 		IP: host, Port: port, Protocol: snapshot.protocols[record.protocolID],
 		Username: record.username, Password: record.password,
 		Country: snapshot.countries[record.countryID], City: snapshot.cities[record.cityID],
-		Continent: decodeContinent(record.continent),
-	}, true
+		Continent: decodeContinent(record.continent), SourceNames: sourceNames, SourceIDs: sourceIDs,
+	}
+	if len(sourceNames) > 0 {
+		px.SourceName = sourceNames[0]
+	}
+	return px, true
 }
 
 // RemoveKeys explicitly removes candidate inventory entries. It rebuilds a
@@ -1178,8 +1196,13 @@ func (s *StatusServer) buildCandidatePage(r *http.Request) CandidatePageResponse
 	for i := range snapshot.records {
 		record := snapshot.records[i]
 		status := candidateRecordStatus(snapshot, record, known)
-		statusCounts[status]++
-		if !filter.matchesNonCountry(snapshot, record, status) {
+		if !filter.matchesBase(snapshot, record) {
+			continue
+		}
+		if filter.matchesCountry(record) {
+			statusCounts[status]++
+		}
+		if !filter.matchesStatus(status) {
 			continue
 		}
 		if record.countryID == 0 {
@@ -1314,6 +1337,7 @@ type candidateFilter struct {
 	source         string
 	status         CandidateStatus
 	statusSet      bool
+	knownOnly      bool
 	countryID      int
 	unknownCountry bool
 }
@@ -1326,10 +1350,14 @@ func newCandidateFilter(r *http.Request, snapshot *candidateSnapshot) candidateF
 	}
 	filter.source = strings.TrimSpace(query.Get("source"))
 	if value := strings.TrimSpace(query.Get("status")); value != "" {
-		filter.status, filter.statusSet = parseCandidateStatus(value)
-		if !filter.statusSet {
-			filter.status = 255
-			filter.statusSet = true
+		if strings.EqualFold(value, "known") || strings.EqualFold(value, "in_pool") {
+			filter.knownOnly = true
+		} else {
+			filter.status, filter.statusSet = parseCandidateStatus(value)
+			if !filter.statusSet {
+				filter.status = 255
+				filter.statusSet = true
+			}
 		}
 	}
 	filter.unknownCountry = nodeQueryEnabled(query.Get("country_unknown")) || strings.EqualFold(strings.TrimSpace(query.Get("country")), "__unknown__")
@@ -1364,7 +1392,7 @@ func parseCandidateStatus(value string) (CandidateStatus, bool) {
 	}
 }
 
-func (f candidateFilter) matchesNonCountry(snapshot *candidateSnapshot, record candidateRecord, status CandidateStatus) bool {
+func (f candidateFilter) matchesBase(snapshot *candidateSnapshot, record candidateRecord) bool {
 	if f.protocolID >= 0 && int(record.protocolID) != f.protocolID {
 		return false
 	}
@@ -1383,13 +1411,18 @@ func (f candidateFilter) matchesNonCountry(snapshot *candidateSnapshot, record c
 			return false
 		}
 	}
-	if f.statusSet && status != f.status {
-		return false
+	return f.search == "" || snapshot.recordContains(record, f.search)
+}
+
+func (f candidateFilter) matchesStatus(status CandidateStatus) bool {
+	if f.knownOnly {
+		return status == candidateKnownAvailable || status == candidateKnownUnavailable
 	}
-	if f.search != "" && !snapshot.recordContains(record, f.search) {
-		return false
-	}
-	return true
+	return !f.statusSet || status == f.status
+}
+
+func (f candidateFilter) matchesNonCountry(snapshot *candidateSnapshot, record candidateRecord, status CandidateStatus) bool {
+	return f.matchesBase(snapshot, record) && f.matchesStatus(status)
 }
 
 func (f candidateFilter) matchesCountry(record candidateRecord) bool {

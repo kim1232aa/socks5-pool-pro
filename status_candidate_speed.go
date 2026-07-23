@@ -11,7 +11,8 @@ import (
 
 // candidateSpeedTestContext is replaceable by focused handler tests. The
 // production operation retains SpeedTestContext's fixed 1 MiB / 18 second
-// contract and never promotes an unverified candidate into the forwarding pool.
+// contract. A successful explicit operator test promotes the verified
+// candidate into the forwarding pool.
 var candidateSpeedTestContext = speedTestCredentialCandidatesContext
 
 type candidateSpeedtestRequest struct {
@@ -36,9 +37,9 @@ type candidateSpeedtestResponse struct {
 	Results []candidateSpeedtestItem `json:"results"`
 }
 
-// handleCandidateSpeedtest measures selected catalog entries concurrently. It
-// intentionally does not call ProxyPool.Update/Prime: a successful measurement
-// alone is not a health verification and must never make a candidate routable.
+// handleCandidateSpeedtest measures selected catalog entries concurrently.
+// Successful explicit tests are operator-approved admissions to ProxyPool;
+// failures remain catalog-only observations.
 func (s *StatusServer) handleCandidateSpeedtest(w http.ResponseWriter, r *http.Request) {
 	var in candidateSpeedtestRequest
 	if err := decodeJSON(r, &in); err != nil {
@@ -102,26 +103,39 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 		item.Error = candidateSpeedtestError("candidate_not_found", fmt.Sprintf("candidate not found or not forwardable: %s", key))
 		return item
 	}
-	if err := s.beginSpeedTest(key); err != nil {
+	if err := s.beginCandidateSpeedTest(key); err != nil {
 		item.Error = candidateSpeedtestError(candidateSpeedtestBusyCode(err), err.Error())
 		return item
 	}
-	completed := false
-	defer func() { s.endSpeedTest(key, completed) }()
+	defer s.endSpeedTest(key, false)
 
-	result, _, err := candidateSpeedTestContext(ctx, px, speedTestOperationTimeout)
+	healthGeneration := s.pool.HealthGeneration()
+	result, verified, err := candidateSpeedTestContext(ctx, px, speedTestOperationTimeout)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		item.Error = candidateSpeedtestError("request_cancelled", ctxErr.Error())
 		return item
 	}
-	// A completed attempt, successful or not, receives the same-node cooldown.
-	// Parent cancellation is the sole exception because the operation was
-	// abandoned rather than completed.
-	completed = true
 	if err != nil {
 		item.Error = candidateSpeedtestError("speedtest_failed", err.Error())
 		return item
 	}
+
+	s.coordinator.sourceLifecycleMu.Lock()
+	if !s.pool.UpdateWithEnabledSources([]Proxy{verified}, nil, s.store.Sources(), healthGeneration) {
+		s.coordinator.sourceLifecycleMu.Unlock()
+		item.Error = candidateSpeedtestError("health_criterion_changed", "检测标准已改变，测速结果未加入转发池")
+		return item
+	}
+	s.pool.ObserveManualHealthOutcomeAtGeneration(key, true, true, 0, healthGeneration)
+	s.pool.UpdateVerifiedCredentialsAtGeneration(key, verified, healthGeneration)
+	if !s.pool.UpdateSpeed(key, result.Kbps, result.Bytes, result.DurationMs) {
+		s.coordinator.sourceLifecycleMu.Unlock()
+		item.Error = candidateSpeedtestError("candidate_promotion_failed", "候选在测速完成后无法加入转发池")
+		return item
+	}
+	s.coordinator.sourceLifecycleMu.Unlock()
+	s.pool.FlushCache()
+
 	item.OK = true
 	item.Kbps = result.Kbps
 	item.Bytes = result.Bytes

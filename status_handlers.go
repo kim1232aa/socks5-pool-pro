@@ -680,6 +680,14 @@ func writeNodeOperationBusy(w http.ResponseWriter, code string, err error) {
 }
 
 func (s *StatusServer) beginSpeedTest(key string) error {
+	return s.beginSpeedTestOperation(key, true)
+}
+
+func (s *StatusServer) beginCandidateSpeedTest(key string) error {
+	return s.beginSpeedTestOperation(key, false)
+}
+
+func (s *StatusServer) beginSpeedTestOperation(key string, enforceCooldown bool) error {
 	s.speedMu.Lock()
 	defer s.speedMu.Unlock()
 	now := time.Now()
@@ -691,8 +699,10 @@ func (s *StatusServer) beginSpeedTest(key string) error {
 	if _, running := s.speedRunning[key]; running {
 		return fmt.Errorf("该节点正在测速")
 	}
-	if until := s.speedCooldownUntil[key]; until.After(now) {
-		return &nodeOperationCooldownError{Operation: "测速", Remaining: until.Sub(now)}
+	if enforceCooldown {
+		if until := s.speedCooldownUntil[key]; until.After(now) {
+			return &nodeOperationCooldownError{Operation: "测速", Remaining: until.Sub(now)}
+		}
 	}
 	select {
 	case s.speedSlots <- struct{}{}:

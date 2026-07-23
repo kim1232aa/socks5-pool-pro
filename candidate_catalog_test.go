@@ -80,6 +80,24 @@ func TestCandidateCatalogPageClassificationFilteringAndCredentials(t *testing.T)
 	if jpFailed.FilteredTotal != 1 || jpFailed.Candidates[0].Key != failed.Key() {
 		t.Fatalf("JP failed filter = %#v", jpFailed)
 	}
+	knownPage, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?status=known&page_size=100")
+	if knownPage.FilteredTotal != 2 {
+		t.Fatalf("status=known total = %d, want available and unavailable pool members", knownPage.FilteredTotal)
+	}
+	unknownDeferred, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?status=deferred&country=__unknown__&page_size=100")
+	if unknownDeferred.FilteredTotal != 1 || unknownDeferred.Candidates[0].Key != deferred.Key() {
+		t.Fatalf("unknown deferred filter = %#v", unknownDeferred)
+	}
+	knownJP, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?status=known&country=US&page_size=100")
+	knownFacetTotal := 0
+	for _, facet := range knownJP.Statuses {
+		if facet.Status == "known_available" || facet.Status == "known_unavailable" {
+			knownFacetTotal += facet.Total
+		}
+	}
+	if knownFacetTotal != 1 {
+		t.Fatalf("US contextual known facet total = %d, facets=%#v", knownFacetTotal, knownJP.Statuses)
+	}
 	protocolVariant, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?search=192.0.2.1&page_size=100")
 	if protocolVariant.FilteredTotal != 2 {
 		t.Fatalf("protocol-aware variants at one address = %d, want 2", protocolVariant.FilteredTotal)

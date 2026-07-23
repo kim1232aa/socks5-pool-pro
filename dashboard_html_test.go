@@ -58,6 +58,24 @@ func TestDashboardCandidateCountsUpdateActiveSummary(t *testing.T) {
 	}
 }
 
+func TestDashboardCandidateSummaryCardsDriveServerFilters(t *testing.T) {
+	for _, want := range []string{
+		`data-action="choose-candidate-summary" data-summary="total"`,
+		`data-action="choose-candidate-summary" data-summary="matching"`,
+		`data-action="choose-candidate-summary" data-summary="known"`,
+		`data-action="choose-candidate-summary" data-summary="deferred"`,
+		`data-action="choose-candidate-summary" data-summary="unknown-country"`,
+		`function chooseCandidateSummary(summary)`,
+		`case 'choose-candidate-summary':`,
+		`status.value = status.value === 'known' ? '' : 'known';`,
+		`country.value = country.value === '__unknown__' ? '' : '__unknown__';`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing candidate summary filter contract %q", want)
+		}
+	}
+}
+
 func TestDashboardCandidatePageSizeIsResponsive(t *testing.T) {
 	for _, want := range []string{
 		`<option value="10">每页10</option>`,
@@ -288,7 +306,7 @@ func TestDashboardCandidateManagementKeepsTenColumnShape(t *testing.T) {
 		`data-action="candidate-delete-selected"`,
 		`fetchJSON('/api/candidates/speedtest'`,
 		`fetchJSON('/api/candidates/delete'`,
-		`测速仅报告本次结果，不改变健康状态，也不会加入转发池。`,
+		`人工测速不受冷却限制；成功后立即加入转发池，失败项仍留在候选库存。`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing candidate management contract %q", want)

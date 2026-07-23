@@ -456,6 +456,50 @@ function chooseCandidateProtocol(protocol) {
   onCandidateFilterChange();
 }
 
+function updateCandidateSummaryButtons() {
+  var status = String((document.getElementById('cf-status') || {}).value || '');
+  var country = String((document.getElementById('cf-country') || {}).value || '');
+  var hasAny = ['cf-text','cf-source','cf-proto','cf-country','cf-status'].some(function(id){ return String((document.getElementById(id) || {}).value || '') !== ''; });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-action="choose-candidate-summary"]'), function(button) {
+    var summary = button.getAttribute('data-summary') || '';
+    var active = summary === 'total' ? !hasAny :
+      summary === 'matching' ? !status && !country :
+      summary === 'known' ? status === 'known' :
+      summary === 'deferred' ? status === 'deferred' :
+      summary === 'unknown-country' ? country === '__unknown__' : false;
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+
+function chooseCandidateSummary(summary) {
+  var text = document.getElementById('cf-text');
+  var source = document.getElementById('cf-source');
+  var protocol = document.getElementById('cf-proto');
+  var country = document.getElementById('cf-country');
+  var status = document.getElementById('cf-status');
+  if (!text || !source || !protocol || !country || !status) return;
+  if (summary === 'total') {
+    text.value = '';
+    source.value = '';
+    protocol.value = '';
+    country.value = '';
+    status.value = '';
+  } else if (summary === 'matching') {
+    country.value = '';
+    status.value = '';
+  } else if (summary === 'known') {
+    status.value = status.value === 'known' ? '' : 'known';
+  } else if (summary === 'deferred') {
+    status.value = status.value === 'deferred' ? '' : 'deferred';
+  } else if (summary === 'unknown-country') {
+    country.value = country.value === '__unknown__' ? '' : '__unknown__';
+  } else {
+    return;
+  }
+  updateCandidateSummaryButtons();
+  onCandidateFilterChange();
+}
+
 function renderCandidateProtocolCards() {
   var container = document.getElementById('candidate-protocol-cards');
   if (!container) return;
@@ -1020,7 +1064,14 @@ function speedtestCandidates(keys) {
   keys.forEach(function(key){ candidateSpeedResults[key] = {pending:true}; });
   applyCandidateView();
   fetchJSON('/api/candidates/speedtest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keys:keys})})
-    .then(function(payload){ normalizeCandidateResults(payload, keys); notify('候选测速完成；结果不改变健康状态，也不会加入转发池', 'success', 7000); })
+    .then(function(payload){
+      normalizeCandidateResults(payload, keys);
+      var promoted = keys.filter(function(key){ return candidateSpeedResults[key] && !candidateSpeedResults[key].error; }).length;
+      notify('候选测速完成；' + promoted + ' 个成功节点已加入转发池', 'success', 7000);
+      candidateSnapshotID = '';
+      candidateQueryGeneration++;
+      return requestCandidates(true);
+    })
     .catch(function(err){ keys.forEach(function(key){ candidateSpeedResults[key] = {error:String(err)}; }); notify('候选测速失败：' + String(err), 'error', 7000); })
     .finally(function(){ candidateOperationPending = false; applyCandidateView(); });
 }
@@ -1085,6 +1136,7 @@ function applyCandidateView() {
   setText('candidate-known', formatCount(known));
   setText('candidate-deferred', formatCount(deferred));
   setText('candidate-country-unknown', formatCount(candidateUnknownCountryTotal()));
+  updateCandidateSummaryButtons();
   var updated = formatCandidateUpdatedAt(data.updated_at);
   var phaseLabels = {checking:'检查中', complete:'已完成', partial:'部分来源失败（已保留旧目录）', loading:'生成中', restored:'已恢复目录，等待按当前标准复检'};
   var phase = data.phase ? (' · 快照' + (phaseLabels[data.phase] || data.phase)) : '';
@@ -2297,6 +2349,7 @@ document.addEventListener('click', function(event) {
     case 'result-dialog-backdrop': resultDialogBackdrop(event); break;
     case 'close-result-dialog': closeResultDialog(); break;
     case 'choose-candidate-protocol': chooseCandidateProtocol(actionElement.getAttribute('data-protocol') || ''); break;
+    case 'choose-candidate-summary': chooseCandidateSummary(actionElement.getAttribute('data-summary') || ''); break;
     case 'set-candidate-continent': setCandidateContinentFilter(actionElement.getAttribute('data-continent') || ''); break;
     case 'choose-candidate-country': chooseCandidateCountry(actionElement.getAttribute('data-country') || ''); break;
     case 'proxyip-verify': runProxyIPVerify(actionElement); break;

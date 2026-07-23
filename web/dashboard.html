@@ -142,11 +142,11 @@
   </div>
 
   <section class="task-metrics task-metrics-candidate" aria-label="候选库存概览">
-    <div class="task-metric"><span>去重候选</span><strong id="candidate-total">加载中</strong></div>
-    <div class="task-metric"><span>当前匹配</span><strong id="candidate-matching">加载中</strong></div>
-    <div class="task-metric healthy"><span>已进入转发池</span><strong id="candidate-known">加载中</strong></div>
-    <div class="task-metric"><span>仍待检测</span><strong id="candidate-deferred">加载中</strong></div>
-    <div class="task-metric warning"><span>来源地区未知</span><strong id="candidate-country-unknown">加载中</strong></div>
+    <button type="button" class="task-metric" data-action="choose-candidate-summary" data-summary="total" aria-pressed="false"><span>去重候选</span><strong id="candidate-total">加载中</strong></button>
+    <button type="button" class="task-metric" data-action="choose-candidate-summary" data-summary="matching" aria-pressed="true"><span>当前匹配</span><strong id="candidate-matching">加载中</strong></button>
+    <button type="button" class="task-metric healthy" data-action="choose-candidate-summary" data-summary="known" aria-pressed="false"><span>已进入转发池</span><strong id="candidate-known">加载中</strong></button>
+    <button type="button" class="task-metric" data-action="choose-candidate-summary" data-summary="deferred" aria-pressed="false"><span>仍待检测</span><strong id="candidate-deferred">加载中</strong></button>
+    <button type="button" class="task-metric warning" data-action="choose-candidate-summary" data-summary="unknown-country" aria-pressed="false"><span>来源地区未知</span><strong id="candidate-country-unknown">加载中</strong></button>
   </section>
 
   <section class="catalog-workflow" aria-label="按类型和地区浏览候选">
@@ -173,6 +173,7 @@
     <label class="sr-only" for="cf-status">按检测状态筛选候选</label>
     <select id="cf-status" onchange="onCandidateFilterChange()">
       <option value="">全部状态</option>
+      <option value="known">已进入转发池</option>
       <option value="known_available">池内可用</option>
       <option value="known_unavailable">池内不可用</option>
       <option value="checked_failed">最近检测失败</option>
@@ -190,9 +191,9 @@
     <span id="candidate-count" class="small" role="status" aria-live="polite"></span>
     <div class="candidate-batch-bar" aria-label="候选批量操作">
       <span id="candidate-selected-count" role="status" aria-live="polite">已选 0 / 16</span>
-      <button type="button" class="btn-sm" data-action="candidate-speedtest-selected" disabled>批量测速</button>
+      <button type="button" class="btn-sm" data-action="candidate-speedtest-selected" disabled>批量测速并加入转发池</button>
       <button type="button" class="btn-sm danger" data-action="candidate-delete-selected" disabled>删除已选</button>
-      <span class="candidate-speedtest-note">测速仅报告本次结果，不改变健康状态，也不会加入转发池。</span>
+      <span class="candidate-speedtest-note">人工测速不受冷却限制；成功后立即加入转发池，失败项仍留在候选库存。</span>
     </div>
     <span class="candidate-filter-note">筛选和分页均在服务端执行。ProxyIP 的逐条专用验证只提供外部参考，不改变本地转发池状态。</span>
   </div>
