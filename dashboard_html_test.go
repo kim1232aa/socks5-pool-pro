@@ -301,7 +301,7 @@ func TestDashboardDisablesSwitchForUnavailableButKeepsRecoveryAction(t *testing.
 		`data-action="switch" disabled aria-label="节点 `,
 		`当前不可用，不能切换`,
 		`title="当前不可用；可先点击验证，恢复后再切换"`,
-		`data-action="verify" onclick="runVerify(this)"`,
+		`data-action="verify" title="立即重新拨号,查看真实出口IP/国家是否和标签一致"`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing unavailable-switch recovery contract %q", want)

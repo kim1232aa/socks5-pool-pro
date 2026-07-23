@@ -49,6 +49,33 @@ var geoCache = struct {
 	inflight: make(map[string]*geoLookupCall),
 }
 
+
+// ipChangePolicy captures the require-ip-change evaluation shared by the
+// refresh checker, the periodic rechecker, and manual verification. All three
+// previously duplicated this exact logic; centralizing it prevents one site
+// from drifting (e.g. a different threshold) while the others stay unchanged.
+type ipChangePolicy struct {
+	ExitIP         string
+	IPChangeKnown  bool
+	IPChanged      bool
+	PolicyAllowed  bool
+}
+
+// evaluateIPChangePolicy computes whether a proxy whose exit IP was just
+// measured should be considered policy-allowed under require-ip-change.
+// A node is only excluded when we can positively tell both endpoints:
+// unknown exits are kept rather than falsely dropped.
+func evaluateIPChangePolicy(exitIP, baseline string, requireIPChange bool) ipChangePolicy {
+	ipChangeKnown := exitIP != "" && baseline != ""
+	ipChanged := ipChangeKnown && exitIP != baseline
+	policyAllowed := !requireIPChange || !ipChangeKnown || ipChanged
+	return ipChangePolicy{
+		ExitIP:        exitIP,
+		IPChangeKnown: ipChangeKnown,
+		IPChanged:     ipChanged,
+		PolicyAllowed: policyAllowed,
+	}
+}
 // CheckProxies concurrently verifies a list of candidate proxies against
 // testURL - the sole criterion for "alive" is a real HTTP round-trip to
 // testURL through DialUpstream. The built-in connectivity endpoint must return
@@ -142,16 +169,16 @@ checkLoop:
 				// alive even if the exit/geo probes are rate-limited; it
 				// just falls back to source-supplied or front-IP geo.
 				px.ExitIP = probeExitIPContext(nodeContext, px, timeout)
-				px.IPChangeKnown = px.ExitIP != "" && baseline != ""
-				px.IPChanged = px.IPChangeKnown && px.ExitIP != baseline
+				policy := evaluateIPChangePolicy(px.ExitIP, baseline, requireIPChange)
+				px.IPChangeKnown = policy.IPChangeKnown
+				px.IPChanged = policy.IPChanged
 
 				// Drop transparent proxies that don't actually change the
-				// exit IP - but only when we can positively tell (we have
-				// both a baseline and a measured exit that match). Unknown
+				// exit IP - but only when we can positively tell. Unknown
 				// exits are kept rather than falsely dropped. This is a
 				// policy exclusion, not a connectivity failure - the node
 				// genuinely answered - so it does NOT go into unreachable.
-				if requireIPChange && px.IPChangeKnown && !px.IPChanged {
+				if !policy.PolicyAllowed {
 					mu.Lock()
 					dropped++
 					policyFiltered[px.Key()] = true
@@ -321,14 +348,14 @@ func probeExitIPContext(parent context.Context, px Proxy, timeout time.Duration)
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-				return DialUpstreamContext(ctx, px, addr, timeout)
-			},
-			DisableKeepAlives: true,
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return DialUpstreamContext(ctx, px, addr, timeout)
 		},
+		DisableKeepAlives: true,
 	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicIPLookupURL, nil)
 	if err != nil {
 		return ""
@@ -478,14 +505,14 @@ func probeAnonymityContext(parent context.Context, px Proxy, timeout time.Durati
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	baseline := BaselineExitIP()
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-				return DialUpstreamContext(ctx, px, addr, timeout)
-			},
-			DisableKeepAlives: true,
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return DialUpstreamContext(ctx, px, addr, timeout)
 		},
+		DisableKeepAlives: true,
 	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://httpbin.org/get", nil)
 	if err != nil {
 		return ""

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -12,32 +11,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-)
-
-var (
-	lastScrapeTime  time.Time
-	nextScrapeTime  time.Time
-	lastScrapeInfo  ScrapeInfo
-	scrapeMu        sync.RWMutex
-	refreshChan     = make(chan struct{}, 1) // manual refresh trigger
-	recheckChan     = make(chan struct{}, 1)
-	fullRecheckChan = make(chan struct{}, 1)
-	healthCycleMu   sync.Mutex // full refresh and whole-pool recheck must not overlap
-	// sourceLifecycleMu makes source configuration changes and the final pool
-	// install one ordered transaction. Without it, an in-flight refresh that
-	// captured an enabled source before it was disabled could revive that
-	// source's nodes after the API had already retired them.
-	sourceLifecycleMu    sync.Mutex
-	refreshOpMu          sync.RWMutex
-	refreshOpSeq         uint64
-	refreshActive        *RefreshOperation
-	refreshPending       *RefreshOperation
-	refreshLast          *RefreshOperation
-	healthRecheckOpMu    sync.RWMutex
-	healthRecheckOpSeq   uint64
-	healthRecheckActive  *HealthRecheckOperation
-	healthRecheckPending *HealthRecheckOperation
-	healthRecheckLast    *HealthRecheckOperation
 )
 
 var recheckProbeExitIP = probeExitIPContext
@@ -57,7 +30,7 @@ type ScrapeInfo struct {
 
 // RefreshOperation makes the asynchronous /api/refresh action observable.
 // A second request coalesces with the already-queued job, while a request made
-// during a running job creates one bounded follow-up job in refreshChan.
+// during a running job creates one bounded follow-up job in the coordinator.
 type RefreshOperation struct {
 	ID           string `json:"id"`
 	Status       string `json:"status"`            // queued, running, complete, partial, skipped
@@ -110,24 +83,6 @@ type scrapeStatusSnapshot struct {
 	Info ScrapeInfo
 }
 
-func getScrapeTimes() (last, next time.Time) {
-	scrapeMu.RLock()
-	defer scrapeMu.RUnlock()
-	return lastScrapeTime, nextScrapeTime
-}
-
-func getScrapeInfo() ScrapeInfo {
-	scrapeMu.RLock()
-	defer scrapeMu.RUnlock()
-	return lastScrapeInfo
-}
-
-func getScrapeStatusSnapshot() scrapeStatusSnapshot {
-	scrapeMu.RLock()
-	defer scrapeMu.RUnlock()
-	return scrapeStatusSnapshot{Last: lastScrapeTime, Next: nextScrapeTime, Info: lastScrapeInfo}
-}
-
 func main() {
 	cfg := ParseConfig()
 	if err := cfg.Validate(); err != nil {
@@ -153,6 +108,7 @@ func main() {
 		InitBaselineExit(cfg.CheckTimeout)
 	}
 
+	coordinator := newRefreshCoordinator()
 	pool := NewProxyPool()
 	pool.SetHealthCriterion(store.CheckURL())
 	pool.SetRequireIPChangePolicy(cfg.RequireIPChange)
@@ -196,7 +152,9 @@ func main() {
 	}
 	if cacheCriterionChanged {
 		pool.FlushCache()
-		_, _ = TriggerFullRecheck(pool)
+		if _, queued := coordinator.triggerFullRecheck(pool); !queued {
+			log.Printf("[main] full recheck already pending or active; not re-queued")
+		}
 	}
 
 	// Background: initial scrape + check, then periodic scrape + manual
@@ -214,12 +172,12 @@ func main() {
 			var operationID string
 			if manual {
 				log.Printf("[main] manual refresh triggered")
-				operationID = beginRefreshOperation()
+				operationID = coordinator.beginRefreshOperation()
 			} else {
-				operationID = beginBackgroundRefreshOperation(trigger)
+				operationID = coordinator.beginBackgroundRefreshOperation(trigger)
 			}
-			result := refreshPool(cfg, store, pool)
-			finishRefreshOperation(operationID, result)
+			result := refreshPool(cfg, store, pool, coordinator)
+			coordinator.finishRefreshOperation(operationID, result)
 		}
 
 		run("startup", false)
@@ -229,28 +187,40 @@ func main() {
 			select {
 			case <-timer.C:
 				run("scheduled", false)
-			case <-refreshChan:
+			case <-coordinator.refreshChan:
 				run("manual", true)
 			}
-			// Completion-based scheduling keeps the reported next deadline and the
-			// timer in the same time model, even when a large refresh runs for minutes.
-			next := time.Now().Add(cfg.ScrapeInterval)
-			scrapeMu.Lock()
-			nextScrapeTime = next
-			scrapeMu.Unlock()
+			// Completion-based scheduling: refreshPool may have set a shorter
+			// next scrape deadline when all sources failed, so read it back rather
+			// than unconditionally using the full interval.
+			_, next := coordinator.scrapeTimes()
+			if next.IsZero() || time.Until(next) <= 0 {
+				next = time.Now().Add(cfg.ScrapeInterval)
+			}
 			timer.Reset(time.Until(next))
 		}
 	}()
+
+	// Establish the shutdown signal context before launching background
+	// goroutines so they can all select on it instead of using blocking sleeps.
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	// Background: random rotation of the default (ANY) group every 3-6
 	// minutes. If the pool is empty, trigger an immediate refresh instead.
 	go func() {
 		for {
 			delay := 3*time.Minute + time.Duration(rand.Intn(4))*time.Minute
-			time.Sleep(delay)
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-signalContext.Done():
+				timer.Stop()
+				return
+			}
 			if pool.Size() == 0 {
 				log.Printf("[main] pool empty, triggering immediate refresh")
-				TriggerRefresh()
+				coordinator.triggerRefresh()
 			} else if pool.Size() > 1 {
 				pool.RotateSticky(GroupAny)
 			}
@@ -270,14 +240,14 @@ func main() {
 			full := false
 			select {
 			case <-timer.C:
-			case <-recheckChan:
+			case <-coordinator.recheckChan:
 				if !timer.Stop() {
 					select {
 					case <-timer.C:
 					default:
 					}
 				}
-			case <-fullRecheckChan:
+			case <-coordinator.fullRecheckChan:
 				full = true
 				if !timer.Stop() {
 					select {
@@ -290,7 +260,7 @@ func main() {
 			// periodic/manual bounded signal won the select above first.
 			if !full {
 				select {
-				case <-fullRecheckChan:
+				case <-coordinator.fullRecheckChan:
 					full = true
 				default:
 				}
@@ -301,25 +271,24 @@ func main() {
 					pool.InvalidateHealth(store.CheckURL())
 					pool.candidates.ResetHealthOutcomes()
 					pool.FlushCache()
-					_, _ = TriggerFullRecheck(pool)
-					if full {
-						select {
-						case <-fullRecheckChan:
-						default:
-						}
+					_, _ = coordinator.triggerFullRecheck(pool)
+					full = true
+					select {
+					case <-coordinator.fullRecheckChan:
+					default:
 					}
 				}
 			}
 			if full {
-				reCheckAllAlive(cfg, store, pool)
+				reCheckAllAlive(cfg, store, pool, coordinator)
 			} else {
-				reCheckAlive(cfg, store, pool)
+				reCheckAlive(cfg, store, pool, coordinator)
 			}
 			timer.Reset(5 * time.Minute)
 		}
 	}()
 
-	status := NewStatusServerWithAdminCredentials(pool, store, cfg.AdminUser, cfg.AdminPass)
+	status := NewStatusServerWithAdminCredentialsAndCoordinator(pool, store, coordinator, cfg.AdminUser, cfg.AdminPass)
 	trustedManagementProxies := make([]string, 0, len(cfg.TrustedManagementProxies))
 	for _, ip := range cfg.TrustedManagementProxies {
 		trustedManagementProxies = append(trustedManagementProxies, ip.String())
@@ -341,8 +310,6 @@ func main() {
 	}()
 	go func() { serverErrors <- server.Start() }()
 
-	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
 	var exitErr error
 	select {
 	case <-signalContext.Done():
@@ -372,11 +339,11 @@ func main() {
 // configured CheckURL and records the outcome, so quality scores stay current
 // without an unbounded retained pool turning a five-minute background pass
 // into a multi-hour job. No scraping or geo lookups happen here.
-func reCheckAlive(cfg *Config, store *ConfigStore, pool *ProxyPool) {
-	_, _ = reCheckNodes(cfg, store, pool, pool.RecheckCandidates(cfg.MaxCandidates), pool.Size(), "recheck", "")
+func reCheckAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
+	_, _ = reCheckNodes(cfg, store, pool, coordinator, pool.RecheckCandidates(cfg.MaxCandidates), pool.Size(), "recheck", "")
 }
 
-func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool) {
+func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
 	all := pool.All()
 	nodes := all[:0]
 	for _, px := range all {
@@ -384,20 +351,20 @@ func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool) {
 			nodes = append(nodes, px)
 		}
 	}
-	operation := beginHealthRecheckOperation(pool, len(nodes))
-	generation, completed := reCheckNodes(cfg, store, pool, nodes, len(nodes), "full-recheck", operation.ID)
+	operation := coordinator.beginHealthRecheckOperation(pool, len(nodes))
+	generation, completed := reCheckNodes(cfg, store, pool, coordinator, nodes, len(nodes), "full-recheck", operation.ID)
 	if completed {
 		completed = pool.CompleteHealthRecheck(generation)
 		if completed {
 			pool.FlushCache()
 		}
 	}
-	finishHealthRecheckOperation(operation.ID, completed)
+	coordinator.finishHealthRecheckOperation(operation.ID, completed)
 }
 
-func reCheckNodes(cfg *Config, store *ConfigStore, pool *ProxyPool, nodes []Proxy, knownTotal int, logLabel, operationID string) (uint64, bool) {
-	healthCycleMu.Lock()
-	defer healthCycleMu.Unlock()
+func reCheckNodes(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, nodes []Proxy, knownTotal int, logLabel, operationID string) (uint64, bool) {
+	coordinator.healthCycleMu.Lock()
+	defer coordinator.healthCycleMu.Unlock()
 	healthGeneration, testURL := currentHealthCriterion(pool, store)
 	if len(nodes) == 0 {
 		return healthGeneration, true
@@ -443,9 +410,10 @@ checkLoop:
 				if healthContext.Err() != nil {
 					return
 				}
-				ipChangeKnown = exitIP != "" && baseline != ""
-				ipChanged = ipChangeKnown && exitIP != baseline
-				policyAllowed = !ipChangeKnown || ipChanged
+				policy := evaluateIPChangePolicy(exitIP, baseline, cfg.RequireIPChange)
+				ipChangeKnown = policy.IPChangeKnown
+				ipChanged = policy.IPChanged
+				policyAllowed = policy.PolicyAllowed
 			}
 			if reachable {
 				pool.UpdateVerifiedCredentialsAtGeneration(px.Key(), verified, healthGeneration)
@@ -453,7 +421,7 @@ checkLoop:
 			if !pool.ObserveHealthOutcomeAtGeneration(px.Key(), reachable, policyAllowed, latency.Milliseconds(), healthGeneration) {
 				return
 			}
-			recordHealthRecheckOutcome(operationID, reachable, reachable && !policyAllowed)
+			coordinator.recordHealthRecheckOutcome(operationID, reachable, reachable && !policyAllowed)
 			if exitIP != "" {
 				pool.UpdateGeo(px.Key(), exitIP, "", "", "", ipChanged, ipChangeKnown)
 			}
@@ -479,7 +447,7 @@ checkLoop:
 // refreshPool fetches every enabled source concurrently, dedups the
 // combined candidate list, health-checks it, and installs the result as
 // the pool's new live proxy list.
-func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunResult {
+func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) refreshRunResult {
 	sources := store.EnabledSources()
 	if len(sources) == 0 {
 		log.Printf("[main] no enabled sources, skipping refresh")
@@ -584,8 +552,8 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 	// fine but got excluded from alive for a policy reason (transparent
 	// proxy). Only genuine connectivity failures should flip a
 	// previously-known-good node to Available=false.
-	healthCycleMu.Lock()
-	defer healthCycleMu.Unlock()
+	coordinator.healthCycleMu.Lock()
+	defer coordinator.healthCycleMu.Unlock()
 	healthGeneration, testURL := currentHealthCriterion(pool, store)
 	healthContext, finishHealthWork, current := pool.BeginHealthWork(healthGeneration)
 	if !current {
@@ -594,7 +562,7 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 	}
 	alive, unreachable, policyFiltered := checkProxiesDetailedContext(healthContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
 	finishHealthWork()
-	applied := applyRefreshHealthResults(pool, store, alive, unreachable, policyFiltered, healthGeneration)
+	applied := applyRefreshHealthResults(pool, store, coordinator, alive, unreachable, policyFiltered, healthGeneration)
 	if !applied {
 		pool.candidates.complete(catalogRefresh, nil, nil, nil)
 		log.Printf("[main] discarded health results because the check criterion changed during refresh")
@@ -605,15 +573,14 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 	// source toggle/delete and would otherwise revive its stale credentials.
 	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
 
-	scrapeMu.Lock()
-	lastScrapeTime = time.Now()
-	nextScrapeTime = lastScrapeTime.Add(cfg.ScrapeInterval)
-	lastScrapeInfo = ScrapeInfo{
+	coordinator.recordScrape(ScrapeInfo{
 		Raw: rawCount, Candidates: candidateTotal, Checked: len(candidates),
 		FreshAlive: len(alive), SourceTotal: len(sources), SourceError: sourceErrors,
-	}
-	scrapeMu.Unlock()
-
+	}, cfg.ScrapeInterval)
+	// Persist the new pool membership immediately rather than relying on the
+	// 500ms debounce timer. A process kill between refresh completion and the
+	// debounced write would otherwise lose the freshly discovered nodes.
+	pool.FlushCache()
 	log.Printf("[main] pool refreshed: %d fresh alive / %d checked against %s; %d known total (from %d sources, %d errors, %d raw, %d protocol-aware candidates, %d non-routable resources)",
 		len(alive), len(candidates), safeSourceURL(testURL), pool.Size(), len(sources), sourceErrors, rawCount, candidateTotal, resourceCount)
 	status := "complete"
@@ -626,9 +593,9 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool) refreshRunRes
 // applyRefreshHealthResults closes the source-toggle race at the one point a
 // completed network check can make nodes routable. Tests exercise this helper
 // directly with a deliberately stale result captured before a source change.
-func applyRefreshHealthResults(pool *ProxyPool, store *ConfigStore, alive []Proxy, unreachable, policyFiltered map[string]bool, healthGeneration uint64) bool {
-	sourceLifecycleMu.Lock()
-	defer sourceLifecycleMu.Unlock()
+func applyRefreshHealthResults(pool *ProxyPool, store *ConfigStore, coordinator *RefreshCoordinator, alive []Proxy, unreachable, policyFiltered map[string]bool, healthGeneration uint64) bool {
+	coordinator.sourceLifecycleMu.Lock()
+	defer coordinator.sourceLifecycleMu.Unlock()
 	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
 		return false
 	}
@@ -842,299 +809,4 @@ func mergeCandidateCredentials(primary, other Proxy) Proxy {
 		return primary.CredentialAlternates[i].Password < primary.CredentialAlternates[j].Password
 	})
 	return primary
-}
-
-// sampleBalanced guarantees every source/protocol bucket a small share, then
-// fills the remainder proportionally from the combined leftovers. This stops
-// one very large feed from crowding all smaller sources out of a cycle.
-func sampleBalanced(list []Proxy, limit int) []Proxy {
-	if limit <= 0 || len(list) == 0 {
-		return nil
-	}
-	if len(list) <= limit {
-		return append([]Proxy(nil), list...)
-	}
-	buckets := make(map[string][]Proxy)
-	for _, px := range list {
-		name := px.SourceName
-		if name == "" {
-			name = "unknown"
-		}
-		key := name + "\x00" + px.Protocol
-		buckets[key] = append(buckets[key], px)
-	}
-	keys := make([]string, 0, len(buckets))
-	for key := range buckets {
-		keys = append(keys, key)
-		s := buckets[key]
-		rand.Shuffle(len(s), func(i, j int) { s[i], s[j] = s[j], s[i] })
-		buckets[key] = s
-	}
-	sort.Strings(keys)
-	quota := limit / (len(keys) * 4)
-	if quota < 1 {
-		quota = 1
-	}
-	if quota > 50 {
-		quota = 50
-	}
-
-	out := make([]Proxy, 0, limit)
-	leftovers := make([]Proxy, 0, len(list))
-	for _, key := range keys {
-		bucket := buckets[key]
-		take := quota
-		if take > len(bucket) {
-			take = len(bucket)
-		}
-		if take > limit-len(out) {
-			take = limit - len(out)
-		}
-		out = append(out, bucket[:take]...)
-		leftovers = append(leftovers, bucket[take:]...)
-	}
-	rand.Shuffle(len(leftovers), func(i, j int) { leftovers[i], leftovers[j] = leftovers[j], leftovers[i] })
-	if remaining := limit - len(out); remaining > 0 {
-		out = append(out, leftovers[:remaining]...)
-	}
-	return out
-}
-
-// RequestRefresh queues at most one follow-up operation and returns a stable
-// job ID callers can inspect through /api/refresh/status. accepted=false means
-// the caller joined an operation that was already queued.
-func RequestRefresh() (operation RefreshOperation, accepted bool) {
-	refreshOpMu.Lock()
-	if refreshPending != nil {
-		operation = *refreshPending
-		refreshOpMu.Unlock()
-		return operation, false
-	}
-	job := newRefreshOperationLocked("manual", "queued")
-	refreshPending = job
-	operation = *job
-	refreshOpMu.Unlock()
-
-	select {
-	case refreshChan <- struct{}{}:
-		return operation, true
-	default:
-		// Defensive fallback: a buffered signal should always correspond to the
-		// pending operation above. Treat it as coalesced rather than creating an
-		// unbounded queue or claiming a second job was accepted.
-		return operation, false
-	}
-}
-
-// TriggerRefresh preserves the historical fire-and-forget call sites.
-func TriggerRefresh() {
-	_, _ = RequestRefresh()
-}
-
-func beginRefreshOperation() string {
-	refreshOpMu.Lock()
-	defer refreshOpMu.Unlock()
-	job := refreshPending
-	refreshPending = nil
-	if job == nil {
-		job = newRefreshOperationLocked("manual", "queued")
-	}
-	job.Status = "running"
-	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	refreshActive = job
-	return job.ID
-}
-
-func beginBackgroundRefreshOperation(trigger string) string {
-	refreshOpMu.Lock()
-	defer refreshOpMu.Unlock()
-	job := newRefreshOperationLocked(trigger, "running")
-	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	refreshActive = job
-	return job.ID
-}
-
-// newRefreshOperationLocked allocates a refresh operation while refreshOpMu is
-// held. Background runs use the same observable state as manual jobs without
-// consuming a manual follow-up that may have been queued while a cycle ran.
-func newRefreshOperationLocked(trigger, status string) *RefreshOperation {
-	refreshOpSeq++
-	now := time.Now().UTC()
-	return &RefreshOperation{
-		ID:     fmt.Sprintf("refresh-%d-%d", now.UnixNano(), refreshOpSeq),
-		Status: status, Trigger: trigger, RequestedAt: now.Format(time.RFC3339Nano),
-	}
-}
-
-func finishRefreshOperation(id string, result refreshRunResult) {
-	refreshOpMu.Lock()
-	defer refreshOpMu.Unlock()
-	if refreshActive == nil || refreshActive.ID != id {
-		return
-	}
-	refreshActive.Status = result.Status
-	if refreshActive.Status == "" {
-		refreshActive.Status = "complete"
-	}
-	refreshActive.SourceErrors = result.SourceErrors
-	refreshActive.Error = result.Error
-	refreshActive.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	completed := *refreshActive
-	refreshLast = &completed
-	refreshActive = nil
-}
-
-func getRefreshOperationStatus() RefreshOperationStatus {
-	refreshOpMu.RLock()
-	defer refreshOpMu.RUnlock()
-	clone := func(operation *RefreshOperation) *RefreshOperation {
-		if operation == nil {
-			return nil
-		}
-		copy := *operation
-		return &copy
-	}
-	state := "idle"
-	if refreshPending != nil {
-		state = "queued"
-	}
-	if refreshActive != nil {
-		state = "running"
-	}
-	return RefreshOperationStatus{
-		State:  state,
-		Active: clone(refreshActive), Pending: clone(refreshPending), Last: clone(refreshLast),
-	}
-}
-
-// TriggerRecheck asks the serialized health worker to apply the current check
-// URL to every known node as soon as possible. Multiple requests collapse into
-// one pending run.
-func TriggerRecheck() {
-	select {
-	case recheckChan <- struct{}{}:
-	default:
-	}
-}
-
-// TriggerFullRecheck invalidates no state by itself; callers changing the
-// health criterion first mark old observations stale, then enqueue this
-// observable exhaustive pass. Requests for the same generation coalesce;
-// a newer generation replaces an older pending job.
-func TriggerFullRecheck(pool *ProxyPool) (HealthRecheckOperation, bool) {
-	generation, checkURL := pool.HealthCriterion()
-	healthRecheckOpMu.Lock()
-	if healthRecheckPending != nil && healthRecheckPending.Generation == generation {
-		operation := *healthRecheckPending
-		healthRecheckOpMu.Unlock()
-		return operation, false
-	}
-	if healthRecheckActive != nil && healthRecheckActive.Generation == generation {
-		operation := *healthRecheckActive
-		healthRecheckOpMu.Unlock()
-		return operation, false
-	}
-	if healthRecheckPending != nil {
-		superseded := *healthRecheckPending
-		superseded.Status = "superseded"
-		superseded.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		healthRecheckLast = &superseded
-	}
-	healthRecheckOpSeq++
-	now := time.Now().UTC()
-	job := &HealthRecheckOperation{
-		ID:     fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), healthRecheckOpSeq),
-		Status: "queued", Generation: generation, CheckURL: checkURL,
-		RequestedAt: now.Format(time.RFC3339Nano),
-	}
-	healthRecheckPending = job
-	operation := *job
-	healthRecheckOpMu.Unlock()
-
-	select {
-	case fullRecheckChan <- struct{}{}:
-	default:
-	}
-	return operation, true
-}
-
-func beginHealthRecheckOperation(pool *ProxyPool, total int) HealthRecheckOperation {
-	healthRecheckOpMu.Lock()
-	defer healthRecheckOpMu.Unlock()
-	job := healthRecheckPending
-	healthRecheckPending = nil
-	if job == nil {
-		generation, checkURL := pool.HealthCriterion()
-		healthRecheckOpSeq++
-		now := time.Now().UTC()
-		job = &HealthRecheckOperation{
-			ID:     fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), healthRecheckOpSeq),
-			Status: "queued", Generation: generation, CheckURL: checkURL,
-			RequestedAt: now.Format(time.RFC3339Nano),
-		}
-	}
-	job.Status = "running"
-	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	job.Total = total
-	healthRecheckActive = job
-	return *job
-}
-
-func recordHealthRecheckOutcome(id string, reachable, policyFiltered bool) {
-	if id == "" {
-		return
-	}
-	healthRecheckOpMu.Lock()
-	defer healthRecheckOpMu.Unlock()
-	if healthRecheckActive == nil || healthRecheckActive.ID != id {
-		return
-	}
-	healthRecheckActive.Completed++
-	if reachable {
-		healthRecheckActive.Reachable++
-	} else {
-		healthRecheckActive.Failed++
-	}
-	if policyFiltered {
-		healthRecheckActive.PolicyFiltered++
-	}
-}
-
-func finishHealthRecheckOperation(id string, completed bool) {
-	healthRecheckOpMu.Lock()
-	defer healthRecheckOpMu.Unlock()
-	if healthRecheckActive == nil || healthRecheckActive.ID != id {
-		return
-	}
-	if completed {
-		healthRecheckActive.Status = "complete"
-	} else {
-		healthRecheckActive.Status = "superseded"
-	}
-	healthRecheckActive.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	finished := *healthRecheckActive
-	healthRecheckLast = &finished
-	healthRecheckActive = nil
-}
-
-func getHealthRecheckOperationStatus() HealthRecheckOperationStatus {
-	healthRecheckOpMu.RLock()
-	defer healthRecheckOpMu.RUnlock()
-	clone := func(operation *HealthRecheckOperation) *HealthRecheckOperation {
-		if operation == nil {
-			return nil
-		}
-		copy := *operation
-		return &copy
-	}
-	state := "idle"
-	if healthRecheckPending != nil {
-		state = "queued"
-	}
-	if healthRecheckActive != nil {
-		state = "running"
-	}
-	return HealthRecheckOperationStatus{
-		State: state, Active: clone(healthRecheckActive), Pending: clone(healthRecheckPending), Last: clone(healthRecheckLast),
-	}
 }

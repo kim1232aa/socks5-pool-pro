@@ -236,18 +236,15 @@ func TestCompactStatusUsesRetainedCandidateSnapshotMetadata(t *testing.T) {
 }
 
 func TestStatusAddsRFC3339UTCTimestampsWithoutRemovingLegacyFields(t *testing.T) {
-	scrapeMu.Lock()
-	previousLast, previousNext := lastScrapeTime, nextScrapeTime
-	lastScrapeTime = time.Date(2026, time.July, 12, 5, 1, 2, 0, time.UTC)
-	nextScrapeTime = time.Date(2026, time.July, 12, 5, 21, 2, 0, time.UTC)
-	scrapeMu.Unlock()
-	t.Cleanup(func() {
-		scrapeMu.Lock()
-		lastScrapeTime, nextScrapeTime = previousLast, previousNext
-		scrapeMu.Unlock()
-	})
+	coordinator := newRefreshCoordinator()
+	previousLast, previousNext := coordinator.scrapeTimes()
+	coordinator.setScrapeTimesForTest(
+		time.Date(2026, time.July, 12, 5, 1, 2, 0, time.UTC),
+		time.Date(2026, time.July, 12, 5, 21, 2, 0, time.UTC),
+	)
+	t.Cleanup(func() { coordinator.setScrapeTimesForTest(previousLast, previousNext) })
 
-	summary := NewStatusServer(NewProxyPool(), &ConfigStore{}).buildSummary()
+	summary := NewStatusServerWithCoordinator(NewProxyPool(), &ConfigStore{}, coordinator).buildSummary()
 	if summary.LastScrape == "" || summary.NextScrape == "" {
 		t.Fatalf("legacy scrape fields were removed: %#v", summary)
 	}
@@ -373,8 +370,10 @@ func TestV1PickSnapshotTracksHiddenScore(t *testing.T) {
 }
 
 func TestRefreshEndpointReturnsTrackableAcceptedOperation(t *testing.T) {
-	resetRefreshOperationsForTest(t)
-	handler := NewStatusServer(NewProxyPool(), &ConfigStore{}).handler()
+	coordinator := newRefreshCoordinator()
+	coordinator.resetForTest()
+	t.Cleanup(coordinator.resetForTest)
+	handler := NewStatusServerWithCoordinator(NewProxyPool(), &ConfigStore{}, coordinator).handler()
 
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, localTestRequest(http.MethodPost, "/api/refresh", nil))
@@ -417,12 +416,12 @@ func TestRefreshEndpointReturnsTrackableAcceptedOperation(t *testing.T) {
 	if status.Code != http.StatusOK || operationStatus.State != "queued" || operationStatus.Pending == nil || operationStatus.Pending.ID != firstBody.ID {
 		t.Fatalf("refresh status = %d %#v", status.Code, operationStatus)
 	}
-	runningID := beginRefreshOperation()
-	if running := getRefreshOperationStatus(); running.State != "running" || running.Active == nil || running.Active.ID != runningID {
+	runningID := coordinator.beginRefreshOperation()
+	if running := coordinator.refreshOperationStatus(); running.State != "running" || running.Active == nil || running.Active.ID != runningID {
 		t.Fatalf("running refresh status = %#v", running)
 	}
-	finishRefreshOperation(runningID, refreshRunResult{Status: "partial", SourceErrors: 2})
-	if completed := getRefreshOperationStatus(); completed.State != "idle" || completed.Last == nil || completed.Last.Status != "partial" || completed.Last.SourceErrors != 2 || completed.Last.CompletedAt == "" {
+	coordinator.finishRefreshOperation(runningID, refreshRunResult{Status: "partial", SourceErrors: 2})
+	if completed := coordinator.refreshOperationStatus(); completed.State != "idle" || completed.Last == nil || completed.Last.Status != "partial" || completed.Last.SourceErrors != 2 || completed.Last.CompletedAt == "" {
 		t.Fatalf("completed refresh status = %#v", completed)
 	}
 }
@@ -447,12 +446,31 @@ func TestStateChangingAPIsRejectCrossSiteBrowsersButAllowCompatibleClients(t *te
 		t.Fatalf("wrong-origin write = %d %s", wrongRecorder.Code, wrongRecorder.Body.String())
 	}
 
+	dashboard := httptest.NewRecorder()
+	handler.ServeHTTP(dashboard, localTestRequest(http.MethodGet, "/", nil))
+	csrf := dashboard.Result().Cookies()[0]
+	if csrf.Name != csrfCookieName || csrf.Value == "" {
+		t.Fatalf("dashboard CSRF cookie = %#v", csrf)
+	}
+	if !strings.Contains(dashboard.Body.String(), `name="csrf-token" content="`+csrf.Value+`"`) {
+		t.Fatalf("dashboard does not expose CSRF token")
+	}
 	sameOrigin := localTestRequest(http.MethodPost, "/api/refresh", nil)
 	sameOrigin.Header.Set("Origin", "http://localhost")
+	sameOrigin.AddCookie(csrf)
+	sameOrigin.Header.Set("X-CSRF-Token", csrf.Value)
 	sameRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(sameRecorder, sameOrigin)
 	if sameRecorder.Code != http.StatusAccepted {
 		t.Fatalf("same-origin write = %d %s", sameRecorder.Code, sameRecorder.Body.String())
+	}
+
+	missingToken := localTestRequest(http.MethodPost, "/api/refresh", nil)
+	missingToken.Header.Set("Origin", "http://localhost")
+	missingRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(missingRecorder, missingToken)
+	if missingRecorder.Code != http.StatusForbidden || !strings.Contains(missingRecorder.Body.String(), `"code":"invalid_csrf_token"`) {
+		t.Fatalf("same-origin write without CSRF token = %d %s", missingRecorder.Code, missingRecorder.Body.String())
 	}
 }
 
@@ -525,41 +543,7 @@ func TestUnauthenticatedManagementRequiresLoopbackHostAndRemote(t *testing.T) {
 
 func resetRefreshOperationsForTest(t *testing.T) {
 	t.Helper()
-	reset := func() {
-		refreshOpMu.Lock()
-		refreshOpSeq = 0
-		refreshActive = nil
-		refreshPending = nil
-		refreshLast = nil
-		refreshOpMu.Unlock()
-		healthRecheckOpMu.Lock()
-		healthRecheckOpSeq = 0
-		healthRecheckActive = nil
-		healthRecheckPending = nil
-		healthRecheckLast = nil
-		healthRecheckOpMu.Unlock()
-		for {
-			drained := false
-			select {
-			case <-refreshChan:
-				drained = true
-			default:
-			}
-			select {
-			case <-recheckChan:
-				drained = true
-			default:
-			}
-			select {
-			case <-fullRecheckChan:
-				drained = true
-			default:
-			}
-			if !drained {
-				return
-			}
-		}
-	}
+	reset := func() { defaultRefreshCoordinator.resetForTest() }
 	reset()
 	t.Cleanup(reset)
 }
@@ -597,20 +581,14 @@ func TestCheckURLChangeInvalidatesHealthAndQueuesOnlyFullRecheck(t *testing.T) {
 	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available {
 		t.Fatalf("pool after check URL change = %#v", nodes)
 	}
-	select {
-	case <-fullRecheckChan:
-	default:
+	if !defaultRefreshCoordinator.drainFullRecheckSignalForTest() {
 		t.Fatal("check URL change did not queue a full recheck")
 	}
-	select {
-	case <-refreshChan:
+	if defaultRefreshCoordinator.drainRefreshSignalForTest() {
 		t.Fatal("check URL change unexpectedly queued a source refresh")
-	default:
 	}
-	select {
-	case <-recheckChan:
+	if defaultRefreshCoordinator.drainRecheckSignalForTest() {
 		t.Fatal("check URL change unexpectedly queued the legacy incremental recheck")
-	default:
 	}
 }
 
@@ -635,10 +613,8 @@ func TestSavingIdenticalCheckURLIsNoOp(t *testing.T) {
 	if got, _ := pool.Find(px.Key()); !got.Available || pool.HealthGeneration() != 0 {
 		t.Fatalf("identical URL invalidated node: %+v generation=%d", got, pool.HealthGeneration())
 	}
-	select {
-	case <-fullRecheckChan:
+	if defaultRefreshCoordinator.drainFullRecheckSignalForTest() {
 		t.Fatal("identical URL queued full recheck")
-	default:
 	}
 }
 
@@ -676,23 +652,25 @@ func TestClearUnavailableBlockedWhileCriterionRecheckPending(t *testing.T) {
 }
 
 func TestHealthRecheckOperationReportsProgress(t *testing.T) {
-	resetRefreshOperationsForTest(t)
+	coordinator := newRefreshCoordinator()
+	coordinator.resetForTest()
+	t.Cleanup(coordinator.resetForTest)
 	pool := NewProxyPool()
 	pool.SetHealthCriterion(defaultCheckURL)
-	operation, accepted := TriggerFullRecheck(pool)
+	operation, accepted := coordinator.triggerFullRecheck(pool)
 	if !accepted || operation.Status != "queued" {
 		t.Fatalf("queued operation = %#v accepted=%v", operation, accepted)
 	}
-	running := beginHealthRecheckOperation(pool, 3)
-	recordHealthRecheckOutcome(running.ID, true, false)
-	recordHealthRecheckOutcome(running.ID, true, true)
-	recordHealthRecheckOutcome(running.ID, false, false)
-	state := getHealthRecheckOperationStatus()
+	running := coordinator.beginHealthRecheckOperation(pool, 3)
+	coordinator.recordHealthRecheckOutcome(running.ID, true, false)
+	coordinator.recordHealthRecheckOutcome(running.ID, true, true)
+	coordinator.recordHealthRecheckOutcome(running.ID, false, false)
+	state := coordinator.healthRecheckOperationStatus()
 	if state.State != "running" || state.Active == nil || state.Active.Completed != 3 || state.Active.Reachable != 2 || state.Active.Failed != 1 || state.Active.PolicyFiltered != 1 {
 		t.Fatalf("running recheck status = %#v", state)
 	}
-	finishHealthRecheckOperation(running.ID, true)
-	state = getHealthRecheckOperationStatus()
+	coordinator.finishHealthRecheckOperation(running.ID, true)
+	state = coordinator.healthRecheckOperationStatus()
 	if state.State != "idle" || state.Last == nil || state.Last.Status != "complete" || state.Last.ID != operation.ID {
 		t.Fatalf("completed recheck status = %#v", state)
 	}
@@ -736,7 +714,7 @@ func TestSourceToggleImmediatelyRetiresItsOnlyRoutingNodeAndQueuesRefresh(t *tes
 	stale := pool.All()[0]
 	stale.Available = true
 	stale.SourceRetired = false
-	if !applyRefreshHealthResults(pool, store, []Proxy{stale}, nil, nil, pool.HealthGeneration()) {
+	if !applyRefreshHealthResults(pool, store, defaultRefreshCoordinator, []Proxy{stale}, nil, nil, pool.HealthGeneration()) {
 		t.Fatal("stale refresh result was rejected for an unrelated generation")
 	}
 	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available || !nodes[0].SourceRetired {
@@ -745,9 +723,7 @@ func TestSourceToggleImmediatelyRetiresItsOnlyRoutingNodeAndQueuesRefresh(t *tes
 	if got, ok, direct := pool.Pick(GroupAny, nil); ok || direct {
 		t.Fatalf("disabled source remained routable: %+v, ok=%v direct=%v", got, ok, direct)
 	}
-	select {
-	case <-refreshChan:
-	default:
+	if !defaultRefreshCoordinator.drainRefreshSignalForTest() {
 		t.Fatal("source toggle did not queue a refresh")
 	}
 }
@@ -816,9 +792,7 @@ func TestSourceDeleteImmediatelyRetiresItsOnlyRoutingNodeAndQueuesRefresh(t *tes
 	if nodes := pool.All(); len(nodes) != 1 || nodes[0].Available || !nodes[0].SourceRetired {
 		t.Fatalf("pool after source delete = %#v", nodes)
 	}
-	select {
-	case <-refreshChan:
-	default:
+	if !defaultRefreshCoordinator.drainRefreshSignalForTest() {
 		t.Fatal("source delete did not queue a refresh")
 	}
 }

@@ -1,4 +1,14 @@
 function fetchJSON(url, options) {
+  options = options || {};
+  var method = String(options.method || 'GET').toUpperCase();
+  if (['POST', 'PUT', 'DELETE', 'PATCH'].indexOf(method) >= 0) {
+    var token = (document.querySelector('meta[name="csrf-token"]') || {}).content;
+    if (token) {
+      var headers = new Headers(options.headers || {});
+      headers.set('X-CSRF-Token', token);
+      options = Object.assign({}, options, {headers:headers});
+    }
+  }
   return fetch(url, options).then(function(r) {
     return r.text().then(function(text) {
       var data = {};
@@ -453,7 +463,7 @@ function renderCandidateProtocolCards() {
   ];
   container.innerHTML = cards.map(function(card) {
     var count = candidateProtocolCount(card.value);
-    return '<button type="button" class="protocol-card' + (selected === card.value ? ' active' : '') + '" onclick="chooseCandidateProtocol(\'' + card.value + '\')" aria-pressed="' + (selected === card.value ? 'true' : 'false') + '">' +
+    return '<button type="button" class="protocol-card' + (selected === card.value ? ' active' : '') + '" data-action="choose-candidate-protocol" data-protocol="' + escapeHtml(card.value) + '" aria-pressed="' + (selected === card.value ? 'true' : 'false') + '">' +
       '<strong>' + card.label + '</strong><span>' + formatCount(count) + '</span><small>' + card.note + '</small></button>';
   }).join('');
 }
@@ -537,7 +547,7 @@ function renderCandidateCountryPicker() {
     {code:'AN', cls:'an', label:'❄️ 南极洲'}, {code:'unknown', cls:'unknown', label:'🏳️ 国家未知'}
   ];
   map.innerHTML = definitions.map(function(item) {
-    return '<button type="button" class="continent-tile continent-' + item.cls + (candidateContinentFilter === item.code ? ' active' : '') + '" onclick="setCandidateContinentFilter(\'' + item.code + '\')">' +
+    return '<button type="button" class="continent-tile continent-' + escapeHtml(item.cls) + (candidateContinentFilter === item.code ? ' active' : '') + '" data-action="set-candidate-continent" data-continent="' + escapeHtml(item.code) + '">' +
       '<strong>' + item.label + '</strong><span>' + pickerCountLabel(counts[item.code] || {}) + '</span></button>';
   }).join('');
 
@@ -567,7 +577,7 @@ function renderCandidateCountryPicker() {
     html += '<div class="country-continent-group"><div class="country-continent-title"><span>' + title + '</span><span>' + pickerCountLabel(groupCounts) + '</span></div>';
     items.forEach(function(item) {
       shown++;
-      html += '<button type="button" class="country-option' + (selected === item.country ? ' active' : '') + '" onclick="chooseCandidateCountry(\'' + item.country + '\')">' +
+      html += '<button type="button" class="country-option' + (selected === item.country ? ' active' : '') + '" data-action="choose-candidate-country" data-country="' + escapeHtml(item.country) + '">' +
         '<span aria-hidden="true">' + flagEmoji(item.country) + '</span><span class="country-option-code">' + item.country + ' ' + escapeHtml(countryNameZH(item.country)) + '</span><span class="country-option-count">' + pickerCountLabel(item) + '</span></button>';
     });
     html += '</div>';
@@ -576,7 +586,7 @@ function renderCandidateCountryPicker() {
   if ((!candidateContinentFilter || candidateContinentFilter === 'unknown') && (!query || 'UNKNOWN 国家未知 尚未定位'.indexOf(query) >= 0)) {
     shown++;
     html += '<div class="country-continent-group"><div class="country-continent-title"><span>🏳️ 国家未知</span><span>' + pickerCountLabel(unknown) + '</span></div>' +
-      '<button type="button" class="country-option' + (selected === '__unknown__' ? ' active' : '') + '" onclick="chooseCandidateCountry(\'__unknown__\')"><span aria-hidden="true">🏳️</span><span class="country-option-code">尚未定位</span><span class="country-option-count">' + pickerCountLabel(unknown) + '</span></button></div>';
+      '<button type="button" class="country-option' + (selected === '__unknown__' ? ' active' : '') + '" data-action="choose-candidate-country" data-country="__unknown__"><span aria-hidden="true">🏳️</span><span class="country-option-code">尚未定位</span><span class="country-option-count">' + pickerCountLabel(unknown) + '</span></button></div>';
   }
   list.innerHTML = html || '<div class="country-option-empty">没有匹配的国家/地区</div>';
   setText('candidate-country-result-count', shown + ' 个地区');
@@ -715,7 +725,7 @@ function proxyIPVerifyCellHTML(key, protocol) {
   var safeKey = escapeHtml(key);
   var note = '<span class="proxyip-verify-note">仅供 Cloudflare Worker ProxyIP 参考 · 资源/代理池状态不变</span>';
   var buttonLabel = !result ? '专用验证' : (result.state === 'error' ? '重试' : '重新验证');
-  var button = '<button type="button" class="btn-sm" data-action="proxyip-verify" onclick="runProxyIPVerify(this)" aria-label="' + buttonLabel + ' ' + safeKey + '">' + buttonLabel + '</button>';
+  var button = '<button type="button" class="btn-sm" data-action="proxyip-verify" aria-label="' + escapeHtml(buttonLabel + ' ' + key) + '">' + escapeHtml(buttonLabel) + '</button>';
   if (!result) return '<div class="proxyip-verify"><div class="proxyip-verify-actions">' + button + '</div>' + note + '</div>';
   if (result.state === 'loading') {
     return '<div class="proxyip-verify"><div class="proxyip-verify-actions"><button type="button" class="btn-sm" data-action="proxyip-verify" aria-disabled="true">验证中…</button>' +
@@ -975,7 +985,7 @@ function applyCandidateView() {
     return '<tr class="' + (candidateExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(candidateKey) + '">' +
       '<td data-label="状态">' + candidateStatusBadge(status) + '</td>' +
       '<td data-label="协议">' + protoBadge(candidate.protocol || '') + (candidate.has_auth ? '<span class="auth-badge" title="该上游候选需要用户名/密码；凭据不会在目录接口中返回">需认证</span>' : '') + '</td>' +
-      '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(candidate.addr || '') + '" onclick="copyAddrFrom(this)" aria-label="复制候选地址">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" onclick="toggleCandidateDetails(this)" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
+      '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(candidate.addr || '') + '" aria-label="复制候选地址">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
       '<td data-label="来源标注地区">' + escapeHtml(location) + '</td>' +
       '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '<span class="candidate-readonly"> · 只读候选</span></td>' +
       '<td data-label="专用验证" class="candidate-verify-cell mobile-secondary">' + proxyIPVerifyCellHTML(candidate.key, candidate.protocol) + '</td></tr>';
@@ -985,9 +995,9 @@ function applyCandidateView() {
     renderCandidatePagers('');
   } else {
     renderCandidatePagers(
-      '<button type="button" class="btn-sm" data-action="previous" ' + (page <= 1 ? 'disabled' : '') + ' onclick="gotoCandidatePage(' + (page - 1) + ')">上一页</button>' +
+      '<button type="button" class="btn-sm" data-action="goto-candidate-page" data-page="' + (page - 1) + '" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
       '<span class="small">第 ' + page + ' / ' + pageCount + ' 页</span>' +
-      '<button type="button" class="btn-sm" data-action="next" ' + (page >= pageCount ? 'disabled' : '') + ' onclick="gotoCandidatePage(' + (page + 1) + ')">下一页</button>');
+      '<button type="button" class="btn-sm" data-action="goto-candidate-page" data-page="' + (page + 1) + '" ' + (page >= pageCount ? 'disabled' : '') + '>下一页</button>');
   }
   restoreCandidateFocus(savedFocus);
 }
@@ -1216,20 +1226,20 @@ function applyNodeView() {
       var rowExpanded = !!expandedNodeRows[n.key];
       var switchAction = n.available === false
         ? '<button type="button" class="btn-sm" data-action="switch" disabled aria-label="节点 ' + escapeHtml(n.addr) + ' 当前不可用，不能切换" title="当前不可用；可先点击验证，恢复后再切换">不可用</button>'
-        : '<button type="button" class="btn-sm" data-action="switch" onclick="switchNode(this)" aria-label="使用节点 ' + escapeHtml(n.addr) + '">使用</button>';
+        : '<button type="button" class="btn-sm" data-action="switch-node" aria-label="使用节点 ' + escapeHtml(n.addr) + '">使用</button>';
       var actionsCell =
         '<div class="row-actions">' + switchAction +
         (ops.speedtest
           ? '<button type="button" class="btn-sm" data-action="speedtest" aria-disabled="true">测速中...</button>'
-          : '<button type="button" class="btn-sm" data-action="speedtest" onclick="runSpeedtest(this)" aria-label="测速节点 ' + escapeHtml(n.addr) + '">测速</button>') +
+          : '<button type="button" class="btn-sm" data-action="speedtest" aria-label="测速节点 ' + escapeHtml(n.addr) + '">测速</button>') +
         (ops.verify
           ? '<button type="button" class="btn-sm" data-action="verify" aria-disabled="true">验证中...</button>'
-          : '<button type="button" class="btn-sm" data-action="verify" onclick="runVerify(this)" title="立即重新拨号,查看真实出口IP/国家是否和标签一致" aria-label="验证节点 ' + escapeHtml(n.addr) + '">验证</button>') +
-        '<button type="button" class="mobile-detail-toggle" data-action="details" onclick="toggleNodeDetails(this)" aria-expanded="' + (rowExpanded ? 'true' : 'false') + '">' + (rowExpanded ? '收起' : '详情') + '</button></div>';
+          : '<button type="button" class="btn-sm" data-action="verify" title="立即重新拨号,查看真实出口IP/国家是否和标签一致" aria-label="验证节点 ' + escapeHtml(n.addr) + '">验证</button>') +
+        '<button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (rowExpanded ? 'true' : 'false') + '">' + (rowExpanded ? '收起' : '详情') + '</button></div>';
       html += '<tr class="' + (n.active ? 'active ' : '') + (n.available === false ? 'unavail ' : '') + (rowExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
         '<td data-label="状态">' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.source_retired ? '<span class="badge-unavail">来源已停用</span>' : (n.health_invalidated ? '<span class="badge-unavail">等待当前标准复检</span>' : (n.policy_excluded ? '<span class="badge-unavail">出口策略排除</span>' : (n.available === false ? '<span class="badge-unavail">暂不可用</span>' : '<span class="small">可用</span>'))))) + '</td>' +
         '<td data-label="协议">' + protoBadge(n.protocol) + '</td>' +
-        '<td data-label="地址(节点IP)" class="mono">' + escapeHtml(n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.addr) + '" onclick="copyAddrFrom(this)" aria-label="复制节点地址">复制</button></td>' +
+        '<td data-label="地址(节点IP)" class="mono">' + escapeHtml(n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.addr) + '" aria-label="复制节点地址">复制</button></td>' +
         '<td data-label="出口IP" class="mobile-secondary">' + exitCell + '</td>' +
         '<td data-label="匿名" class="mobile-secondary">' + anonBadge(n.anonymity) + '</td>' +
         '<td data-label="国家/城市">' + (loc || '<span class="small">-</span>') + '</td>' +
@@ -1245,15 +1255,15 @@ function applyNodeView() {
       renderNodePagers('');
     } else {
       renderNodePagers(
-          '<button type="button" class="btn-sm" data-action="previous" ' + (page <= 1 ? 'disabled' : '') + ' onclick="gotoPage(' + (page - 1) + ')">上一页</button>' +
+          '<button type="button" class="btn-sm" data-action="goto-node-page" data-page="' + (page - 1) + '" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
           '<span class="small">第 ' + page + ' / ' + pageCount + ' 页</span>' +
-          '<button type="button" class="btn-sm" data-action="next" ' + (page >= pageCount ? 'disabled' : '') + ' onclick="gotoPage(' + (page + 1) + ')">下一页</button>');
+          '<button type="button" class="btn-sm" data-action="goto-node-page" data-page="' + (page + 1) + '" ' + (page >= pageCount ? 'disabled' : '') + '>下一页</button>');
     }
   }
 
   if (banner) {
     var lockUI = anyPinned
-      ? '<span class="lock-badge">🔒 手动锁定</span><button type="button" class="btn-sm" onclick="setAuto()">恢复自动轮换</button>'
+      ? '<span class="lock-badge">🔒 手动锁定</span><button type="button" class="btn-sm" data-action="set-auto">恢复自动轮换</button>'
       : '<span class="auto-badge">🔄 自动轮换中</span>';
     var body = active
       ? escapeHtml(active.addr) + '<span class="cn-meta">' + protoBadge(active.protocol) + ' 出口 ' + escapeHtml(active.exit_ip || '?') + ' ' + escapeHtml(active.country || '') + '</span>'
@@ -1920,6 +1930,60 @@ document.addEventListener('visibilitychange', function() {
 document.addEventListener('keydown', function(e) {
   trapModalFocus(e);
   if (e.key === 'Escape') { closeCandidateCountryPicker(); closeResultDialog(); }
+});
+
+document.addEventListener('click', function(event) {
+  var actionElement = event.target.closest ? event.target.closest('[data-action]') : null;
+  if (!actionElement) return;
+  if (actionElement.disabled || actionElement.getAttribute('aria-disabled') === 'true') {
+    if (actionElement.getAttribute('data-action') !== 'candidate-country-backdrop' &&
+        actionElement.getAttribute('data-action') !== 'result-dialog-backdrop') return;
+  }
+  switch (actionElement.getAttribute('data-action')) {
+    case 'refresh': doRefresh(actionElement); break;
+    case 'show-candidate-protocol': showCandidateProtocol(actionElement.getAttribute('data-protocol')); break;
+    case 'save-check-url': saveCheckURL(actionElement); break;
+    case 'open-node-country-picker': openNodeCountryPicker(); break;
+    case 'open-candidate-country-picker': openCandidateCountryPicker(); break;
+    case 'export-nodes': exportNodes(actionElement.getAttribute('data-format')); break;
+    case 'clear-unavailable': clearUnavailable(); break;
+    case 'delete-source':
+      if (confirm('删除来源 ' + (actionElement.getAttribute('data-source-name') || '') + '?')) postJSON('/api/sources/delete', {id:actionElement.getAttribute('data-source-id')}, reloadOrAlert);
+      break;
+    case 'preset-gfw':
+      if (confirm('用 GFW 分流预设覆盖当前所有规则?')) postJSON('/api/rules/preset-gfw', {}, reloadOrAlert);
+      break;
+    case 'move-rule': postJSON('/api/rules/move', {id:actionElement.getAttribute('data-rule-id'), delta:Number(actionElement.getAttribute('data-delta'))}, reloadOrAlert); break;
+    case 'delete-rule':
+      if (confirm('删除规则?')) postJSON('/api/rules/delete', {id:actionElement.getAttribute('data-rule-id')}, reloadOrAlert);
+      break;
+    case 'save-default-group': postJSON('/api/rules/default', {group:document.getElementById('default-group-select').value}, reloadOrAlert); break;
+    case 'delete-group':
+      if (confirm('删除分组 ' + (actionElement.getAttribute('data-group-name') || '') + '? 若仍有规则引用，请先删除或改写对应规则。')) postJSON('/api/groups/delete', {id:actionElement.getAttribute('data-group-id')}, reloadOrAlert);
+      break;
+    case 'candidate-country-backdrop': candidateCountryBackdrop(event); break;
+    case 'close-candidate-country-picker': closeCandidateCountryPicker(); break;
+    case 'result-dialog-backdrop': resultDialogBackdrop(event); break;
+    case 'close-result-dialog': closeResultDialog(); break;
+    case 'choose-candidate-protocol': chooseCandidateProtocol(actionElement.getAttribute('data-protocol') || ''); break;
+    case 'set-candidate-continent': setCandidateContinentFilter(actionElement.getAttribute('data-continent') || ''); break;
+    case 'choose-candidate-country': chooseCandidateCountry(actionElement.getAttribute('data-country') || ''); break;
+    case 'proxyip-verify': runProxyIPVerify(actionElement); break;
+    case 'copy': copyAddrFrom(actionElement); break;
+    case 'toggle-candidate-details': toggleCandidateDetails(actionElement); break;
+    case 'goto-candidate-page': gotoCandidatePage(actionElement.getAttribute('data-page')); break;
+    case 'switch-node': switchNode(actionElement); break;
+    case 'speedtest': runSpeedtest(actionElement); break;
+    case 'details':
+      if (actionElement.closest('#candidate-tbody')) toggleCandidateDetails(actionElement);
+      else toggleNodeDetails(actionElement);
+      break;
+    case 'toggle-node-details': toggleNodeDetails(actionElement); break;
+    case 'goto-node-page': gotoPage(actionElement.getAttribute('data-page')); break;
+    case 'set-auto': setAuto(); break;
+    default: return;
+  }
+  event.preventDefault();
 });
 
 syncNodePageSizeSelect();

@@ -24,7 +24,7 @@ import (
 // of being restricted to bare IPv4 entries.
 var proxyURLRegex = regexp.MustCompile(`(?i)(?:socks5|https?)://[^\s<>"']+`)
 
-const maxFetchBytes = 64 << 20 // 64MB safety cap for source downloads
+const maxFetchBytes = 16 << 20 // 16MB cap; bounded for low-memory hosts while covering the largest known feed
 
 const (
 	// The largest bundled feed currently contains roughly 230k records. Keep
@@ -252,6 +252,14 @@ func isPublicInternetIP(ip net.IP) bool {
 // tests. Production attempts are individually bounded by the client's timeout
 // and collectively bounded by policy.TotalTimeout.
 func fetchSourceWithClient(src Source, client *http.Client, policy sourceFetchPolicy) ([]Proxy, error) {
+	if isJSONSourceFormat(src.Format) {
+		proxies, err := downloadAndParseJSONSource(src, client, policy)
+		if err != nil {
+			return nil, err
+		}
+		return finalizeFetchedProxies(src, proxies)
+	}
+
 	body, err := downloadSource(src, client, policy)
 	if err != nil {
 		return nil, err
@@ -276,6 +284,19 @@ func fetchSourceWithClient(src Source, client *http.Client, policy sourceFetchPo
 		return nil, err
 	}
 
+	return finalizeFetchedProxies(src, proxies)
+}
+
+func isJSONSourceFormat(format string) bool {
+	switch format {
+	case FormatEDTJSON, FormatProxyIPJSON, FormatJSONArray:
+		return true
+	default:
+		return false
+	}
+}
+
+func finalizeFetchedProxies(src Source, proxies []Proxy) ([]Proxy, error) {
 	valid := proxies[:0]
 	for _, px := range proxies {
 		if err := validateFetchedProxyFields(px); err != nil {
@@ -298,6 +319,106 @@ func fetchSourceWithClient(src Source, client *http.Client, policy sourceFetchPo
 
 	log.Printf("[fetch] %s: %d proxies from %s", safeLogLabel(src.Name), len(proxies), safeSourceURL(src.URL))
 	return proxies, nil
+}
+
+func downloadAndParseJSONSource(src Source, client *http.Client, policy sourceFetchPolicy) ([]Proxy, error) {
+	if client == nil {
+		return nil, fmt.Errorf("fetch failed: nil HTTP client")
+	}
+	if policy.Attempts < 1 {
+		policy.Attempts = 1
+	}
+	if policy.TotalTimeout <= 0 {
+		policy.TotalTimeout = sourceFetchTotalTimeout
+	}
+	if policy.RetryDelay < 0 {
+		policy.RetryDelay = 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), policy.TotalTimeout)
+	defer cancel()
+
+	var lastErr error
+	for attempt := 1; attempt <= policy.Attempts; attempt++ {
+		proxies, retryable, err := downloadAndParseJSONSourceAttempt(ctx, src, client)
+		if err == nil {
+			return proxies, nil
+		}
+		lastErr = err
+		if !retryable || attempt == policy.Attempts {
+			return nil, fmt.Errorf("fetch failed after %d attempt(s): %w", attempt, err)
+		}
+
+		delay := policy.RetryDelay * time.Duration(1<<(attempt-1))
+		log.Printf("[fetch] %s: attempt %d/%d failed (%v), retrying in %s", safeLogLabel(src.Name), attempt, policy.Attempts, err, delay)
+		if err := waitSourceRetry(ctx, delay); err != nil {
+			return nil, fmt.Errorf("fetch failed after %d attempt(s): %w", attempt, errors.Join(lastErr, err))
+		}
+	}
+	return nil, fmt.Errorf("fetch failed: %w", lastErr)
+}
+
+type sourceStreamReader struct {
+	reader  io.Reader
+	readErr error
+}
+
+func (r *sourceStreamReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.readErr = err
+	}
+	return n, err
+}
+
+func downloadAndParseJSONSourceAttempt(ctx context.Context, src Source, client *http.Client) ([]Proxy, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URL, nil)
+	if err != nil {
+		return nil, false, safeSourceURLError("create source request", src.URL, err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, isRetryableNetworkError(err), safeSourceURLError("fetch source", src.URL, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		_ = resp.Body.Close()
+		err := fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return nil, isRetryableSourceStatus(resp.StatusCode), err
+	}
+
+	limited := &io.LimitedReader{R: resp.Body, N: maxFetchBytes + 1}
+	reader := &sourceStreamReader{reader: limited}
+	var proxies []Proxy
+	switch src.Format {
+	case FormatEDTJSON:
+		proxies, err = parseEDTJSONReader(reader)
+	case FormatProxyIPJSON:
+		proxies, err = parseProxyIPJSONReader(reader)
+	case FormatJSONArray:
+		proxies, err = parseJSONArrayReader(reader, src.Protocol)
+	default:
+		err = fmt.Errorf("unknown source format: %q", src.Format)
+	}
+	var discard [4 << 10]byte
+	_, drainErr := io.CopyBuffer(io.Discard, reader, discard[:])
+	closeErr := resp.Body.Close()
+	if limited.N == 0 {
+		return nil, false, fmt.Errorf("source response exceeds %d byte limit", maxFetchBytes)
+	}
+	if drainErr != nil {
+		return nil, isRetryableNetworkError(drainErr), safeSourceURLError("read source response", src.URL, drainErr)
+	}
+	if reader.readErr != nil {
+		return nil, isRetryableNetworkError(reader.readErr), safeSourceURLError("read source response", src.URL, reader.readErr)
+	}
+	if closeErr != nil {
+		return nil, isRetryableNetworkError(closeErr), safeSourceURLError("close source response", src.URL, closeErr)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return proxies, false, nil
 }
 
 func downloadSource(src Source, client *http.Client, policy sourceFetchPolicy) ([]byte, error) {
@@ -604,11 +725,15 @@ func parsePlainList(body []byte, protocol string) ([]Proxy, error) {
 // fyvri/fresh-proxy-list's classic/socks5.json. protocol tags every
 // resulting entry since the file itself doesn't encode one.
 func parseJSONArray(body []byte, protocol string) ([]Proxy, error) {
+	return parseJSONArrayReader(bytes.NewReader(body), protocol)
+}
+
+func parseJSONArrayReader(reader io.Reader, protocol string) ([]Proxy, error) {
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
 	if !isForwardingProtocol(protocol) {
 		return nil, fmt.Errorf("json-array source requires a protocol")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder := json.NewDecoder(reader)
 	opening, err := decoder.Token()
 	if err != nil {
 		return nil, fmt.Errorf("parse json array: %w", err)
@@ -686,7 +811,11 @@ type edtEntry struct {
 }
 
 func parseEDTJSON(body []byte) ([]Proxy, error) {
-	decoder := json.NewDecoder(bytes.NewReader(body))
+	return parseEDTJSONReader(bytes.NewReader(body))
+}
+
+func parseEDTJSONReader(reader io.Reader) ([]Proxy, error) {
+	decoder := json.NewDecoder(reader)
 	opening, err := decoder.Token()
 	if err != nil {
 		return nil, fmt.Errorf("parse EDT json: %w", err)
@@ -847,7 +976,11 @@ func (p *proxyIPPorts) UnmarshalJSON(data []byte) error {
 }
 
 func parseProxyIPJSON(body []byte) ([]Proxy, error) {
-	decoder := json.NewDecoder(bytes.NewReader(body))
+	return parseProxyIPJSONReader(bytes.NewReader(body))
+}
+
+func parseProxyIPJSONReader(reader io.Reader) ([]Proxy, error) {
+	decoder := json.NewDecoder(reader)
 	opening, err := decoder.Token()
 	if err != nil {
 		return nil, fmt.Errorf("parse proxyip json: %w", err)

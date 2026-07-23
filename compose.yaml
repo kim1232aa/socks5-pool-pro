@@ -18,8 +18,8 @@ services:
       SOCKS_PASS: "${SOCKS_PASS:-}"
       ADMIN_USER: "${ADMIN_USER:-}"
       ADMIN_PASS: "${ADMIN_PASS:-}"
-      GOMEMLIMIT: "${GOMEMLIMIT:-1200MiB}"
-      GOGC: "${GOGC:-75}"
+      GOMEMLIMIT: "${GOMEMLIMIT:-768MiB}"
+      GOGC: "${GOGC:-100}"
     command:
       - /app/socks5-pool
       - -listen
@@ -46,10 +46,10 @@ services:
     networks:
       - socks5-pool
     read_only: true
-    mem_limit: 1536m
-    mem_reservation: 512m
+    mem_limit: 1024m
+    mem_reservation: 384m
     pids_limit: 512
-    cpus: "4.0"
+    cpus: "2.0"
     ulimits:
       nofile:
         soft: 65536
@@ -66,6 +66,8 @@ services:
       - FOWNER
       - SETGID
       - SETUID
+      - CAP_KILL
+      - CAP_SYS_PTRACE
     logging:
       driver: json-file
       options:

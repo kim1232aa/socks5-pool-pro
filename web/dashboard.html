@@ -5,6 +5,7 @@
 <title>Proxy Atlas · 代理节点控制台</title>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#111827">
+<meta name="csrf-token" content="{{.CSRFToken}}">
 <link rel="stylesheet" href="/assets/dashboard.css">
 </head>
 <body>
@@ -35,8 +36,8 @@
     <div class="topbar-context"><span class="eyebrow">Control plane</span><h1 id="page-title">转发代理池</h1><p id="page-description" class="page-description">健康节点、出口状态与人工复检。</p></div>
     <div class="topbar-actions">
       <span class="api-chip" data-connection-status data-state="connecting">管理 API · 连接中</span>
+      <button id="refresh-btn" type="button" class="btn" data-action="refresh" aria-describedby="refresh-status">立即刷新节点</button>
       <span id="refresh-status" class="small refresh-status" role="status" aria-live="polite"></span>
-      <button id="refresh-btn" type="button" class="btn" onclick="doRefresh(this)" aria-describedby="refresh-status">立即刷新节点</button>
     </div>
   </header>
 
@@ -48,7 +49,7 @@
     <nav class="resource-rail" aria-label="代理资源边界">
       <a class="resource-pill active" href="#nodes"><b>01</b><span>转发池<small>可路由、可操作</small></span></a>
       <a class="resource-pill" href="#candidates"><b>02</b><span>候选库存<small>完整只读目录</small></span></a>
-      <a class="resource-pill proxyip" href="#candidates" onclick="showCandidateProtocol('proxyip')"><b>03</b><span>ProxyIP<small>Worker 外部资源</small></span></a>
+      <a class="resource-pill proxyip" href="#candidates" data-action="show-candidate-protocol" data-protocol="proxyip"><b>03</b><span>ProxyIP<small>Worker 外部资源</small></span></a>
     </nav>
   </div>
 
@@ -63,7 +64,7 @@
     <div class="checkurl-bar">
       <div class="field-copy"><span class="step-number">健康标准</span><label class="checkurl-label" for="check-url-input">通过代理可访问的目标 URL</label></div>
       <input id="check-url-input" type="url" value="{{.CheckURL}}" placeholder="https://www.google.com/generate_204">
-      <button id="check-url-save" type="button" class="btn-sm" onclick="saveCheckURL(this)">保存并全量复检</button>
+      <button id="check-url-save" type="button" class="btn-sm" data-action="save-check-url">保存并全量复检</button>
       <span class="checkurl-hint">默认 HTTPS 探针必须返回 204；自定义目标必须返回 2xx，重定向不会被当作成功。更改后旧结果立即失效并全池复检。</span>
       <span id="check-url-status" class="small" role="status" aria-live="polite"></span>
     </div>
@@ -91,8 +92,7 @@
   <div class="filter-bar">
     <label class="sr-only" for="f-text">搜索节点 IP 或地址</label>
     <input id="f-text" placeholder="搜索 IP/地址..." oninput="onFilterChange()" autocomplete="off">
-    <input id="f-country" type="hidden" value="">
-    <button id="f-country-button" type="button" class="country-picker-trigger" onclick="openNodeCountryPicker()" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">🗺️ 全部实测出口国家</button>
+    <button id="f-country-button" type="button" class="country-picker-trigger" data-action="open-node-country-picker" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">🗺️ 全部实测出口国家</button>
     <label class="sr-only" for="f-proto">按协议筛选</label>
     <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
     <label class="sr-only" for="f-sort">节点排序方式</label>
@@ -110,9 +110,8 @@
       <option value="100">每页100</option>
     </select>
     <label class="chk"><input type="checkbox" id="f-ipchanged" onchange="onFilterChange()"> 只看真正改IP的</label>
-    <label class="chk"><input type="checkbox" id="f-hide-unavail" checked onchange="onFilterChange()"> 隐藏不可用</label>
-    <button type="button" class="btn-sm" onclick="exportNodes('csv')" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
-    <button type="button" class="btn-sm" onclick="exportNodes('tme')" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
+    <button type="button" class="btn-sm" data-action="export-nodes" data-format="csv" title="按延迟升序,UTF-8 BOM,Excel 可直接打开">导出CSV</button>
+    <button type="button" class="btn-sm" data-action="export-nodes" data-format="tme" title="Telegram SOCKS 链接(仅 socks5 节点)">导出t.me</button>
     <span id="node-count" class="small" role="status" aria-live="polite"></span>
   </div>
   <div id="node-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
@@ -129,7 +128,7 @@
 
   <details class="danger-zone">
     <summary>维护与危险操作</summary>
-    <div><p id="clear-unavailable-help">不可用节点默认只隐藏并会在恢复后重新出现。仅在确认不再保留历史节点时执行永久清理。</p><button type="button" class="btn-sm danger" id="clear-unavailable-button" onclick="clearUnavailable()">永久清理全部不可用节点</button></div>
+    <div><p id="clear-unavailable-help">不可用节点默认只隐藏并会在恢复后重新出现。仅在确认不再保留历史节点时执行永久清理。</p><button type="button" class="btn-sm danger" id="clear-unavailable-button" data-action="clear-unavailable">永久清理全部不可用节点</button></div>
   </details>
 
 </div>
@@ -156,8 +155,7 @@
     </div>
     <div class="workflow-step workflow-step-region">
       <span class="workflow-index">2</span><div class="workflow-copy"><b>选择来源地区</b><small>先选大洲，再从实时数量中选择国家或地区。</small></div>
-      <input id="cf-country" type="hidden" value="">
-      <button id="cf-country-button" type="button" class="country-picker-trigger browse-region-button" onclick="openCandidateCountryPicker()" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">打开地区浏览器</button>
+      <button id="cf-country-button" type="button" class="country-picker-trigger browse-region-button" data-action="open-candidate-country-picker" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">打开地区浏览器</button>
     </div>
     <div class="proxyip-rule"><b>Cloudflare ProxyIP</b><span>只接受端口集合含 443 的记录，使用时仅取纯 IP；它不是 <code>host&amp;port=1080&amp;user=...&amp;pass=...</code> 这类 SOCKS/HTTP 链式代理参数。</span></div>
   </section>
@@ -220,8 +218,7 @@
         <input type="checkbox" aria-label="切换来源 {{.Name}}" {{if .Enabled}}checked{{end}} onchange="postJSON('/api/sources/toggle',{id:'{{.ID}}',enabled:this.checked},reloadOrAlert)">
         <span class="slider"></span>
       </label>
-    </td>
-    <td data-label="操作"><button type="button" class="btn-sm danger" onclick="if(confirm('删除来源 {{.Name}}?'))postJSON('/api/sources/delete',{id:'{{.ID}}'},reloadOrAlert)">删除</button></td>
+    <td data-label="操作"><button type="button" class="btn-sm danger" data-action="delete-source" data-source-id="{{.ID}}" data-source-name="{{.Name}}">删除</button></td>
   </tr>
   {{end}}
   </table>
@@ -253,8 +250,7 @@
   <div class="panel-heading"><div><span class="panel-kicker">Traffic Routing</span><h2>分流规则</h2><p>规则自上而下匹配；越具体的域名规则应越靠前。</p></div></div>
   <div class="preset-bar">
     <b style="color:#e2e8f0">一键 GFW 分流</b>
-    <span>国内域名/内网 直连(DIRECT),其余走代理(ANY);会覆盖当前规则。</span>
-    <button type="button" class="btn" onclick="if(confirm('用 GFW 分流预设覆盖当前所有规则?'))postJSON('/api/rules/preset-gfw',{},reloadOrAlert)">启用 GFW 分流</button>
+    <button type="button" class="btn" data-action="preset-gfw">启用 GFW 分流</button>
   </div>
   <div class="table-scroll" tabindex="0" aria-label="规则表格，可横向滚动">
   <table class="management-table">
@@ -268,9 +264,9 @@
     <td data-label="目标分组">{{$r.Group}}</td>
     <td data-label="操作">
       {{if ne $r.Type "MATCH"}}
-      <button type="button" class="btn-sm" aria-label="上移规则" onclick="postJSON('/api/rules/move',{id:'{{$r.ID}}',delta:-1},reloadOrAlert)">↑</button>
-      <button type="button" class="btn-sm" aria-label="下移规则" onclick="postJSON('/api/rules/move',{id:'{{$r.ID}}',delta:1},reloadOrAlert)">↓</button>
-      <button type="button" class="btn-sm danger" onclick="if(confirm('删除规则?'))postJSON('/api/rules/delete',{id:'{{$r.ID}}'},reloadOrAlert)">删除</button>
+      <button type="button" class="btn-sm" aria-label="上移规则" data-action="move-rule" data-rule-id="{{$r.ID}}" data-delta="-1">↑</button>
+      <button type="button" class="btn-sm" aria-label="下移规则" data-action="move-rule" data-rule-id="{{$r.ID}}" data-delta="1">↓</button>
+      <button type="button" class="btn-sm danger" data-action="delete-rule" data-rule-id="{{$r.ID}}">删除</button>
       {{else}}
       <span class="note-inline">兜底规则,不可删除/移动,可在下方修改默认分组</span>
       {{end}}
@@ -294,8 +290,7 @@
 
   <div class="default-group-editor">
     <label for="default-group-select">默认(兜底)分组:</label>
-    <select id="default-group-select" data-default="{{.DefaultGroup}}">{{range .GroupOptions}}<option value="{{.}}" {{if eq . $.DefaultGroup}}selected{{end}}>{{.}}</option>{{end}}</select>
-    <button type="button" class="btn-sm" onclick="postJSON('/api/rules/default',{group:document.getElementById('default-group-select').value},reloadOrAlert)">保存</button>
+    <button type="button" class="btn-sm" data-action="save-default-group">保存</button>
   </div>
 </div>
 
@@ -318,8 +313,7 @@
       </select>
     </td>
     <td data-label="过滤条件" class="small">{{if .Nodes}}指定节点: {{range .Nodes}}{{.}} {{end}}<br>{{end}}{{if .Countries}}国家: {{range .Countries}}{{.}} {{end}}<br>{{end}}{{if .Protocols}}协议: {{range .Protocols}}{{.}} {{end}}<br>{{end}}{{if .Sources}}来源: {{range .Sources}}{{.}} {{end}}{{end}}</td>
-    <td data-label="成员 / 当前节点">{{.Count}} / {{if .Current}}{{.Current}}{{if .Dynamic}} (每连接轮换){{end}}{{else}}-{{end}}</td>
-    <td data-label="操作"><button type="button" class="btn-sm danger" onclick="if(confirm('删除分组 {{.Name}}? 若仍有规则引用，请先删除或改写对应规则。'))postJSON('/api/groups/delete',{id:'{{.ID}}'},reloadOrAlert)">删除</button></td>
+    <td data-label="操作"><button type="button" class="btn-sm danger" data-action="delete-group" data-group-id="{{.ID}}" data-group-name="{{.Name}}">删除</button></td>
   </tr>
   {{end}}
   {{end}}
@@ -349,13 +343,12 @@
 </div>
 </main>
 </div>
-<div id="candidate-country-modal" class="country-picker-overlay" role="dialog" aria-modal="true" aria-labelledby="candidate-country-title" hidden onclick="candidateCountryBackdrop(event)">
+<div id="candidate-country-modal" class="country-picker-overlay" role="dialog" aria-modal="true" aria-labelledby="candidate-country-title" hidden data-action="candidate-country-backdrop">
   <div class="country-picker">
     <div class="country-picker-head">
       <div class="modal-step"><span>步骤 2 / 3</span><h2 id="candidate-country-title">选择来源地区</h2></div>
       <label class="sr-only" for="candidate-country-search">搜索国家代码</label>
-      <input id="candidate-country-search" placeholder="搜索国家代码或名称，如 JP / 日本" oninput="renderCandidateCountryPicker()" autocomplete="off">
-      <button type="button" class="country-picker-close" onclick="closeCandidateCountryPicker()" aria-label="关闭国家筛选">×</button>
+      <button type="button" class="country-picker-close" data-action="close-candidate-country-picker" aria-label="关闭国家筛选">×</button>
     </div>
     <div class="country-picker-body">
       <div class="country-map">
@@ -365,8 +358,8 @@
       </div>
       <div class="country-list-pane">
         <div class="country-list-toolbar">
-          <button id="country-picker-all" type="button" class="btn-sm" onclick="chooseCandidateCountry('')">全部地区</button>
-          <button type="button" class="btn-sm" onclick="chooseCandidateCountry('__unknown__')">国家未知</button>
+          <button id="country-picker-all" type="button" class="btn-sm" data-action="choose-candidate-country" data-country="">全部地区</button>
+          <button type="button" class="btn-sm" data-action="choose-candidate-country" data-country="__unknown__">国家未知</button>
           <span id="candidate-country-result-count" class="small"></span>
         </div>
         <div id="candidate-country-list" class="country-list"></div>
@@ -374,14 +367,14 @@
     </div>
   </div>
 </div>
-<div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
-<div id="result-overlay" class="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-dialog-title" hidden onclick="resultDialogBackdrop(event)">
+<div id="result-overlay" class="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-dialog-title" hidden data-action="result-dialog-backdrop">
   <div class="result-dialog">
-    <div class="result-dialog-head"><h2 id="result-dialog-title">操作结果</h2><button type="button" class="result-dialog-close" onclick="closeResultDialog()" aria-label="关闭">×</button></div>
+    <div class="result-dialog-head"><h2 id="result-dialog-title">操作结果</h2><button type="button" class="result-dialog-close" data-action="close-result-dialog" aria-label="关闭">×</button></div>
     <div id="result-dialog-body" class="result-dialog-body"></div>
-    <div class="result-dialog-foot"><button type="button" class="btn" onclick="closeResultDialog()">知道了</button></div>
+    <div class="result-dialog-foot"><button type="button" class="btn" data-action="close-result-dialog">知道了</button></div>
   </div>
 </div>
+<div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
 <script src="/assets/dashboard.js" defer></script>
 </body>
 </html>

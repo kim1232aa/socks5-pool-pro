@@ -26,6 +26,23 @@ func (b *trackingReadCloser) Close() error {
 	return nil
 }
 
+type readSizeTrackingReadCloser struct {
+	io.Reader
+	maxRead *atomic.Int32
+}
+
+func (r *readSizeTrackingReadCloser) Read(p []byte) (int, error) {
+	for {
+		current := r.maxRead.Load()
+		if int32(len(p)) <= current || r.maxRead.CompareAndSwap(current, int32(len(p))) {
+			break
+		}
+	}
+	return r.Reader.Read(p)
+}
+
+func (r *readSizeTrackingReadCloser) Close() error { return nil }
+
 func testSourceFetchPolicy(attempts int) sourceFetchPolicy {
 	return sourceFetchPolicy{
 		Attempts:     attempts,
@@ -165,6 +182,83 @@ func TestFetchSourceClosesEveryRetryResponseBody(t *testing.T) {
 	}
 }
 
+func TestFetchSourceStreamsJSONResponse(t *testing.T) {
+	const entry = `"8.8.8.8:8080"`
+	body := "[" + strings.TrimSuffix(strings.Repeat(entry+",", 10_000), ",") + "]"
+	var maxRead atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       &readSizeTrackingReadCloser{Reader: strings.NewReader(body), maxRead: &maxRead},
+			Request:    req,
+		}, nil
+	})}
+
+	proxies, err := fetchSourceWithClient(Source{
+		Name:     "streaming-json",
+		URL:      "http://source.test/list",
+		Format:   FormatJSONArray,
+		Protocol: "http",
+	}, client, testSourceFetchPolicy(1))
+	if err != nil {
+		t.Fatalf("fetchSourceWithClient() error = %v", err)
+	}
+	if len(proxies) != 1 || proxies[0].Key() != "http://8.8.8.8:8080" {
+		t.Fatalf("proxies = %#v, want one parsed proxy", proxies)
+	}
+	if got := maxRead.Load(); got > 8<<10 {
+		t.Fatalf("maximum source read buffer = %d bytes, want a bounded decoder buffer", got)
+	}
+}
+
+func TestFetchSourceStreamsEveryJSONFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  Source
+		body    string
+		wantKey string
+	}{
+		{
+			name:    "EDT",
+			source:  Source{Name: "streaming-edt", URL: "http://source.test/edt", Format: FormatEDTJSON},
+			body:    `[{"proxy":"http://8.8.8.8:8080"}]`,
+			wantKey: "http://8.8.8.8:8080",
+		},
+		{
+			name:    "ProxyIP",
+			source:  Source{Name: "streaming-proxyip", URL: "http://source.test/proxyip", Format: FormatProxyIPJSON},
+			body:    `{"data":[{"ip":"1.1.1.1","port":[443]}]}`,
+			wantKey: "proxyip://1.1.1.1:443",
+		},
+		{
+			name:    "array",
+			source:  Source{Name: "streaming-array", URL: "http://source.test/array", Format: FormatJSONArray, Protocol: "http"},
+			body:    `["8.8.4.4:8080"]`,
+			wantKey: "http://8.8.4.4:8080",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(tt.body)),
+					Request:    req,
+				}, nil
+			})}
+			proxies, err := fetchSourceWithClient(tt.source, client, testSourceFetchPolicy(1))
+			if err != nil {
+				t.Fatalf("fetchSourceWithClient() error = %v", err)
+			}
+			if len(proxies) != 1 || proxies[0].Key() != tt.wantKey {
+				t.Fatalf("proxies = %#v, want %s", proxies, tt.wantKey)
+			}
+		})
+	}
+}
+
 func TestRetryableSourceStatuses(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		if !isRetryableSourceStatus(status) {
@@ -193,7 +287,7 @@ func TestProductionSourceFetchBudgetsCoverSlowArchiveBodies(t *testing.T) {
 	if sourceFetchQueueTimeout < 5*time.Minute {
 		t.Fatalf("queue timeout = %s, want at least 5m behind four bounded slots", sourceFetchQueueTimeout)
 	}
-	if maxConcurrentSourceFetches != 4 || maxFetchBytes != 64<<20 {
+	if maxConcurrentSourceFetches != 4 || maxFetchBytes != 16<<20 {
 		t.Fatalf("resource bounds changed: concurrency=%d max-bytes=%d", maxConcurrentSourceFetches, maxFetchBytes)
 	}
 }

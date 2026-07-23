@@ -111,77 +111,6 @@ func TestDedupeCandidatesRetainsBoundedCredentialVariants(t *testing.T) {
 	}
 }
 
-func TestSampleBalancedRespectsLimitAndCoversEveryBucket(t *testing.T) {
-	var candidates []Proxy
-	buckets := []struct {
-		source   string
-		protocol string
-	}{
-		{"alpha", "http"},
-		{"alpha", "socks5"},
-		{"beta", "http"},
-		{"beta", "socks5"},
-		{"gamma", "https"},
-	}
-	for bucketIndex, bucket := range buckets {
-		for i := 0; i < 8; i++ {
-			candidates = append(candidates, Proxy{
-				IP:         fmt.Sprintf("192.0.%d.%d", bucketIndex+2, i+1),
-				Port:       fmt.Sprintf("%d", 10000+bucketIndex*100+i),
-				Protocol:   bucket.protocol,
-				SourceName: bucket.source,
-			})
-		}
-	}
-
-	const limit = 10
-	got := sampleBalanced(candidates, limit)
-	if len(got) != limit {
-		t.Fatalf("sample size = %d, want exact limit %d", len(got), limit)
-	}
-
-	covered := make(map[string]int)
-	seen := make(map[string]bool)
-	for _, px := range got {
-		bucket := px.SourceName + "\x00" + px.Protocol
-		covered[bucket]++
-		if seen[px.Key()] {
-			t.Fatalf("sample contains duplicate candidate key %q", px.Key())
-		}
-		seen[px.Key()] = true
-	}
-	for _, bucket := range buckets {
-		key := bucket.source + "\x00" + bucket.protocol
-		if covered[key] == 0 {
-			t.Errorf("bucket %q received no minimum coverage: counts=%v", key, covered)
-		}
-	}
-}
-
-func TestSampleBalancedEdgeLimits(t *testing.T) {
-	in := []Proxy{
-		{IP: "192.0.2.1", Port: "1", Protocol: "http", SourceName: "a"},
-		{IP: "192.0.2.2", Port: "2", Protocol: "http", SourceName: "a"},
-	}
-	if got := sampleBalanced(in, 0); got != nil {
-		t.Fatalf("zero limit returned %#v, want nil", got)
-	}
-	if got := sampleBalanced(in, -1); got != nil {
-		t.Fatalf("negative limit returned %#v, want nil", got)
-	}
-	if got := sampleBalanced(in, 1); len(got) != 1 {
-		t.Fatalf("limit 1 returned %d candidates", len(got))
-	}
-	got := sampleBalanced(in, len(in)+1)
-	if !reflect.DeepEqual(got, in) {
-		t.Fatalf("non-truncating sample = %#v, want input order %#v", got, in)
-	}
-	got[0].IP = "203.0.113.1"
-	if in[0].IP == got[0].IP {
-		t.Fatal("non-truncating sample aliases the caller's slice")
-	}
-}
-
 // This is an integration-level assertion around refreshPool's prioritisation,
 // rather than a copy of its slice-partitioning logic. A bounded scrape spends
 // its scarce slots discovering unseen nodes; already-known nodes are maintained
@@ -237,7 +166,7 @@ func TestRefreshPoolPrioritizesUnseenCandidateWhenCapped(t *testing.T) {
 	pool := NewProxyPool()
 	pool.Prime([]Proxy{known}, nil)
 
-	refreshPool(cfg, store, pool)
+	refreshPool(cfg, store, pool, newRefreshCoordinator())
 
 	if knownTunnels.Load() != 0 {
 		t.Errorf("known candidate consumed the unseen candidate's discovery slot (%d tunneled requests)", knownTunnels.Load())
@@ -308,7 +237,7 @@ func TestRefreshPoolRequiresThreeKnownNodeFailuresBeforeUnavailable(t *testing.T
 	}
 
 	for attempt := 1; attempt <= healthFailureThreshold; attempt++ {
-		refreshPool(cfg, store, pool)
+		refreshPool(cfg, store, pool, newRefreshCoordinator())
 		got, ok := pool.Find(known.Key())
 		if !ok {
 			t.Fatalf("known node disappeared after refresh %d", attempt)
@@ -360,7 +289,7 @@ func TestPeriodicRecheckDoesNotReviveTransparentProxy(t *testing.T) {
 		baselineExitMu.Unlock()
 	})
 
-	if _, completed := reCheckNodes(cfg, store, pool, []Proxy{px}, 1, "test-recheck", ""); !completed {
+	if _, completed := reCheckNodes(cfg, store, pool, newRefreshCoordinator(), []Proxy{px}, 1, "test-recheck", ""); !completed {
 		t.Fatal("periodic recheck did not complete")
 	}
 	got, _ := pool.Find(px.Key())
