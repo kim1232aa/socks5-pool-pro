@@ -1378,10 +1378,12 @@ function toggleNodeSelection(button) {
 
 function toggleNodePageSelection(button) {
   var rows = nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes : [];
+  var selectedOnPage = rows.filter(function(item){ return !!selectedNodeURLs[String(item.key || '')]; }).length;
+  var targetState = selectedOnPage !== rows.length; // If not all selected, select all. If all selected, unselect all.
   rows.forEach(function(node) {
     var key = String(node.key || '');
     if (!key) return;
-    if (button.checked) selectedNodeURLs[key] = String(node.proxy_url || node.addr || '');
+    if (targetState) selectedNodeURLs[key] = String(node.proxy_url || node.addr || '');
     else delete selectedNodeURLs[key];
   });
   updateNodeSelectionUI(rows);
