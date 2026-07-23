@@ -12,6 +12,7 @@ func TestExportFiltersIncludeFullPoolAndAggregateSourceNames(t *testing.T) {
 	pool := NewProxyPool()
 	changedAvailable := Proxy{
 		IP: "198.51.100.10", Port: "1080", Protocol: "socks5", Available: true,
+		Username: "export-user", Password: "export-pass",
 		ExitIP: "203.0.113.10", IPChangeKnown: true, IPChanged: true,
 		SourceName: "primary", SourceNames: []string{"feed-a", "feed-b"}, LatencyMs: 10,
 	}
@@ -52,8 +53,11 @@ func TestExportFiltersIncludeFullPoolAndAggregateSourceNames(t *testing.T) {
 		t.Fatalf("exported CSV rows = %d, want header plus four nodes", got)
 	}
 	for _, record := range records[1:] {
-		if record[1] == changedAvailable.Addr() {
-			if got, want := record[17], "feed-a, feed-b"; got != want {
+		if record[2] == changedAvailable.Addr() {
+			if got, want := record[1], changedAvailable.ConsumerURL(); got != want || record[5] != changedAvailable.Username || record[6] != changedAvailable.Password {
+				t.Fatalf("exported credentials = URL %q user %q pass %q, want %q/%q/%q", got, record[5], record[6], want, changedAvailable.Username, changedAvailable.Password)
+			}
+			if got, want := record[18], "feed-a, feed-b"; got != want {
 				t.Fatalf("aggregated source column = %q, want %q", got, want)
 			}
 			return
@@ -96,7 +100,7 @@ func TestExportCSVNeutralizesSpreadsheetFormulas(t *testing.T) {
 		t.Fatalf("CSV records = %d", len(records))
 	}
 	row := records[1]
-	for _, column := range []int{4, 5, 10, 11, 17} {
+	for _, column := range []int{5, 6, 11, 12, 18} {
 		if !strings.HasPrefix(row[column], "'") {
 			t.Errorf("column %d was not neutralized: %q", column, row[column])
 		}

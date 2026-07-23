@@ -11,6 +11,9 @@ type NodeView struct {
 	Key               string  `json:"key"`
 	Addr              string  `json:"addr"`
 	Protocol          string  `json:"protocol"`
+	ProxyURL          string  `json:"proxy_url"`
+	Username          string  `json:"username"`
+	Password          string  `json:"password"`
 	Country           string  `json:"country"`
 	City              string  `json:"city"`
 	Continent         string  `json:"continent"` // AS/NA/EU/AF/SA/OC/AN - groups the dashboard's country filter
@@ -103,6 +106,8 @@ type StatusSummary struct {
 type PoolAPIProxy struct {
 	ProxyURL string `json:"proxy_url"`
 	SocksURL string `json:"socks_url,omitempty"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 // V1ProxyView is the bounded, metadata-bearing alternative to the unbounded
@@ -111,6 +116,8 @@ type PoolAPIProxy struct {
 type V1ProxyView struct {
 	ProxyURL string  `json:"proxy_url"`
 	SocksURL string  `json:"socks_url,omitempty"`
+	Username string  `json:"username"`
+	Password string  `json:"password"`
 	Key      string  `json:"key"`
 	Protocol string  `json:"protocol"`
 	Country  string  `json:"country"`
@@ -325,7 +332,7 @@ func apiPoolProxiesFrom(proxies []Proxy) []PoolAPIProxy {
 
 		proxyURL := px.ConsumerURL()
 		view := PoolAPIProxy{
-			ProxyURL: proxyURL,
+			ProxyURL: proxyURL, Username: px.Username, Password: px.Password,
 		}
 		if px.Protocol == "socks5" {
 			view.SocksURL = proxyURL
@@ -368,7 +375,8 @@ func nodeViewOf(px Proxy, activeKey string) NodeView {
 		source = strings.Join(px.SourceNames, ", ")
 	}
 	return NodeView{
-		Key: px.Key(), Addr: px.Addr(), Protocol: px.Protocol,
+		Key: px.Key(), Addr: px.Addr(), Protocol: px.Protocol, ProxyURL: px.ConsumerURL(),
+		Username: px.Username, Password: px.Password,
 		Country: px.Country, City: px.City, Continent: px.Continent, Source: source,
 		ExitIP: px.ExitIP, IPChanged: px.IPChanged, IPChangeKnown: px.IPChangeKnown, Anonymity: px.Anonymity,
 		LatencyMs: px.LatencyMs, SpeedKbps: px.SpeedKbps,

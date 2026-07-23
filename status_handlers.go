@@ -188,7 +188,8 @@ func (s *StatusServer) v1HealthyProxySnapshot() ([]V1ProxyView, string) {
 		}
 		proxyURL := px.ConsumerURL()
 		view := V1ProxyView{
-			ProxyURL: proxyURL, Key: px.Key(), Protocol: px.Protocol,
+			ProxyURL: proxyURL, Username: px.Username, Password: px.Password,
+			Key: px.Key(), Protocol: px.Protocol,
 			Country: normalizedNodeCountry(px.Country), City: px.City,
 			Latency: px.LatencyMs, Speed: px.SpeedKbps, score: s.pool.scoreLocked(px),
 		}

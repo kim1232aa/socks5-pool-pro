@@ -317,7 +317,7 @@ func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 	if err := json.Unmarshal(pickRecorder.Body.Bytes(), &pick); err != nil {
 		t.Fatal(err)
 	}
-	if pick.Proxy.Protocol != "socks5" || pick.Proxy.Country != "JP" || pick.Proxy.ProxyURL == "" || pick.Proxy.SocksURL != pick.Proxy.ProxyURL {
+	if pick.Proxy.Protocol != "socks5" || pick.Proxy.Country != "JP" || pick.Proxy.ProxyURL == "" || pick.Proxy.SocksURL != pick.Proxy.ProxyURL || pick.Proxy.Username != "user" || pick.Proxy.Password != "pass" {
 		t.Fatalf("v1 proxy pick = %#v", pick)
 	}
 	if strings.Contains(pickRecorder.Body.String(), "telegram_url") {

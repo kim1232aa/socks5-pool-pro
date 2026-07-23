@@ -962,13 +962,13 @@ function applyCandidateView() {
     var emptyMessage = data.phase === 'loading' || data.phase === 'checking'
       ? '候选快照正在生成，完成后会自动显示。'
       : '完整候选快照尚未生成，请确认已启用来源后刷新。';
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">' + emptyMessage + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">' + emptyMessage + '</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">没有符合当前筛选条件的候选</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合当前筛选条件的候选</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
@@ -984,8 +984,10 @@ function applyCandidateView() {
     var candidateExpanded = !!expandedCandidateRows[candidateKey];
     return '<tr class="' + (candidateExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(candidateKey) + '">' +
       '<td data-label="状态">' + candidateStatusBadge(status) + '</td>' +
-      '<td data-label="协议">' + protoBadge(candidate.protocol || '') + (candidate.has_auth ? '<span class="auth-badge" title="该上游候选需要用户名/密码；凭据不会在目录接口中返回">需认证</span>' : '') + '</td>' +
-      '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(candidate.addr || '') + '" aria-label="复制候选地址">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
+      '<td data-label="协议">' + protoBadge(candidate.protocol || '') + (candidate.has_auth ? '<span class="auth-badge" title="该上游候选使用下列用户名和密码">需认证</span>' : '') + '</td>' +
+      '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.proxy_url || candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(String(candidate.proxy_url || candidate.addr || '')) + '" aria-label="复制候选代理URL">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
+      '<td data-label="用户名" class="mono mobile-secondary">' + escapeHtml(candidate.username || '') + '</td>' +
+      '<td data-label="密码" class="mono mobile-secondary">' + escapeHtml(candidate.password || '') + '</td>' +
       '<td data-label="来源标注地区">' + escapeHtml(location) + '</td>' +
       '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '<span class="candidate-readonly"> · 只读候选</span></td>' +
       '<td data-label="专用验证" class="candidate-verify-cell mobile-secondary">' + proxyIPVerifyCellHTML(candidate.key, candidate.protocol) + '</td></tr>';
@@ -1200,14 +1202,14 @@ function applyNodeView() {
   }
 
   if (!poolTotal) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
     renderNodePagers('');
     if (banner) banner.textContent = '无 (代理池为空)';
     restoreNodeFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">没有匹配的节点</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">没有匹配的节点</td></tr>';
     renderNodePagers('');
   } else {
     var html = '';
@@ -1239,7 +1241,9 @@ function applyNodeView() {
       html += '<tr class="' + (n.active ? 'active ' : '') + (n.available === false ? 'unavail ' : '') + (rowExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(n.key) + '">' +
         '<td data-label="状态">' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.source_retired ? '<span class="badge-unavail">来源已停用</span>' : (n.health_invalidated ? '<span class="badge-unavail">等待当前标准复检</span>' : (n.policy_excluded ? '<span class="badge-unavail">出口策略排除</span>' : (n.available === false ? '<span class="badge-unavail">暂不可用</span>' : '<span class="small">可用</span>'))))) + '</td>' +
         '<td data-label="协议">' + protoBadge(n.protocol) + '</td>' +
-        '<td data-label="地址(节点IP)" class="mono">' + escapeHtml(n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.addr) + '" aria-label="复制节点地址">复制</button></td>' +
+        '<td data-label="代理URL" class="mono">' + escapeHtml(n.proxy_url || n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.proxy_url || n.addr) + '" aria-label="复制完整代理URL">复制</button></td>' +
+        '<td data-label="用户名" class="mono mobile-secondary">' + escapeHtml(n.username || '') + '</td>' +
+        '<td data-label="密码" class="mono mobile-secondary">' + escapeHtml(n.password || '') + '</td>' +
         '<td data-label="出口IP" class="mobile-secondary">' + exitCell + '</td>' +
         '<td data-label="匿名" class="mobile-secondary">' + anonBadge(n.anonymity) + '</td>' +
         '<td data-label="国家/城市">' + (loc || '<span class="small">-</span>') + '</td>' +

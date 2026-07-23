@@ -18,7 +18,7 @@ import (
 const (
 	candidateCacheFilename                  = "candidate_catalog.v1.bin.gz"
 	candidateCacheMagic                     = "SPCAND01"
-	candidateCacheVersion            uint16 = 1
+	candidateCacheVersion            uint16 = 2
 	maxCandidateCacheCompressedBytes        = 96 << 20
 	maxCandidateCacheDecodedBytes           = 256 << 20
 	maxCandidateCacheStringBytes            = 96 << 20
@@ -302,6 +302,12 @@ func (e *candidateCacheEncoder) encode(snapshot *candidateSnapshot) error {
 		if err := e.string(record.addr, maxCandidateCacheStringLength); err != nil {
 			return err
 		}
+		if err := e.string(record.username, maxCandidateCacheStringLength); err != nil {
+			return err
+		}
+		if err := e.string(record.password, maxCandidateCacheStringLength); err != nil {
+			return err
+		}
 		for _, value := range []uint32{record.sourceOffset, record.countryID, record.cityID} {
 			if err := e.uint32(value); err != nil {
 				return err
@@ -474,8 +480,13 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 		if record.addr, err = d.string(maxCandidateCacheStringLength); err != nil {
 			return nil, err
 		}
-		values := []*uint32{&record.sourceOffset, &record.countryID, &record.cityID}
-		for _, destination := range values {
+		if record.username, err = d.string(maxCandidateCacheStringLength); err != nil {
+			return nil, err
+		}
+		if record.password, err = d.string(maxCandidateCacheStringLength); err != nil {
+			return nil, err
+		}
+		for _, destination := range []*uint32{&record.sourceOffset, &record.countryID, &record.cityID} {
 			if *destination, err = d.uint32(); err != nil {
 				return nil, err
 			}
@@ -677,6 +688,12 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 		record := &snapshot.records[i]
 		if len(record.addr) == 0 || len(record.addr) > maxCandidateCacheStringLength {
 			return fmt.Errorf("invalid address length at record %d", i)
+		}
+		if len(record.username) > maxCandidateCacheStringLength || len(record.password) > maxCandidateCacheStringLength {
+			return fmt.Errorf("invalid credential length at record %d", i)
+		}
+		if record.hasAuth != (record.username != "" || record.password != "") {
+			return fmt.Errorf("authentication flag does not match credentials at record %d", i)
 		}
 		host, port, err := net.SplitHostPort(record.addr)
 		if err != nil || host == "" {

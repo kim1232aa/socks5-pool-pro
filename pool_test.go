@@ -531,7 +531,7 @@ func TestUpdateWithEnabledSourcesAndPolicyMakesHardExclusionWin(t *testing.T) {
 		t.Fatalf("selection after atomic policy publication = %+v, ok=%v direct=%v; want healthy peer", selected, ok, direct)
 	}
 	views := apiPoolProxiesFrom(p.All())
-	if len(views) != 1 || views[0].ProxyURL != healthy.ConsumerURL() {
+	if len(views) != 1 || views[0].ProxyURL != healthy.ConsumerURL() || views[0].Username != healthy.Username || views[0].Password != healthy.Password {
 		t.Fatalf("healthy compatibility views after atomic policy publication = %#v", views)
 	}
 }

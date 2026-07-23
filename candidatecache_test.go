@@ -13,15 +13,15 @@ import (
 	"testing"
 )
 
-func TestCandidateCatalogCacheRoundTripRedactsCredentialsAndRestoresReadiness(t *testing.T) {
+func TestCandidateCatalogCacheRoundTripRetainsCredentialsAndRestoresReadiness(t *testing.T) {
 	dir := t.TempDir()
 	cache := newCandidateCatalogCache(dir)
 	catalog := &CandidateCatalog{}
 	catalog.SetDiskCache(cache)
 
 	const (
-		secretUser = "candidate-cache-user-must-not-leak"
-		secretPass = "candidate-cache-password-must-not-leak"
+		secretUser = "candidate-cache-user"
+		secretPass = "candidate-cache-password"
 	)
 	labels := map[string]string{"source-a-id": "Source A"}
 	proxy := Proxy{
@@ -41,8 +41,8 @@ func TestCandidateCatalogCacheRoundTripRedactsCredentialsAndRestoresReadiness(t 
 		t.Fatalf("candidate cache mode = %04o, want 0600", got)
 	}
 	decoded := readCandidateCacheDecoded(t, cache.path)
-	if bytes.Contains(decoded, []byte(secretUser)) || bytes.Contains(decoded, []byte(secretPass)) {
-		t.Fatal("candidate cache persisted upstream credentials")
+	if !bytes.Contains(decoded, []byte(secretUser)) || !bytes.Contains(decoded, []byte(secretPass)) {
+		t.Fatal("candidate cache omitted upstream credentials")
 	}
 
 	restored := &CandidateCatalog{}
@@ -61,7 +61,7 @@ func TestCandidateCatalogCacheRoundTripRedactsCredentialsAndRestoresReadiness(t 
 		t.Fatalf("restored snapshot phase=%q revision=%d records=%d", snapshot.phase, snapshot.revision, len(snapshot.records))
 	}
 	record := snapshot.records[0]
-	if !record.hasAuth || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
+	if !record.hasAuth || record.username != secretUser || record.password != secretPass || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
 		t.Fatalf("restored compact record = %#v", record)
 	}
 	snapshot.mu.RUnlock()
@@ -78,8 +78,8 @@ func TestCandidateCatalogCacheRoundTripRedactsCredentialsAndRestoresReadiness(t 
 	if page.CandidateTotal != 1 || !page.Candidates[0].HasAuth || page.Candidates[0].Country != "JP" || page.Candidates[0].City != "Tokyo" {
 		t.Fatalf("restored API page = %#v", page)
 	}
-	if strings.Contains(raw, secretUser) || strings.Contains(raw, secretPass) {
-		t.Fatal("restored candidate API leaked credentials")
+	if !strings.Contains(raw, secretUser) || !strings.Contains(raw, secretPass) || page.Candidates[0].Username != secretUser || page.Candidates[0].Password != secretPass || page.Candidates[0].ProxyURL != proxy.ConsumerURL() {
+		t.Fatalf("restored candidate API omitted credentials: %#v raw=%s", page.Candidates[0], raw)
 	}
 
 	next := restored.begin([]Proxy{proxy}, labels, nil, 0)

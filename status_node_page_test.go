@@ -28,6 +28,13 @@ func TestNodesPageFiltersSortsBoundsAndKeepsLegacyNodesArray(t *testing.T) {
 	if got, want := len(legacyNodes), len(nodes); got != want {
 		t.Fatalf("legacy /api/nodes length = %d, want %d", got, want)
 	}
+	for _, view := range legacyNodes {
+		if proxy, ok := nodes["socks-us"]; ok && view.Key == proxy.Key() {
+			if view.ProxyURL != proxy.ConsumerURL() || view.Username != proxy.Username || view.Password != proxy.Password {
+				t.Fatalf("legacy node credentials = %#v, want URL %q and original fields", view, proxy.ConsumerURL())
+			}
+		}
+	}
 
 	page := getNodePage(t, handler, "/api/nodes/page?page=2&page_size=2&sort=latency")
 	if page.Page != 2 || page.PageSize != 2 {

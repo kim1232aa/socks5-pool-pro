@@ -37,6 +37,9 @@ func TestStatusSummaryKeepsIPPoolCompatibilityContract(t *testing.T) {
 	if got, want := summary.Proxies[0].SocksURL, summary.ActiveProxy; got != want {
 		t.Fatalf("socks_url = %q, want %q", got, want)
 	}
+	if got := summary.Proxies[0]; got.Username != "user@example" || got.Password != "pa:ss" {
+		t.Fatalf("status proxy omitted credentials: %#v", got)
+	}
 	if got, want := summary.Proxies[1].ProxyURL, "http://198.51.100.11:8080"; got != want {
 		t.Fatalf("http proxy_url = %q, want %q", got, want)
 	}
@@ -65,7 +68,7 @@ func TestStatusSummaryKeepsIPPoolCompatibilityContract(t *testing.T) {
 	}
 	for _, proxy := range proxyWire.Proxies {
 		for field := range proxy {
-			if field != "proxy_url" && field != "socks_url" {
+			if field != "proxy_url" && field != "socks_url" && field != "username" && field != "password" {
 				t.Fatalf("unexpected field %q in /api/status proxies", field)
 			}
 		}

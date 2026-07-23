@@ -261,14 +261,14 @@ func TestDashboardProxyIPVerifyIsExplicitResourceOnlyAction(t *testing.T) {
 }
 
 func TestDashboardCandidateVerifyColumnKeepsTableShape(t *testing.T) {
-	if !strings.Contains(dashboardClientSource(), `<thead><tr><th>状态</th><th>协议</th><th>候选地址</th><th>来源标注地区</th><th>来源</th><th>专用验证</th></tr></thead>`) {
-		t.Fatal("candidate verify header is missing")
+	if !strings.Contains(dashboardClientSource(), `<thead><tr><th>状态</th><th>协议</th><th>候选地址</th><th>用户名</th><th>密码</th><th>来源标注地区</th><th>来源</th><th>专用验证</th></tr></thead>`) {
+		t.Fatal("candidate verify and credential headers are missing")
 	}
-	if strings.Contains(dashboardClientSource(), `colspan="5"`) {
-		t.Fatal("candidate empty rows still use the old five-column colspan")
+	if strings.Contains(dashboardClientSource(), `colspan="5"`) || strings.Contains(dashboardClientSource(), `colspan="6"`) {
+		t.Fatal("candidate empty rows still use a pre-credential colspan")
 	}
-	if got := strings.Count(dashboardClientSource(), `colspan="6"`); got != 3 {
-		t.Fatalf("candidate six-column empty-state colspan count = %d, want 3", got)
+	if got := strings.Count(dashboardClientSource(), `colspan="8"`); got != 3 {
+		t.Fatalf("candidate eight-column empty-state colspan count = %d, want 3", got)
 	}
 }
 
@@ -322,5 +322,21 @@ func TestDashboardManualVerifyHandlesUnknownLabelMatch(t *testing.T) {
 	legacyIndex := strings.Index(dashboardClientSource(), legacyGuard)
 	if unknownIndex < 0 || legacyIndex < 0 || unknownIndex > legacyIndex {
 		t.Fatal("label_match_known=false must take precedence over the legacy label_matched branch")
+	}
+}
+
+func TestDashboardShowsAndCopiesUpstreamCredentials(t *testing.T) {
+	for _, want := range []string{
+		`<th>代理URL</th><th>用户名</th><th>密码</th>`,
+		`String(candidate.proxy_url || candidate.addr || '')`,
+		`escapeHtml(candidate.username || '')`,
+		`escapeHtml(candidate.password || '')`,
+		`escapeHtml(n.proxy_url || n.addr)`,
+		`escapeHtml(n.username || '')`,
+		`escapeHtml(n.password || '')`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing upstream credential display contract %q", want)
+		}
 	}
 }

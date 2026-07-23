@@ -1012,6 +1012,10 @@ func mergeFreshProxy(existing, fresh Proxy) Proxy {
 	fresh.SpeedTestedAt = existing.SpeedTestedAt
 	fresh.SpeedBytes = existing.SpeedBytes
 	fresh.SpeedDurationMs = existing.SpeedDurationMs
+	if fresh.Username == "" {
+		fresh.Username = existing.Username
+		fresh.Password = existing.Password
+	}
 
 	if fresh.ExitIP == "" {
 		fresh.ExitIP = existing.ExitIP

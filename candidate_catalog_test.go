@@ -12,7 +12,7 @@ import (
 	"unsafe"
 )
 
-func TestCandidateCatalogPageClassificationFilteringAndRedaction(t *testing.T) {
+func TestCandidateCatalogPageClassificationFilteringAndCredentials(t *testing.T) {
 	available := Proxy{IP: "192.0.2.1", Port: "8080", Protocol: "http", Available: true}
 	unavailable := Proxy{IP: "192.0.2.1", Port: "8080", Protocol: "socks5", Available: false}
 	failed := Proxy{
@@ -36,8 +36,8 @@ func TestCandidateCatalogPageClassificationFilteringAndRedaction(t *testing.T) {
 	if page.CandidateTotal != 6 || page.FilteredTotal != 6 || page.Phase != "complete" {
 		t.Fatalf("catalog page totals/phase = %#v", page)
 	}
-	if strings.Contains(raw, "catalog-user") || strings.Contains(raw, "do-not-leak") {
-		t.Fatalf("candidate response leaked upstream credentials: %s", raw)
+	if !strings.Contains(raw, "catalog-user") || !strings.Contains(raw, "do-not-leak") {
+		t.Fatalf("candidate response omitted upstream credentials: %s", raw)
 	}
 	byKey := make(map[string]CandidateView)
 	for _, candidate := range page.Candidates {
@@ -51,6 +51,9 @@ func TestCandidateCatalogPageClassificationFilteringAndRedaction(t *testing.T) {
 	assertCandidateStatus(t, byKey, resource.Key(), "resource")
 	if !byKey[failed.Key()].HasAuth {
 		t.Fatal("authenticated candidate did not expose has_auth=true")
+	}
+	if got, want := byKey[failed.Key()].ProxyURL, failed.ConsumerURL(); got != want || byKey[failed.Key()].Username != failed.Username || byKey[failed.Key()].Password != failed.Password {
+		t.Fatalf("authenticated candidate credentials = %#v, want URL %q and original fields", byKey[failed.Key()], want)
 	}
 	if byKey[resource.Key()].Routable {
 		t.Fatal("proxyip resource was marked routable")
@@ -277,8 +280,8 @@ func TestCandidateCatalogMetadataAndAuthFallbackOnlyForFailedAttribution(t *test
 	partialPool.candidates.complete(first, nil, nil, nil)
 	partialPool.candidates.begin([]Proxy{current}, labels, map[string]bool{"old-id": true}, 1)
 	partialPage, raw := getCandidatePage(t, NewStatusServer(partialPool, &ConfigStore{}).handler(), "/api/candidates/page")
-	if !partialPage.Candidates[0].HasAuth || partialPage.Candidates[0].Country != "JP" || strings.Contains(raw, "secret") {
-		t.Fatalf("failed-attribution fallback = %#v raw=%s", partialPage.Candidates[0], raw)
+	if got := partialPage.Candidates[0]; !got.HasAuth || got.Country != "JP" || got.ProxyURL != old.ConsumerURL() || got.Username != old.Username || got.Password != old.Password || !strings.Contains(raw, "secret") {
+		t.Fatalf("failed-attribution fallback = %#v raw=%s", got, raw)
 	}
 
 	fullPool := NewProxyPool()
@@ -385,9 +388,9 @@ func TestCandidateCountryContractAcceptsOnlyASCIIISO2(t *testing.T) {
 	}
 }
 
-func TestCandidateRecordStaysCompact(t *testing.T) {
-	if size := unsafe.Sizeof(candidateRecord{}); size > 64 {
-		t.Fatalf("candidateRecord is %d bytes; compact catalog would exceed its memory budget", size)
+func TestCandidateRecordStaysBounded(t *testing.T) {
+	if size := unsafe.Sizeof(candidateRecord{}); size > 96 {
+		t.Fatalf("candidateRecord is %d bytes; credential-bearing catalog exceeded its memory budget", size)
 	}
 }
 

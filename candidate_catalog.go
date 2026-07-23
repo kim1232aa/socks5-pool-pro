@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -43,13 +44,14 @@ func (s CandidateStatus) String() string {
 	}
 }
 
-// candidateRecord is intentionally compact. At roughly 56 bytes on amd64 plus the
-// address string, 500k records remain comfortably below the memory cost of
-// retaining 500k full Proxy values (which contain many strings and a slice).
+// candidateRecord keeps per-candidate connection data compact while retaining
+// the exact upstream credentials needed by API, dashboard, and cache consumers.
 // Repeated source/protocol/country/city values are interned in snapshot-level
 // dictionaries, while multi-source attribution uses one flat uint32 array.
 type candidateRecord struct {
 	addr         string
+	username     string
+	password     string
 	sourceOffset uint32
 	countryID    uint32
 	cityID       uint32
@@ -397,6 +399,8 @@ func buildCandidateSnapshot(candidates []Proxy, sourceLabels map[string]string) 
 		}
 		record := candidateRecord{
 			addr:       addr,
+			username:   px.Username,
+			password:   px.Password,
 			protocolID: protocolID,
 			countryID:  internCountry(px.Country),
 			cityID:     internCity(px.City),
@@ -765,17 +769,20 @@ func mergeCandidateSnapshots(previous, current *candidateSnapshot, failedSources
 			builder.appendRecord(current, newRecord, nil)
 			j++
 		default:
-			// The address was seen this cycle, so carry its new last-seen time,
-			// authentication flag and source attribution. Preserve a prior
-			// check outcome until this cycle's bounded checker reaches it.
+			// The address was seen this cycle, so carry its new last-seen time
+			// and source attribution. Preserve a prior check outcome until this
+			// cycle's bounded checker reaches it. If a failed old source remains
+			// attributed and the current declarations lack credentials, retain the
+			// old connection-ready credential pair with its authentication flag.
 			merged := newRecord
 			merged.status = oldRecord.status
 			merged.checkedUnix = oldRecord.checkedUnix
 			oldAttributionRetained := recordHasSourceIn(previous, oldRecord, failedSources)
-			// Authentication cannot be attributed to one source in the compact
-			// record. Be conservative only while a failed old attribution is
-			// retained; otherwise the current successful-source declaration wins.
-			merged.hasAuth = newRecord.hasAuth || oldAttributionRetained && oldRecord.hasAuth
+			if oldAttributionRetained && merged.username == "" && oldRecord.username != "" {
+				merged.username = oldRecord.username
+				merged.password = oldRecord.password
+			}
+			merged.hasAuth = merged.username != "" || merged.password != ""
 			if oldAttributionRetained && newRecord.countryID == 0 && oldRecord.countryID != 0 {
 				merged.countryID = oldRecord.countryID
 				merged.continent = oldRecord.continent
@@ -968,6 +975,9 @@ type CandidateView struct {
 	Key             string   `json:"key"`
 	Addr            string   `json:"addr"`
 	Protocol        string   `json:"protocol"`
+	ProxyURL        string   `json:"proxy_url"`
+	Username        string   `json:"username"`
+	Password        string   `json:"password"`
 	Source          string   `json:"source"`
 	SourceNames     []string `json:"source_names"`
 	Country         string   `json:"country"`
@@ -1172,8 +1182,11 @@ func (s *candidateSnapshot) view(record candidateRecord, status CandidateStatus)
 	}
 	city := s.cities[record.cityID]
 	continent := decodeContinent(record.continent)
+	host, port, _ := net.SplitHostPort(record.addr)
+	proxyURL := (Proxy{IP: host, Port: port, Protocol: protocol, Username: record.username, Password: record.password}).ConsumerURL()
 	view := CandidateView{
-		Key: protocol + "://" + record.addr, Addr: record.addr, Protocol: protocol,
+		Key: protocol + "://" + record.addr, Addr: record.addr, Protocol: protocol, ProxyURL: proxyURL,
+		Username: record.username, Password: record.password,
 		SourceNames: sources, Country: country, City: city, Continent: continent,
 		SourceCountry: country, SourceCity: city, SourceContinent: continent,
 		Status: status.String(), Known: status == candidateKnownAvailable || status == candidateKnownUnavailable,
