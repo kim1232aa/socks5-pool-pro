@@ -27,6 +27,26 @@ func TestDashboardUsesSeparateEmbeddedAssets(t *testing.T) {
 	}
 }
 
+func TestDashboardPaginationCountryControlsMatchScriptContract(t *testing.T) {
+	for _, id := range []string{"f-country", "cf-country"} {
+		if !strings.Contains(dashboardHTML, `id="`+id+`"`) {
+			t.Fatalf("dashboard template is missing pagination country state control %q", id)
+		}
+		if !strings.Contains(string(dashboardJS), "requiredControl('"+id+"')") {
+			t.Fatalf("dashboard script is missing required pagination control reference %q", id)
+		}
+	}
+	for _, want := range []string{
+		"function requiredControl(id)",
+		"Promise.resolve().then(function() { return fetchJSON(nodePageURL(), options); })",
+		"Promise.resolve().then(function() { return fetchJSON(candidatePageURL(), options); })",
+	} {
+		if !strings.Contains(string(dashboardJS), want) {
+			t.Fatalf("dashboard script is missing diagnosable pagination request contract %q", want)
+		}
+	}
+}
+
 func TestDashboardCandidateCountsUpdateActiveSummary(t *testing.T) {
 	for _, want := range []string{
 		"setText('candidate-matching', formatCount(total));",

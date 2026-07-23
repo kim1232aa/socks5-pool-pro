@@ -1610,21 +1610,27 @@ function requestStatus() {
 }
 
 var queuedNodeRefresh = false;
+function requiredControl(id) {
+  var control = document.getElementById(id);
+  if (!control) throw new Error('缺少必需的页面控件 #' + id);
+  return control;
+}
+
 function nodePageURL() {
   var q = [
     'page=' + encodeURIComponent(nodePage),
     'page_size=' + encodeURIComponent(nodePageSize)
   ];
-  var text = (document.getElementById('f-text').value || '').trim();
-  var country = document.getElementById('f-country').value;
-  var protocol = document.getElementById('f-proto').value;
-  var sort = document.getElementById('f-sort').value;
+  var text = (requiredControl('f-text').value || '').trim();
+  var country = requiredControl('f-country').value;
+  var protocol = requiredControl('f-proto').value;
+  var sort = requiredControl('f-sort').value;
   if (text) q.push('search=' + encodeURIComponent(text));
   if (country) q.push('country=' + encodeURIComponent(country));
   if (protocol) q.push('protocol=' + encodeURIComponent(protocol));
   if (sort) q.push('sort=' + encodeURIComponent(sort));
-  if (document.getElementById('f-ipchanged').checked) q.push('only_changed=1');
-  if (document.getElementById('f-hide-unavail').checked) q.push('available=1');
+  if (requiredControl('f-ipchanged').checked) q.push('only_changed=1');
+  if (requiredControl('f-hide-unavail').checked) q.push('available=1');
   if (nodePage > 1 && nodeSnapshotID) q.push('snapshot_id=' + encodeURIComponent(nodeSnapshotID));
   return '/api/nodes/page?' + q.join('&');
 }
@@ -1641,7 +1647,7 @@ function requestNodes(force) {
   var options = nodesAbortController ? {signal:nodesAbortController.signal} : undefined;
   var requestGeneration = nodeQueryGeneration;
   if (!nodesLoaded) setListNotice('node-notice', 'loading', '正在获取代理池分页数据…');
-  nodesRequest = fetchJSON(nodePageURL(), options)
+  nodesRequest = Promise.resolve().then(function() { return fetchJSON(nodePageURL(), options); })
     .then(function(pageData) {
       if (canFetchNodes() && requestGeneration === nodeQueryGeneration) {
         lastNodesFetchAt = Date.now();
@@ -1689,11 +1695,11 @@ function candidatePageURL() {
     'page=' + encodeURIComponent(candidatePage),
     'page_size=' + encodeURIComponent(candidatePageSize)
   ];
-  var text = (document.getElementById('cf-text').value || '').trim();
-  var source = document.getElementById('cf-source').value;
-  var protocol = document.getElementById('cf-proto').value;
-  var country = document.getElementById('cf-country').value;
-  var status = document.getElementById('cf-status').value;
+  var text = (requiredControl('cf-text').value || '').trim();
+  var source = requiredControl('cf-source').value;
+  var protocol = requiredControl('cf-proto').value;
+  var country = requiredControl('cf-country').value;
+  var status = requiredControl('cf-status').value;
   if (text) q.push('search=' + encodeURIComponent(text));
   if (source) q.push('source=' + encodeURIComponent(source));
   if (protocol) q.push('protocol=' + encodeURIComponent(protocol));
@@ -1722,7 +1728,7 @@ function requestCandidates(force) {
   var options = candidatesAbortController ? {signal:candidatesAbortController.signal} : undefined;
   var requestGeneration = candidateQueryGeneration;
   if (!candidatesLoaded) setListNotice('candidate-notice', 'loading', '正在查询完整候选快照，请稍候…');
-  candidatesRequest = fetchJSON(candidatePageURL(), options)
+  candidatesRequest = Promise.resolve().then(function() { return fetchJSON(candidatePageURL(), options); })
     .then(function(pageData) {
       if (canFetchCandidates() && requestGeneration === candidateQueryGeneration) {
         lastCandidatesFetchAt = Date.now();

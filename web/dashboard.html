@@ -94,6 +94,7 @@
     <label class="sr-only" for="f-text">搜索节点 IP 或地址</label>
     <input id="f-text" placeholder="搜索 IP/地址..." oninput="onFilterChange()" autocomplete="off">
     <button id="f-country-button" type="button" class="country-picker-trigger" data-action="open-node-country-picker" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">🗺️ 全部实测出口国家</button>
+    <input id="f-country" type="hidden" value="">
     <label class="sr-only" for="f-proto">按协议筛选</label>
     <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
     <label class="sr-only" for="f-sort">节点排序方式</label>
@@ -164,6 +165,7 @@
   <div class="filter-bar" aria-label="候选目录筛选">
     <label class="sr-only" for="cf-text">搜索候选地址或来源</label>
     <input id="cf-text" placeholder="搜索 IP / 地址 / 来源..." oninput="onCandidateFilterChange()" autocomplete="off">
+    <input id="cf-country" type="hidden" value="">
     <label class="sr-only" for="cf-source">按来源筛选候选</label>
     <select id="cf-source" onchange="onCandidateFilterChange()"><option value="">全部来源</option></select>
     <label class="sr-only" for="cf-proto">按协议筛选候选</label>
