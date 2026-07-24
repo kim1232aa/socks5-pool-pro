@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -36,15 +35,15 @@ func auditTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	return client, server
 }
 
-func TestAuditExternalClientSpoofsLoopbackHost(t *testing.T) {
+func TestAuditExternalClientCannotSpoofLoopbackHost(t *testing.T) {
 	handler := NewStatusServer(NewProxyPool(), &ConfigStore{}).handler()
 	req := httptest.NewRequest(http.MethodGet, "http://management.example/api/status?compact=1", nil)
 	req.Host = "localhost:8080"
 	req.RemoteAddr = "203.0.113.77:54321"
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("external request with spoofed loopback Host = %d, expected current bypass 200", rec.Code)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("external request with spoofed loopback Host = %d, want %d", rec.Code, http.StatusForbidden)
 	}
 }
 
@@ -55,10 +54,10 @@ func TestAuditSuccessfulEmptySourceDeletesLastGoodInventory(t *testing.T) {
 	}))
 	defer server.Close()
 
-	source := Source{ID: "source-a", Name: "Source A", URL: server.URL, Format: FormatJSONArray, Protocol: "http"}
+	source := Source{ID: "source-a", Name: "Source A", URL: server.URL, Format: FormatJSONArray, Protocol: "http", AllowEmpty: true}
 	proxies, err := fetchSourceWithClient(source, server.Client(), testSourceFetchPolicy(1))
 	if err != nil || len(proxies) != 0 {
-		t.Fatalf("empty source result = %d, %v; want zero proxies and nil error", len(proxies), err)
+		t.Fatalf("authoritative empty source result = %d, %v; want zero proxies and nil error", len(proxies), err)
 	}
 
 	catalog := &CandidateCatalog{}
@@ -84,12 +83,12 @@ func TestAuditConfigMutationSurvivesPersistenceFailure(t *testing.T) {
 	if err := store.SetCheckURL(changed); err == nil {
 		t.Fatal("SetCheckURL unexpectedly persisted over a directory")
 	}
-	if got := store.CheckURL(); got != changed {
-		t.Fatalf("in-memory URL = %q, want failed mutation to remain reproducibly applied", got)
+	if got := store.CheckURL(); got == changed {
+		t.Fatalf("in-memory URL = %q; failed mutation must not escape its transactional write", got)
 	}
 }
 
-func TestAuditDefaultHealthPassesPort80OnlyProxy(t *testing.T) {
+func TestAuditDefaultHTTPSHealthRejectsPort80OnlyProxy(t *testing.T) {
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect || r.Host != "www.google.com:80" {
 			http.Error(w, "CONNECT target denied", http.StatusForbidden)
@@ -111,15 +110,15 @@ func TestAuditDefaultHealthPassesPort80OnlyProxy(t *testing.T) {
 	defer proxyServer.Close()
 	u, _ := url.Parse(proxyServer.URL)
 	px := Proxy{IP: u.Hostname(), Port: u.Port(), Protocol: "http"}
-	if !checkURL(px, defaultCheckURL, time.Second) {
-		t.Fatal("port-80-only proxy did not pass current default HTTP health check")
+	if checkURL(px, defaultCheckURL, time.Second) {
+		t.Fatal("port-80-only proxy unexpectedly passed default HTTPS health check")
 	}
-	if checkURL(px, "https://example.com/", time.Second) {
-		t.Fatal("port-80-only proxy unexpectedly forwarded HTTPS")
+	if !checkURL(px, legacyDefaultCheckURL, time.Second) {
+		t.Fatal("port-80-only proxy did not pass explicit HTTP health check")
 	}
 }
 
-func TestAuditHTTPConnectRelayDoesNotPropagateClientHalfClose(t *testing.T) {
+func TestAuditHTTPConnectRelayPropagatesClientHalfClose(t *testing.T) {
 	client, relayLeft := auditTCPPair(t)
 	relayRight, target := auditTCPPair(t)
 	defer client.Close()
@@ -138,12 +137,10 @@ func TestAuditHTTPConnectRelayDoesNotPropagateClientHalfClose(t *testing.T) {
 	if _, err := io.ReadFull(target, got); err != nil {
 		t.Fatal(err)
 	}
-	_ = target.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_ = target.SetReadDeadline(time.Now().Add(time.Second))
 	var one [1]byte
-	if _, err := target.Read(one[:]); err == io.EOF {
-		t.Fatal("HTTP CONNECT relay unexpectedly propagated EOF")
-	} else if err == nil {
-		t.Fatal("unexpected extra tunneled byte")
+	if _, err := target.Read(one[:]); err != io.EOF {
+		t.Fatalf("relay did not propagate client half-close: %v", err)
 	}
 
 	_ = target.Close()
@@ -165,44 +162,12 @@ func TestAuditDedupeDiscardsAlternateCredentials(t *testing.T) {
 	}
 }
 
-func TestAuditSOCKSDomainInjectsHTTPConnectHeaders(t *testing.T) {
+func TestAuditSOCKSDomainRejectsHTTPConnectHeaders(t *testing.T) {
 	domain := "example.com HTTP/1.1\r\nX-Audit: injected\r\nIgnore"
 	wire := []byte{socks5Version, cmdConnect, 0, atypDomain, byte(len(domain))}
 	wire = append(wire, []byte(domain)...)
 	wire = append(wire, 0x01, 0xbb) // port 443
-	target, _, err := readConnectRequest(bytes.NewReader(wire))
-	if err != nil {
-		t.Fatalf("current SOCKS parser rejected control characters: %v", err)
-	}
-
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	received := make(chan string, 1)
-	go func() {
-		conn, _ := listener.Accept()
-		if conn == nil {
-			return
-		}
-		defer conn.Close()
-		reader := bufio.NewReader(conn)
-		var raw strings.Builder
-		for {
-			line, readErr := reader.ReadString('\n')
-			raw.WriteString(line)
-			if readErr != nil || line == "\r\n" {
-				break
-			}
-		}
-		received <- raw.String()
-		_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"))
-	}()
-	host, port, _ := net.SplitHostPort(listener.Addr().String())
-	_, _ = DialUpstream(Proxy{IP: host, Port: port, Protocol: "http"}, target, time.Second)
-	raw := <-received
-	if !strings.Contains(raw, "\r\nX-Audit: injected\r\n") {
-		t.Fatalf("raw CONNECT request did not contain injected header: %q", raw)
+	if _, _, err := readConnectRequest(bytes.NewReader(wire)); err == nil {
+		t.Fatal("SOCKS parser accepted domain control characters")
 	}
 }
