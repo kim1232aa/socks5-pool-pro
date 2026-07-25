@@ -1378,8 +1378,7 @@ function toggleNodeSelection(button) {
 
 function toggleNodePageSelection(button) {
   var rows = nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes : [];
-  var selectedOnPage = rows.filter(function(item){ return !!selectedNodeURLs[String(item.key || '')]; }).length;
-  var targetState = selectedOnPage !== rows.length; // If not all selected, select all. If all selected, unselect all.
+  var targetState = !!button.checked;
   rows.forEach(function(node) {
     var key = String(node.key || '');
     if (!key) return;
@@ -2407,11 +2406,11 @@ document.addEventListener('click', function(event) {
     case 'set-candidate-continent': setCandidateContinentFilter(actionElement.getAttribute('data-continent') || ''); break;
     case 'choose-candidate-country': chooseCandidateCountry(actionElement.getAttribute('data-country') || ''); break;
     case 'proxyip-verify': runProxyIPVerify(actionElement); break;
-    case 'node-select': toggleNodeSelection(actionElement); break;
-    case 'node-select-page': toggleNodePageSelection(actionElement); break;
+    case 'node-select': toggleNodeSelection(actionElement); return;
+    case 'node-select-page': toggleNodePageSelection(actionElement); return;
     case 'copy-selected-nodes': copySelectedNodes(actionElement); break;
-    case 'candidate-select': toggleCandidateSelection(actionElement); break;
-    case 'candidate-select-page': toggleCandidatePageSelection(actionElement); break;
+    case 'candidate-select': toggleCandidateSelection(actionElement); return;
+    case 'candidate-select-page': toggleCandidatePageSelection(actionElement); return;
     case 'candidate-speedtest': speedtestCandidates([rowKey(actionElement)]); break;
     case 'candidate-speedtest-selected': speedtestCandidates(selectedCandidateList()); break;
     case 'candidate-delete': deleteCandidate(actionElement); break;
@@ -2431,10 +2430,13 @@ document.addEventListener('click', function(event) {
     case 'goto-node-page': gotoPage(actionElement.getAttribute('data-page')); break;
     case 'refresh-listeners': requestListeners(true); break;
     case 'edit-listener': editListener(actionElement); break;
-    case 'toggle-listener': updateListenerEnabled(actionElement); break;
+    case 'toggle-listener': updateListenerEnabled(actionElement); return;
     case 'delete-listener': deleteListener(actionElement); break;
     case 'cancel-listener-edit': resetListenerForm(); break;
     default: return;
+  }
+  if (actionElement && (actionElement.tagName === 'INPUT' || actionElement.tagName === 'SELECT' || actionElement.tagName === 'TEXTAREA' || actionElement.tagName === 'LABEL' || actionElement.type === 'checkbox' || actionElement.type === 'radio')) {
+    return;
   }
   event.preventDefault();
 });

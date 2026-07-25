@@ -421,3 +421,18 @@ func TestDashboardShowsAndCopiesUpstreamCredentials(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardSelectionControlsAndColumnsContract(t *testing.T) {
+	for _, want := range []string{
+		`<th><input id="node-select-page" type="checkbox" data-action="node-select-page" aria-label="选择本页节点"></th><th>状态</th><th>协议</th>`,
+		`case 'node-select': toggleNodeSelection(actionElement); return;`,
+		`case 'node-select-page': toggleNodePageSelection(actionElement); return;`,
+		`case 'candidate-select': toggleCandidateSelection(actionElement); return;`,
+		`case 'candidate-select-page': toggleCandidatePageSelection(actionElement); return;`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard selection controls or column alignment violates contract: missing %q", want)
+		}
+	}
+}
+
