@@ -107,25 +107,17 @@ func (cs *ConfigStore) AddRule(r Rule) (Rule, error) {
 	if r.Type == RuleGeosite && !validGeositeCategory(r.Value) {
 		return Rule{}, fmt.Errorf("GEOSITE value must be %q or %q", GeositeCN, GeositeGFW)
 	}
-	if r.Group == "" {
+	if strings.TrimSpace(r.Group) == "" {
 		return Rule{}, fmt.Errorf("group is required")
-	}
-	r.Group = canonicalReservedGroup(r.Group)
-	// Normalize a dynamic country target ("country:jp" -> "COUNTRY:JP") so it
-	// matches the uppercase ISO codes stored on nodes. Any other group name
-	// is passed through and resolved (or gracefully fallen back) at dial time.
-	if cc, ok := parseCountryGroup(r.Group); ok {
-		if !validCountryGroupCode(cc) {
-			return Rule{}, fmt.Errorf("country group must use a two-letter ASCII country code")
-		}
-		r.Group = countryGroupPrefix + strings.ToUpper(cc)
 	}
 	r.ID = generateID("rule")
 
 	err := cs.mutate(func(c *PoolConfig) error {
-		if !routingTargetExists(c, r.Group) {
+		resolved, ok := resolveGroupReference(r.Group, c.Groups)
+		if !ok {
 			return fmt.Errorf("routing target does not exist: %s", r.Group)
 		}
+		r.Group = resolved.canonical
 		insertAt := len(c.Rules)
 		for i, existing := range c.Rules {
 			if existing.Type == RuleMatch {
@@ -186,32 +178,21 @@ func (cs *ConfigStore) MoveRule(id string, delta int) error {
 // MATCH rule's target group - i.e. the fallback for any traffic that
 // doesn't hit a more specific rule.
 func (cs *ConfigStore) SetDefaultGroup(group string) error {
-	if group == "" {
+	if strings.TrimSpace(group) == "" {
 		return fmt.Errorf("group is required")
 	}
-	group = canonicalReservedGroup(group)
-	// Same normalization AddRule applies - without it, a non-canonically-
-	// cased "country:jp" passed directly via the API wouldn't match
-	// parseCountryGroup's case-sensitive "COUNTRY:" prefix check, and the
-	// default route would silently fall back to the entire pool instead of
-	// the intended country.
-	if cc, ok := parseCountryGroup(group); ok {
-		if !validCountryGroupCode(cc) {
-			return fmt.Errorf("country group must use a two-letter ASCII country code")
-		}
-		group = countryGroupPrefix + strings.ToUpper(cc)
-	}
 	return cs.mutate(func(c *PoolConfig) error {
-		if !routingTargetExists(c, group) {
+		resolved, ok := resolveGroupReference(group, c.Groups)
+		if !ok {
 			return fmt.Errorf("routing target does not exist: %s", group)
 		}
 		for i, r := range c.Rules {
 			if r.Type == RuleMatch {
-				c.Rules[i].Group = group
+				c.Rules[i].Group = resolved.canonical
 				return nil
 			}
 		}
-		c.Rules = append(c.Rules, Rule{ID: generateID("rule"), Type: RuleMatch, Group: group})
+		c.Rules = append(c.Rules, Rule{ID: generateID("rule"), Type: RuleMatch, Group: resolved.canonical})
 		return nil
 	})
 }
@@ -300,12 +281,12 @@ func (cs *ConfigStore) DeleteGroup(id string) error {
 		for i, g := range c.Groups {
 			if g.ID == id {
 				for _, rule := range c.Rules {
-					if strings.EqualFold(rule.Group, g.Name) {
+					if resolved, ok := resolveGroupReference(rule.Group, c.Groups); ok && resolved.group != nil && resolved.group.ID == g.ID {
 						return fmt.Errorf("group %q is still referenced by routing rule %q", g.Name, rule.ID)
 					}
 				}
 				for _, listener := range c.Listeners {
-					if listener.Mode == ListenerModeGroup && strings.EqualFold(listener.Group, g.Name) {
+					if resolved, ok := resolveGroupReference(listener.Group, c.Groups); listener.Mode == ListenerModeGroup && ok && resolved.group != nil && resolved.group.ID == g.ID {
 						return fmt.Errorf("group %q is still referenced by listener %q", g.Name, listener.ID)
 					}
 				}
@@ -315,6 +296,54 @@ func (cs *ConfigStore) DeleteGroup(id string) error {
 		}
 		return fmt.Errorf("group not found: %s", id)
 	})
+}
+
+type groupReferenceKind uint8
+
+const (
+	groupReferenceAny groupReferenceKind = iota
+	groupReferenceDirect
+	groupReferenceCountry
+	groupReferenceNamed
+)
+
+type resolvedGroupReference struct {
+	kind      groupReferenceKind
+	canonical string
+	country   string
+	group     *Group
+}
+
+// resolveGroupReference is the single resolver for persisted and runtime group
+// references. Reserved targets and names are case-insensitive; group IDs are
+// deliberately exact. Named references retain their identity form: an ID input
+// resolves to the canonical ID, while a name input resolves to canonical case.
+func resolveGroupReference(reference string, groups []Group) (resolvedGroupReference, bool) {
+	reference = strings.TrimSpace(reference)
+	if reference == "" || strings.EqualFold(reference, GroupAny) {
+		return resolvedGroupReference{kind: groupReferenceAny, canonical: GroupAny}, true
+	}
+	if strings.EqualFold(reference, GroupDirect) {
+		return resolvedGroupReference{kind: groupReferenceDirect, canonical: GroupDirect}, true
+	}
+	if code, ok := parseCountryGroup(reference); ok {
+		if !validCountryGroupCode(code) {
+			return resolvedGroupReference{}, false
+		}
+		code = strings.ToUpper(strings.TrimSpace(code))
+		return resolvedGroupReference{kind: groupReferenceCountry, canonical: countryGroupPrefix + code, country: code}, true
+	}
+	for i := range groups {
+		if groups[i].ID == reference {
+			return resolvedGroupReference{kind: groupReferenceNamed, canonical: groups[i].ID, group: &groups[i]}, true
+		}
+	}
+	for i := range groups {
+		if strings.EqualFold(groups[i].Name, reference) {
+			return resolvedGroupReference{kind: groupReferenceNamed, canonical: groups[i].Name, group: &groups[i]}, true
+		}
+	}
+	return resolvedGroupReference{}, false
 }
 
 func validCountryGroupCode(code string) bool {
@@ -332,32 +361,6 @@ func validCountryGroupCode(code string) bool {
 		}
 	}
 	return true
-}
-
-func routingTargetExists(config *PoolConfig, target string) bool {
-	if target == GroupAny || target == GroupDirect {
-		return true
-	}
-	if code, ok := parseCountryGroup(target); ok {
-		return validCountryGroupCode(code)
-	}
-	for _, group := range config.Groups {
-		if strings.EqualFold(group.Name, target) {
-			return true
-		}
-	}
-	return false
-}
-
-func canonicalReservedGroup(group string) string {
-	group = strings.TrimSpace(group)
-	if strings.EqualFold(group, GroupAny) {
-		return GroupAny
-	}
-	if strings.EqualFold(group, GroupDirect) {
-		return GroupDirect
-	}
-	return group
 }
 
 // ListenerBinding is a persisted SOCKS5 listener port binding. The primary

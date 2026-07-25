@@ -167,3 +167,50 @@ func TestNewConfigStoreDoesNotReAddDeletedBuiltinProxyIPSource(t *testing.T) {
 		t.Fatalf("persisted sources changed: %#v", got)
 	}
 }
+
+func TestNewConfigStoreCanonicalizesAndPersistsLegacyFixedNodeKey(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTestPoolConfig(t, dir, PoolConfig{Listeners: []ListenerBinding{{
+		ID: "listener-fixed", Name: "legacy fixed", Port: 19080,
+		Mode: ListenerModeFixed, NodeKey: " SOCKS5://Proxy.Example.COM.:01080 ", Enabled: true,
+	}}})
+
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "socks5://proxy.example.com:1080"
+	if got := store.Listeners(); len(got) != 1 || got[0].NodeKey != want {
+		t.Fatalf("loaded listeners = %#v, want canonical node key %q", got, want)
+	}
+	if got := readTestPoolConfig(t, path).Listeners; len(got) != 1 || got[0].NodeKey != want {
+		t.Fatalf("persisted listeners = %#v, want canonical node key %q", got, want)
+	}
+}
+
+func TestNewConfigStoreCanonicalizesLegacyGroupReferences(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTestPoolConfig(t, dir, PoolConfig{
+		Groups: []Group{{ID: "group-tokyo", Name: "Tokyo-Egress", Strategy: StrategySticky}},
+		Rules:  []Rule{{ID: "rule-tokyo", Type: RuleDomain, Value: "example.test", Group: "tokyo-egress"}},
+		Listeners: []ListenerBinding{{
+			ID: "listener-tokyo", Name: "Tokyo", Port: 19081,
+			Mode: ListenerModeGroup, Group: "TOKYO-EGRESS", Enabled: true,
+		}},
+	})
+
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Rules(); len(got) != 1 || got[0].Group != "Tokyo-Egress" {
+		t.Fatalf("loaded rules = %#v, want canonical group name", got)
+	}
+	if got := store.Listeners(); len(got) != 1 || got[0].Group != "Tokyo-Egress" {
+		t.Fatalf("loaded listeners = %#v, want canonical group name", got)
+	}
+	persisted := readTestPoolConfig(t, path)
+	if persisted.Rules[0].Group != "Tokyo-Egress" || persisted.Listeners[0].Group != "Tokyo-Egress" {
+		t.Fatalf("canonical group references were not persisted: rules=%#v listeners=%#v", persisted.Rules, persisted.Listeners)
+	}
+}

@@ -3,14 +3,16 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
-	"fmt"
 	"testing"
 )
 
@@ -332,115 +334,178 @@ func readCandidateCacheDecoded(t *testing.T, path string) []byte {
 	return data
 }
 
-func writeV1CandidateCache(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	gw := gzip.NewWriter(f)
-	defer gw.Close()
+const (
+	candidateCacheV1Golden = "H4sIAAAAAAAC/wsOcHb0czEwZGRgYNBkgAB2KM0BxMn5uQU5qSWpEBEts39zposzvFhQJzoXSF8QP64DpEF6uYG4OL+0KDlVN1E3M4URqj0YLKTgCOKzAHFGSUkBE9R4EO0VAOOxAnFIfnZlPiNUAETzALGFHhhaWRhYGMDEGaEqQPBjMNhxKVAaAPasN03RAAAA"
+	candidateCacheV2Golden = "H4sIAAAAAAAC/wsOcHb0czEwZGJgYNBkgAB2KM0BxMn5uQU5qSWpEBEts39zposzvFhQJzoXSF8QP64DpBmBMtxAXJxfWpScqpuom5nCCNUeDBZScATxWYA4o6SkgAlqPIj2CoDxWIE4JD+7Mp8RKgCieYDYQg8MrSwMLAxAtuSkpicmV+qWFqcWIXELEouLYboYofoZGRkZPgaDnZ4CpQE16EdV7wAAAA=="
+)
 
-	if _, err := gw.Write([]byte("SPCAND01")); err != nil {
-		return err
-	}
-	binary.Write(gw, binary.LittleEndian, uint16(1))
-	binary.Write(gw, binary.LittleEndian, uint16(0)) // flags
-	binary.Write(gw, binary.LittleEndian, uint32(0)) // string buf len
-	binary.Write(gw, binary.LittleEndian, uint32(0)) // num records
+func TestCandidateCacheLegacyGoldenMigrationToV3(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		golden   string
+		username string
+		password string
+		status   CandidateStatus
+	}{
+		{name: "v1 historical layout", golden: candidateCacheV1Golden, status: candidateDeferred},
+		{name: "v2 credential layout", golden: candidateCacheV2Golden, username: "legacy-user", password: "legacy-pass", status: candidateCheckedFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cache := newCandidateCatalogCache(dir)
+			compressed, err := base64.StdEncoding.DecodeString(test.golden)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cache.path, compressed, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(cache.path, 0o644); err != nil {
+				t.Fatal(err)
+			}
 
-	// Arrays
-	for _, count := range []uint32{0, 1, 1, 1} {
-		binary.Write(gw, binary.LittleEndian, count)
+			snapshot, err := cache.load()
+			if err != nil {
+				t.Fatalf("load legacy golden: %v", err)
+			}
+			if len(snapshot.records) != 1 {
+				t.Fatalf("legacy records = %d, want 1", len(snapshot.records))
+			}
+			record := snapshot.records[0]
+			if snapshot.generation != 41 || snapshot.revision != 7 || snapshot.phase != "complete" || snapshot.sourceErrors != 0 || len(snapshot.sourceRefs) != 1 || snapshot.sourceRefs[0] != 0 || snapshot.protocols[record.protocolID] != "http" || record.addr != "8.8.8.8:8080" || record.username != test.username || record.password != test.password || !record.hasAuth || record.status != test.status || record.continent != encodeContinent("AS") || snapshot.sourceKeys[0] != "source-a-id" || snapshot.sources[0] != "Source A" || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
+				t.Fatalf("legacy record was not fully decoded: record=%#v snapshot=%#v", record, snapshot)
+			}
+			if info, err := os.Stat(cache.path); err != nil || info.Mode().Perm() != 0o600 {
+				t.Fatalf("legacy cache mode after load = %v, %v; want 0600", info, err)
+			}
+
+			if err := cache.save(snapshot); err != nil {
+				t.Fatalf("save migrated v3 cache: %v", err)
+			}
+			decoded := readCandidateCacheDecoded(t, cache.path)
+			if got := binary.LittleEndian.Uint16(decoded[len(candidateCacheMagic):]); got != candidateCacheVersion {
+				t.Fatalf("migrated cache version = %d, want %d", got, candidateCacheVersion)
+			}
+			reloaded, err := cache.load()
+			if err != nil {
+				t.Fatalf("reload migrated v3 cache: %v", err)
+			}
+			reloadedRecord := reloaded.records[0]
+			if reloaded.generation != snapshot.generation || reloaded.revision != snapshot.revision || reloaded.phase != snapshot.phase || reloadedRecord.addr != record.addr || reloadedRecord.username != record.username || reloadedRecord.password != record.password || reloadedRecord.hasAuth != record.hasAuth || reloadedRecord.status != record.status || reloadedRecord.seenUnix != record.seenUnix || reloadedRecord.checkedUnix != record.checkedUnix || reloaded.sourceKeys[0] != snapshot.sourceKeys[0] || reloaded.sources[0] != snapshot.sources[0] || reloaded.countries[reloadedRecord.countryID] != "JP" || reloaded.cities[reloadedRecord.cityID] != "Tokyo" {
+				t.Fatalf("v3 migration lost data: before=%#v after=%#v", record, reloadedRecord)
+			}
+		})
 	}
-	for _, count := range []uint32{0, 0, 0} {
-		binary.Write(gw, binary.LittleEndian, count)
-	}
-	return nil
 }
 
-func TestCandidateCacheV1MigrationReturnsEmptyDirectoryWithWarning(t *testing.T) {
+func TestCandidateCacheV3RoundTripRetainsBoundedCredentialAlternates(t *testing.T) {
 	dir := t.TempDir()
 	cache := newCandidateCatalogCache(dir)
-
-	if err := writeV1CandidateCache(cache.path); err != nil {
-		t.Fatalf("failed to write v1 cache: %v", err)
-	}
-	
-	catalog := &CandidateCatalog{}
-	catalog.SetDiskCache(cache)
-	loaded, err := catalog.LoadDiskCache()
-	if err != nil {
-		// soft warning
-	}
-	if loaded {
-		
-	}
-	if loaded {
-		t.Error("expected empty records")
-	}
-}
-
-func TestCandidateCacheV3RoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	cache := newCandidateCatalogCache(dir)
-
 	catalog := &CandidateCatalog{}
 	catalog.SetDiskCache(cache)
 
-	proxy1 := Proxy{
-		IP: "1.2.3.4", Port: "1080", Username: "u", Password: "p", Protocol: "socks5",
+	proxy := Proxy{
+		IP: "1.2.3.4", Port: "1080", Username: "primary", Password: "secret", Protocol: "socks5",
 		Country: "US", City: "Ashburn", Continent: "NA",
 		CredentialAlternates: []ProxyCredential{
 			{Username: "alt1", Password: "p1"},
 			{Username: "alt2", Password: "p2"},
+			{Username: "alt3", Password: "p3"},
 		},
 	}
-	proxy2 := Proxy{
-		IP: "2.3.4.5", Port: "8080", Username: "u", Protocol: "http",
-		Country: "FR", City: "Paris", Continent: "EU",
-		CredentialAlternates: []ProxyCredential{
-			{Username: "alt3"},
-		},
-	}
-	
-	oversized := Proxy{
-		IP: "3.4.5.6", Port: "1080", Username: "u", Protocol: "socks5",
-		Country: "US", Continent: "NA",
-	}
-	for i := 0; i < 20; i++ {
-		oversized.CredentialAlternates = append(oversized.CredentialAlternates, ProxyCredential{Username: fmt.Sprintf("u%d", i)})
+	overLimit := Proxy{IP: "2.3.4.5", Port: "8080", Username: "u", Protocol: "http"}
+	for i := 0; i < maxAlternatesPerCandidate+4; i++ {
+		overLimit.CredentialAlternates = append(overLimit.CredentialAlternates, ProxyCredential{Username: fmt.Sprintf("u%02d", i)})
 	}
 
-	refresh := catalog.begin([]Proxy{proxy1, proxy2, oversized}, nil, nil, 0)
-	catalog.complete(refresh, []Proxy{proxy1, proxy2, oversized}, []Proxy{proxy1, proxy2, oversized}, nil)
-	
-	cache2 := newCandidateCatalogCache(dir)
-	catalog2 := &CandidateCatalog{}
-	catalog2.SetDiskCache(cache2)
-	if _, err := catalog2.LoadDiskCache(); err != nil { t.Fatal(err) }
-	
-	p1, ok := catalog2.FindByKey(proxy1.Key())
-	if !ok {
-		t.Fatalf("missing p1")
-	}
-	if len(p1.CredentialAlternates) != 2 {
-		t.Errorf("p1 got %d alts want 2", len(p1.CredentialAlternates))
-	}
-	
-	p2, ok := catalog2.FindByKey(proxy2.Key())
-	if !ok {
-		t.Fatalf("missing p2")
-	}
-	if len(p2.CredentialAlternates) != 1 {
-		t.Errorf("p2 got %d alts want 1", len(p2.CredentialAlternates))
-	}
+	refresh := catalog.begin([]Proxy{proxy, overLimit}, nil, nil, 0)
+	catalog.complete(refresh, nil, nil, nil)
 
-	pOversized, ok := catalog2.FindByKey(oversized.Key())
-	if !ok {
-		t.Fatalf("missing oversized")
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(dir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("LoadDiskCache() = (%v, %v), want (true, nil)", loaded, err)
 	}
-	if len(pOversized.CredentialAlternates) != 16 {
-		t.Errorf("oversized got %d alts want 16 (maxAlternatesPerCandidate)", len(pOversized.CredentialAlternates))
+	got, ok := restored.FindByKey(proxy.Key())
+	if !ok || !reflect.DeepEqual(got.CredentialAlternates, proxy.CredentialAlternates) {
+		t.Fatalf("roundtrip alternates = %#v, want %#v", got.CredentialAlternates, proxy.CredentialAlternates)
+	}
+	truncated, ok := restored.FindByKey(overLimit.Key())
+	if !ok || len(truncated.CredentialAlternates) != maxAlternatesPerCandidate {
+		t.Fatalf("bounded alternates = %#v, want first %d entries", truncated.CredentialAlternates, maxAlternatesPerCandidate)
+	}
+	if got, want := truncated.CredentialAlternates[maxAlternatesPerCandidate-1].Username, fmt.Sprintf("u%02d", maxAlternatesPerCandidate-1); got != want {
+		t.Fatalf("last retained alternate = %q, want %q", got, want)
+	}
+}
+
+func TestCandidateCacheV3RejectsInvalidAlternateRanges(t *testing.T) {
+	proxy := candidateFromSource("8.8.8.80", "source-a-id", "Source A")
+	proxy.CredentialAlternates = []ProxyCredential{{Username: "alternate", Password: "secret"}}
+	for _, test := range []struct {
+		name   string
+		mutate func(*candidateSnapshot)
+	}{
+		{name: "per-record count over limit", mutate: func(snapshot *candidateSnapshot) {
+			snapshot.records[0].credentialAlternateCount = maxAlternatesPerCandidate + 1
+		}},
+		{name: "range beyond table", mutate: func(snapshot *candidateSnapshot) {
+			snapshot.records[0].credentialAlternateOffset = uint32(len(snapshot.credentialAlternateTable))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := buildCandidateSnapshot([]Proxy{proxy}, map[string]string{"source-a-id": "Source A"})
+			snapshot.generation, snapshot.revision, snapshot.phase = 1, 1, "complete"
+			test.mutate(snapshot)
+			if err := validateCandidateSnapshot(snapshot); err == nil || !strings.Contains(err.Error(), "credential alternate") {
+				t.Fatalf("validateCandidateSnapshot() error = %v, want credential alternate rejection", err)
+			}
+		})
+	}
+}
+
+func TestCandidateCacheV3RejectsTruncatedAndTrailingWireData(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{name: "truncated", mutate: func(decoded []byte) []byte { return decoded[:len(decoded)-1] }},
+		{name: "trailing bytes", mutate: func(decoded []byte) []byte { return append(decoded, 0xde, 0xad) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cache := newCandidateCatalogCache(dir)
+			snapshot := buildCandidateSnapshot([]Proxy{candidateFromSource("8.8.8.81", "source-a-id", "Source A")}, map[string]string{"source-a-id": "Source A"})
+			snapshot.generation, snapshot.revision, snapshot.phase = 1, 1, "complete"
+			if err := cache.save(snapshot); err != nil {
+				t.Fatal(err)
+			}
+			writeCandidateCacheDecoded(t, cache.path, test.mutate(readCandidateCacheDecoded(t, cache.path)))
+			if _, err := cache.load(); err == nil {
+				t.Fatal("cache.load() accepted malformed v3 wire data")
+			}
+		})
+	}
+}
+
+func writeCandidateCacheDecoded(t *testing.T, path string, decoded []byte) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := gzip.NewWriter(file)
+	if _, err := writer.Write(decoded); err != nil {
+		_ = writer.Close()
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

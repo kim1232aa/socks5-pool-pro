@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -118,8 +120,69 @@ func TestConfigStoreMutationIsCopyOnWriteWhenDiskWriteFails(t *testing.T) {
 	if !errors.As(err, &persistenceErr) {
 		t.Fatalf("disk failure type = %T (%v), want ConfigPersistenceError", err, err)
 	}
+	if persistenceErr.Outcome != ConfigPersistenceNotCommitted {
+		t.Fatalf("persistence outcome = %q, want %q", persistenceErr.Outcome, ConfigPersistenceNotCommitted)
+	}
 	if after := store.Snapshot(); !reflect.DeepEqual(after, before) {
 		t.Fatalf("failed write mutated memory:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestConfigStorePublishesRenamedConfigWhenDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := store.Snapshot()
+	const updatedURL = "https://example.com/renamed-config"
+	syncErr := errors.New("injected directory sync failure")
+	originalSync := syncPrivateFileDirectory
+	syncPrivateFileDirectory = func(string) error { return syncErr }
+	t.Cleanup(func() { syncPrivateFileDirectory = originalSync })
+
+	err = store.SetCheckURL(updatedURL)
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("SetCheckURL error = %v, want injected sync failure", err)
+	}
+	var persistenceErr *ConfigPersistenceError
+	if !errors.As(err, &persistenceErr) {
+		t.Fatalf("directory sync failure type = %T (%v), want ConfigPersistenceError", err, err)
+	}
+	if persistenceErr.Outcome != ConfigPersistenceDurabilityUncertain {
+		t.Fatalf("persistence outcome = %q, want %q", persistenceErr.Outcome, ConfigPersistenceDurabilityUncertain)
+	}
+	if !strings.Contains(err.Error(), "path updated but directory durability is uncertain") {
+		t.Fatalf("persistence error does not expose uncertain commit: %v", err)
+	}
+	response := httptest.NewRecorder()
+	writeConfigStoreError(response, err)
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"code":"config_persistence_failed"`) || !strings.Contains(response.Body.String(), "path updated but directory durability is uncertain") {
+		t.Fatalf("API persistence response = %d %s", response.Code, response.Body.String())
+	}
+	if after := store.Snapshot(); after.CheckURL != updatedURL || reflect.DeepEqual(after, before) {
+		t.Fatalf("renamed config was not published in memory:\nbefore=%#v\nafter=%#v", before, after)
+	}
+
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted PoolConfig
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CheckURL != updatedURL {
+		t.Fatalf("renamed config on disk has check_url %q, want %q", persisted.CheckURL, updatedURL)
+	}
+
+	syncPrivateFileDirectory = originalSync
+	reopened, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.CheckURL(); got != updatedURL {
+		t.Fatalf("reopened check URL = %q, want %q", got, updatedURL)
 	}
 }
 

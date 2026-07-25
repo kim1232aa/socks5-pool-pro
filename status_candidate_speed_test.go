@@ -249,6 +249,118 @@ func TestCandidateSpeedtestReturnsPartialFailuresWithoutCancellingPeers(t *testi
 	}
 }
 
+func TestCandidateSpeedtestRechecksCandidateAndSourceBeforePromotion(t *testing.T) {
+	t.Run("candidate removed", func(t *testing.T) {
+		candidate := Proxy{IP: "198.51.100.44", Port: "8080", Protocol: "http"}
+		pool := NewProxyPool()
+		seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+		server := NewStatusServer(pool, &ConfigStore{})
+		installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+			seedCandidateSpeedCatalog(pool, nil)
+			return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 8000}, px, nil
+		})
+
+		result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+		if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "candidate_promotion_failed" {
+			t.Fatalf("removed candidate result = %d %#v raw=%s", result.status, result.body, result.raw)
+		}
+		if pool.Size() != 0 {
+			t.Fatalf("removed candidate was published: pool size = %d", pool.Size())
+		}
+	})
+
+	t.Run("candidate explicitly removed", func(t *testing.T) {
+		candidate := Proxy{IP: "198.51.100.47", Port: "8080", Protocol: "http"}
+		pool := NewProxyPool()
+		seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+		server := NewStatusServer(pool, &ConfigStore{})
+		installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+			removed, _, err := pool.candidates.RemoveKeys([]string{candidate.Key()})
+			if err != nil || len(removed) != 1 {
+				t.Fatalf("RemoveKeys during speedtest = %v, %v", removed, err)
+			}
+			return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 8000}, px, nil
+		})
+
+		result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+		if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "candidate_promotion_failed" {
+			t.Fatalf("explicitly removed candidate result = %d %#v raw=%s", result.status, result.body, result.raw)
+		}
+		if pool.Size() != 0 {
+			t.Fatalf("explicitly removed candidate was published: pool size = %d", pool.Size())
+		}
+	})
+
+	t.Run("same key revision changed", func(t *testing.T) {
+		candidate := Proxy{IP: "198.51.100.48", Port: "8080", Protocol: "http"}
+		pool := NewProxyPool()
+		seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+		server := NewStatusServer(pool, &ConfigStore{})
+		installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+			if changed := pool.candidates.ApplyHealthOutcomes([]Proxy{candidate}, nil, nil); changed != 1 {
+				t.Fatalf("ApplyHealthOutcomes during speedtest changed %d candidates", changed)
+			}
+			return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 8000}, px, nil
+		})
+
+		result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+		if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "candidate_promotion_failed" {
+			t.Fatalf("revision-changed candidate result = %d %#v raw=%s", result.status, result.body, result.raw)
+		}
+		if pool.Size() != 0 {
+			t.Fatalf("revision-changed candidate was published: pool size = %d", pool.Size())
+		}
+	})
+
+	t.Run("same key replaced by a new snapshot", func(t *testing.T) {
+		candidate := Proxy{
+			IP: "198.51.100.46", Port: "8080", Protocol: "http",
+			SourceName: "Old source", SourceNames: []string{"Old source"},
+		}
+		replacement := candidate
+		replacement.SourceName = "New source"
+		replacement.SourceNames = []string{"New source"}
+		pool := NewProxyPool()
+		seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+		server := NewStatusServer(pool, &ConfigStore{})
+		installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+			seedCandidateSpeedCatalog(pool, []Proxy{replacement})
+			return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 8000}, px, nil
+		})
+
+		result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+		if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "candidate_promotion_failed" {
+			t.Fatalf("replaced candidate result = %d %#v raw=%s", result.status, result.body, result.raw)
+		}
+		if pool.Size() != 0 {
+			t.Fatalf("replaced candidate was published: pool size = %d", pool.Size())
+		}
+	})
+
+	t.Run("source disabled", func(t *testing.T) {
+		source := Source{ID: "source-a", Name: "Source A", Enabled: true}
+		candidate := Proxy{IP: "198.51.100.45", Port: "8080", Protocol: "http", SourceIDs: []string{source.ID}, SourceNames: []string{source.Name}}
+		pool := NewProxyPool()
+		seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+		store := &ConfigStore{cfg: PoolConfig{Sources: []Source{source}}}
+		server := NewStatusServer(pool, store)
+		installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+			store.mu.Lock()
+			store.cfg.Sources[0].Enabled = false
+			store.mu.Unlock()
+			return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 8000}, px, nil
+		})
+
+		result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+		if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "candidate_promotion_failed" {
+			t.Fatalf("disabled-source candidate result = %d %#v raw=%s", result.status, result.body, result.raw)
+		}
+		if pool.Size() != 0 {
+			t.Fatalf("disabled-source candidate was published: pool size = %d", pool.Size())
+		}
+	})
+}
+
 func TestCandidateSpeedtestCancellationStopsEveryWorker(t *testing.T) {
 	candidates := []Proxy{
 		{IP: "198.51.100.41", Port: "8080", Protocol: "http"},
@@ -392,7 +504,48 @@ func seedCandidateSpeedCatalog(pool *ProxyPool, candidates []Proxy) {
 
 func installCandidateSpeedTest(t *testing.T, fn func(context.Context, Proxy, time.Duration) (SpeedTestResult, Proxy, error)) {
 	t.Helper()
-	previous := candidateSpeedTestContext
+	previousHealth := candidateHealthCheckContext
+	previousSpeed := candidateSpeedTestContext
+	candidateHealthCheckContext = func(_ context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, error) {
+		return px, true, nil
+	}
 	candidateSpeedTestContext = fn
-	t.Cleanup(func() { candidateSpeedTestContext = previous })
+	t.Cleanup(func() {
+		candidateHealthCheckContext = previousHealth
+		candidateSpeedTestContext = previousSpeed
+	})
+}
+
+func TestCandidateSpeedtestHealthCheckFailure(t *testing.T) {
+	pool := NewProxyPool()
+	candidate := Proxy{IP: "127.0.0.1", Port: "8080", Protocol: "socks5", Username: "user", Password: "pwd"}
+	seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+	server := NewStatusServer(pool, &ConfigStore{})
+
+	called := false
+	installCandidateSpeedTest(t, func(ctx context.Context, px Proxy, timeout time.Duration) (SpeedTestResult, Proxy, error) {
+		called = true
+		return SpeedTestResult{Kbps: 2048, Bytes: speedTestMaxBytes, DurationMs: 4000}, px, nil
+	})
+	candidateHealthCheckContext = func(_ context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, error) {
+		return px, false, errors.New("health criterion rejected candidate")
+	}
+
+	result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+	if result.status != http.StatusOK {
+		t.Fatalf("expected 200, got %d", result.status)
+	}
+	if len(result.body.Results) != 1 {
+		t.Fatalf("expected 1 result")
+	}
+	item := result.body.Results[0]
+	if item.OK {
+		t.Errorf("expected healthcheck failure to prevent OK")
+	}
+	if item.Error == nil || !strings.Contains(item.Error.Code, "candidate_healthcheck_failed") {
+		t.Errorf("expected candidate_healthcheck_failed, got %v", item.Error)
+	}
+	if called {
+		t.Errorf("speedtest should not be called if healthcheck failed")
+	}
 }

@@ -174,6 +174,27 @@ func TestDeleteGroupRejectedWhenReferencedByListener(t *testing.T) {
 	}
 }
 
+func TestListenerGroupIDResolutionIsExact(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := store.AddGroup(Group{Name: "Tokyo-Egress", Countries: []string{"JP"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddListener(ListenerBinding{Name: "wrong ID", Port: 14081, Mode: ListenerModeGroup, Group: strings.ToUpper(group.ID)}); err == nil {
+		t.Fatal("AddListener accepted a case-folded group ID")
+	}
+	listener, err := store.AddListener(ListenerBinding{Name: "exact ID", Port: 14082, Mode: ListenerModeGroup, Group: group.ID})
+	if err != nil {
+		t.Fatalf("AddListener exact group ID: %v", err)
+	}
+	if listener.Group != group.ID {
+		t.Fatalf("stored listener group = %q, want canonical ID %q", listener.Group, group.ID)
+	}
+}
+
 func TestReplaceListenersRollsBackAtomically(t *testing.T) {
 	store, err := NewConfigStore(t.TempDir())
 	if err != nil {
@@ -216,5 +237,85 @@ func TestListenerFixedNodeKeyRejectsAnyFallback(t *testing.T) {
 	// the store accepts the reserved name.
 	if _, err := store.AddListener(ListenerBinding{Name: "any group", Port: 16081, Mode: ListenerModeGroup, Group: GroupAny, Enabled: true}); err != nil {
 		t.Fatalf("AddListener group ANY rejected: %v", err)
+	}
+}
+
+func TestProxyKeyIsCanonical(t *testing.T) {
+	for name, proxy := range map[string]Proxy{
+		"dns":  {Protocol: "SOCKS5", IP: "Proxy.Example.COM.", Port: "01080"},
+		"ipv4": {Protocol: "HTTPS", IP: "192.168.001.001", Port: "00443"},
+		"ipv6": {Protocol: "HTTP", IP: "2001:0DB8:0:0:0:0:0:1", Port: "00080"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := map[string]string{
+				"dns":  "socks5://proxy.example.com:1080",
+				"ipv4": "https://192.168.1.1:443",
+				"ipv6": "http://[2001:db8::1]:80",
+			}[name]
+			if got := proxy.Key(); got != want {
+				t.Fatalf("Proxy.Key() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestListenerFixedNodeKeyCanonicalizedAcrossMutations(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added, err := store.AddListener(ListenerBinding{
+		Name: "add", Port: 17080, Mode: ListenerModeFixed,
+		NodeKey: " SOCKS5://Proxy.Example.COM.:01080 ", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("AddListener: %v", err)
+	}
+	if want := "socks5://proxy.example.com:1080"; added.NodeKey != want {
+		t.Fatalf("AddListener node key = %q, want %q", added.NodeKey, want)
+	}
+
+	updated, err := store.UpdateListener(ListenerBinding{
+		ID: added.ID, Name: "update", Port: added.Port, Mode: ListenerModeFixed,
+		NodeKey: "HTTP://[2001:0DB8:0:0:0:0:0:1]:00080", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateListener: %v", err)
+	}
+	if want := "http://[2001:db8::1]:80"; updated.NodeKey != want {
+		t.Fatalf("UpdateListener node key = %q, want %q", updated.NodeKey, want)
+	}
+
+	if err := store.ReplaceListeners([]ListenerBinding{{
+		ID: added.ID, Name: "replace", Port: added.Port, Mode: ListenerModeFixed,
+		NodeKey: "HTTPS://192.168.001.001:00443", Enabled: true,
+	}}); err != nil {
+		t.Fatalf("ReplaceListeners: %v", err)
+	}
+	got := store.Listeners()
+	if want := "https://192.168.1.1:443"; len(got) != 1 || got[0].NodeKey != want {
+		t.Fatalf("ReplaceListeners = %#v, want node key %q", got, want)
+	}
+}
+
+func TestListenerFixedNodeKeyRejectsURLExtras(t *testing.T) {
+	for name, key := range map[string]string{
+		"userinfo": "socks5://user:pass@proxy.example:1080",
+		"path":     "socks5://proxy.example:1080/",
+		"query":    "socks5://proxy.example:1080?debug=1",
+		"fragment": "socks5://proxy.example:1080#debug",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, err := NewConfigStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.AddListener(ListenerBinding{
+				Name: name, Port: 18080, Mode: ListenerModeFixed, NodeKey: key,
+			}); err == nil {
+				t.Fatalf("AddListener accepted node key %q", key)
+			}
+		})
 	}
 }

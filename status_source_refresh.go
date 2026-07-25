@@ -13,9 +13,15 @@ func (s *StatusServer) handleSourceRefresh(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	s.coordinator.sourceLifecycleMu.RLock()
+	defer s.coordinator.sourceLifecycleMu.RUnlock()
 	source, ok := s.store.SourceByID(in.ID)
 	if !ok {
 		writeErrCode(w, http.StatusNotFound, "source_not_found", fmt.Errorf("source not found: %s", in.ID))
+		return
+	}
+	if !source.Enabled {
+		writeErrCode(w, http.StatusConflict, "source_disabled", fmt.Errorf("source is disabled: %s", in.ID))
 		return
 	}
 	operation, accepted := s.coordinator.requestSourceRefresh(source, "manual")
@@ -32,6 +38,11 @@ func (s *StatusServer) handleSourceAutoRefresh(w http.ResponseWriter, r *http.Re
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if s.coordinator.sourceAutoRefreshBeforeMutation != nil {
+		s.coordinator.sourceAutoRefreshBeforeMutation()
+	}
+	s.coordinator.sourceLifecycleMu.Lock()
+	defer s.coordinator.sourceLifecycleMu.Unlock()
 	if err := s.store.SetSourceAutoRefresh(in.ID, in.Enabled, in.IntervalSeconds); err != nil {
 		if _, ok := s.store.SourceByID(in.ID); !ok {
 			writeErrCode(w, http.StatusNotFound, "source_not_found", err)

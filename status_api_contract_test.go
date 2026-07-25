@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -331,6 +333,59 @@ func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 	}
 }
 
+func TestV1ProxyStaleSnapshotTakesPriorityOverPageOutOfRange(t *testing.T) {
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{
+		{IP: "192.0.2.20", Port: "1080", Protocol: "socks5", Available: true},
+		{IP: "192.0.2.21", Port: "1080", Protocol: "socks5", Available: true},
+	}, nil)
+	handler := NewStatusServer(pool, &ConfigStore{}).handler()
+
+	initialRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(initialRecorder, localTestRequest(http.MethodGet, "/api/v1/proxies?page=2&page_size=1", nil))
+	if initialRecorder.Code != http.StatusOK {
+		t.Fatalf("initial second page = %d: %s", initialRecorder.Code, initialRecorder.Body.String())
+	}
+	var initial V1ProxyPage
+	if err := json.Unmarshal(initialRecorder.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	if initial.SnapshotID == "" || initialRecorder.Header().Get("X-Snapshot-ID") != initial.SnapshotID {
+		t.Fatalf("initial snapshot metadata = %#v headers=%v", initial, initialRecorder.Header())
+	}
+
+	pool.Prime([]Proxy{
+		{IP: "192.0.2.20", Port: "1080", Protocol: "socks5", Available: true},
+	}, nil)
+	staleRecorder := httptest.NewRecorder()
+	path := fmt.Sprintf("/api/v1/proxies?page=2&page_size=1&snapshot_id=%s", initial.SnapshotID)
+	handler.ServeHTTP(staleRecorder, localTestRequest(http.MethodGet, path, nil))
+	if staleRecorder.Code != http.StatusConflict || !strings.Contains(staleRecorder.Body.String(), `"code":"snapshot_changed"`) {
+		t.Fatalf("stale out-of-range page = %d %s", staleRecorder.Code, staleRecorder.Body.String())
+	}
+	if current := staleRecorder.Header().Get("X-Snapshot-ID"); current == "" || current == initial.SnapshotID {
+		t.Fatalf("stale response current snapshot header = %q, old snapshot = %q", current, initial.SnapshotID)
+	}
+}
+
+func TestV1ProxyMaxIntPageIsRejected(t *testing.T) {
+	_, handler := buildBenchPool(100)
+	maxInt := int(^uint(0) >> 1)
+	recorder := httptest.NewRecorder()
+	path := fmt.Sprintf("/api/v1/proxies?page=%d&page_size=1", maxInt)
+	handler.ServeHTTP(recorder, localTestRequest(http.MethodGet, path, nil))
+	if got, want := recorder.Code, http.StatusBadRequest; got != want {
+		t.Fatalf("MaxInt v1 page status = %d, want %d; body=%s", got, want, recorder.Body.String())
+	}
+	var response apiErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode MaxInt v1 page response: %v", err)
+	}
+	if response.Code != "page_out_of_range" {
+		t.Fatalf("MaxInt v1 page code = %q, want page_out_of_range", response.Code)
+	}
+}
+
 func TestV1PickSnapshotTracksHiddenScore(t *testing.T) {
 	pool := NewProxyPool()
 	first := Proxy{IP: "192.0.2.30", Port: "1080", Protocol: "socks5", Country: "JP", Available: true, LatencyMs: 20}
@@ -589,6 +644,100 @@ func TestCheckURLChangeInvalidatesHealthAndQueuesOnlyFullRecheck(t *testing.T) {
 	}
 	if defaultRefreshCoordinator.drainRecheckSignalForTest() {
 		t.Fatal("check URL change unexpectedly queued the legacy incremental recheck")
+	}
+}
+
+func TestCheckURLDurabilityUncertainConvergesRuntimeBeforeReturningError(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	proxy := testProxy("socks5", "8.8.8.13", "1080", true)
+	pool.Prime([]Proxy{proxy}, nil)
+	cache := newPoolCache(t.TempDir())
+	pool.SetCache(cache)
+	candidate := testProxy("http", "198.51.100.14", "8080", false)
+	refresh := pool.candidates.begin([]Proxy{candidate}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{candidate}, nil, nil)
+	coordinator := newRefreshCoordinator()
+	handler := NewStatusServerWithCoordinator(pool, store, coordinator).handler()
+
+	const updatedURL = "https://example.com/uncertain-health"
+	syncErr := errors.New("injected directory sync failure")
+	originalSync := syncPrivateFileDirectory
+	syncPrivateFileDirectory = func(string) error { return syncErr }
+	t.Cleanup(func() { syncPrivateFileDirectory = originalSync })
+
+	request := localTestRequest(http.MethodPost, "/api/settings/check-url", strings.NewReader(`{"url":"`+updatedURL+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), `"code":"config_persistence_failed"`) || !strings.Contains(recorder.Body.String(), "path updated but directory durability is uncertain") {
+		t.Fatalf("uncertain check URL response = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.Snapshot().CheckURL; got != updatedURL {
+		t.Fatalf("store check URL = %q, want committed URL %q", got, updatedURL)
+	}
+	generation, criterion := pool.HealthCriterion()
+	if generation != 1 || criterion != updatedURL || !pool.HealthRecheckPending() {
+		t.Fatalf("pool criterion state = generation %d URL %q pending %v", generation, criterion, pool.HealthRecheckPending())
+	}
+	if got, ok := pool.Find(proxy.Key()); !ok || got.Available || !got.HealthInvalidated {
+		t.Fatalf("pool health did not converge to new criterion: found=%v proxy=%+v", ok, got)
+	}
+	cached, _, _, cachedCriterion, _, cachedPending := cache.loadWithHealthState()
+	if len(cached) != 1 || cached[0].Available || !cached[0].HealthInvalidated || cachedCriterion != updatedURL || !cachedPending {
+		t.Fatalf("flushed pool state did not converge: nodes=%#v criterion=%q pending=%v", cached, cachedCriterion, cachedPending)
+	}
+	candidatePage := NewStatusServer(pool, store).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
+	if len(candidatePage.Candidates) != 1 || candidatePage.Candidates[0].Status != "deferred" || candidatePage.Phase != "restored" {
+		t.Fatalf("candidate outcomes did not reset: %#v", candidatePage)
+	}
+	if !coordinator.drainFullRecheckSignalForTest() {
+		t.Fatal("uncertain criterion change did not queue a full recheck")
+	}
+}
+
+func TestCheckURLChangeReportsPoolDurabilityFailureWithoutAcceptance(t *testing.T) {
+	resetRefreshOperationsForTest(t)
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{testProxy("socks5", "198.51.100.12", "1080", true)}, nil)
+	badParent := t.TempDir() + "/not-a-directory"
+	if err := os.WriteFile(badParent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool.SetCache(&poolCache{path: badParent + "/pool_cache.json"})
+	handler := NewStatusServer(pool, store).handler()
+
+	request := localTestRequest(http.MethodPost, "/api/settings/check-url", strings.NewReader(`{"url":"https://example.com/durable-health"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code == http.StatusOK || recorder.Code == http.StatusAccepted {
+		t.Fatalf("non-durable check URL change returned success: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), `"code":"check_url_not_durable"`) {
+		t.Fatalf("non-durable check URL response = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"accepted":true`) {
+		t.Fatalf("non-durable response claimed acceptance: %s", recorder.Body.String())
+	}
+	if defaultRefreshCoordinator.drainFullRecheckSignalForTest() {
+		t.Fatal("non-durable criterion change queued a full recheck")
+	}
+	if got := store.CheckURL(); got != "https://example.com/durable-health" {
+		t.Fatalf("config criterion = %q, want submitted URL", got)
+	}
+	generation, criterion := pool.HealthCriterion()
+	if generation != 1 || criterion != store.CheckURL() || !pool.HealthRecheckPending() {
+		t.Fatalf("pool criterion state = generation %d URL %q pending %v", generation, criterion, pool.HealthRecheckPending())
 	}
 }
 

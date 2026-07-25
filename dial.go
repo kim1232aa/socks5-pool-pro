@@ -356,8 +356,12 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	if header[0] != socks5Version || header[2] != 0x00 {
 		return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 CONNECT reply", fmt.Errorf("malformed reply header"))
 	}
-	if header[1] != 0x00 {
-		return nil, newUpstreamError(UpstreamErrorTarget, "connect SOCKS5 target", fmt.Errorf("upstream status %d", header[1]))
+	if header[1] != replySucceeded {
+		kind := UpstreamErrorTarget
+		if header[1] == replyGeneralFailure || header[1] == replyCommandNotSupported {
+			kind = UpstreamErrorProtocol
+		}
+		return nil, newUpstreamError(kind, "connect SOCKS5 target", fmt.Errorf("upstream status %d", header[1]))
 	}
 
 	var addrLen int
@@ -443,8 +447,11 @@ func dialHTTPConnectContext(ctx context.Context, px Proxy, target string) (resul
 		// reused by the credential retry loop.
 		_ = resp.Body.Close()
 		kind := UpstreamErrorTarget
-		if resp.StatusCode == http.StatusProxyAuthRequired {
+		switch resp.StatusCode {
+		case http.StatusProxyAuthRequired:
 			kind = UpstreamErrorAuth
+		case http.StatusMethodNotAllowed, http.StatusNotImplemented:
+			kind = UpstreamErrorProtocol
 		}
 		return nil, newUpstreamError(kind, "connect HTTP target", fmt.Errorf("upstream CONNECT failed: %s", resp.Status))
 	}

@@ -226,12 +226,12 @@ func checkURL(px Proxy, testURL string, timeout time.Duration) bool {
 	return checkURLContext(context.Background(), px, testURL, timeout)
 }
 
-// checkCredentialCandidates validates all bounded credential declarations for
-// one endpoint while sharing a single per-node deadline. Authentication
-// rejections normally arrive quickly, allowing the next declaration to be
-// tried, but a stalled endpoint cannot multiply timeout by the number of
-// credentials. On success the working pair is promoted to the primary fields
-// so every later probe and consumer uses the credential that was verified.
+// checkCredentialCandidates validates bounded credential declarations for one
+// endpoint while sharing a single per-node deadline. Only an explicit upstream
+// authentication rejection advances to the next declaration; target HTTP
+// failures, redirects, timeouts, and transport failures cannot be repaired by a
+// different password. On success the working pair is promoted to the primary
+// fields so every later probe and consumer uses the verified credential.
 func checkCredentialCandidates(parent context.Context, px Proxy, testURL string, timeout time.Duration) (Proxy, bool, time.Duration) {
 	if parent == nil {
 		parent = context.Background()
@@ -239,29 +239,12 @@ func checkCredentialCandidates(parent context.Context, px Proxy, testURL string,
 	if timeout <= 0 {
 		return px, false, 0
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
 	started := time.Now()
-	candidates := px.credentialCandidates()
-	deadline, _ := ctx.Deadline()
-	for index, candidate := range candidates {
-		if ctx.Err() != nil {
-			break
-		}
-		remaining := time.Until(deadline)
-		attemptsLeft := len(candidates) - index
-		if remaining <= 0 || attemptsLeft <= 0 {
-			break
-		}
-		attemptBudget := remaining / time.Duration(attemptsLeft)
-		attemptContext, cancelAttempt := context.WithTimeout(ctx, attemptBudget)
-		ok := checkURLContext(attemptContext, candidate, testURL, attemptBudget)
-		cancelAttempt()
-		if ok {
-			return px.promoteCredential(candidate), true, time.Since(started)
-		}
+	checked, ok, _ := checkURLCredentialCandidatesContext(parent, px, testURL, timeout)
+	if !ok {
+		return px, false, time.Since(started)
 	}
-	return px, false, time.Since(started)
+	return checked, true, time.Since(started)
 }
 
 // checkURLContext is the cancellation-aware form used by request-scoped manual
@@ -393,7 +376,11 @@ func RefreshBaselineExit(timeout time.Duration) bool {
 }
 
 func RefreshBaselineExitWithChange(timeout time.Duration) (success, changed bool) {
-	return refreshBaselineExitWithURLChange(publicIPLookupURL, timeout)
+	return RefreshBaselineExitWithChangeContext(context.Background(), timeout)
+}
+
+func RefreshBaselineExitWithChangeContext(parent context.Context, timeout time.Duration) (success, changed bool) {
+	return refreshBaselineExitWithURLChangeContext(parent, publicIPLookupURL, timeout)
 }
 
 func refreshBaselineExitWithURL(endpoint string, timeout time.Duration) bool {
@@ -402,12 +389,26 @@ func refreshBaselineExitWithURL(endpoint string, timeout time.Duration) bool {
 }
 
 func refreshBaselineExitWithURLChange(endpoint string, timeout time.Duration) (success, changed bool) {
+	return refreshBaselineExitWithURLChangeContext(context.Background(), endpoint, timeout)
+}
+
+func refreshBaselineExitWithURLChangeContext(parent context.Context, endpoint string, timeout time.Duration) (success, changed bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	client := newDirectHTTPClient(timeout)
 	transport, _ := client.Transport.(*http.Transport)
 	if transport != nil {
 		defer transport.CloseIdleConnections()
 	}
-	resp, err := client.Get(endpoint)
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		log.Printf("[baseline] direct egress probe failed; IP-change state is unknown and will be retried: %v", err)
+		return false, false
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[baseline] direct egress probe failed; IP-change state is unknown and will be retried: %v", err)
 		return false, false

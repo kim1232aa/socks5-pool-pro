@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"sort"
@@ -34,6 +35,10 @@ func formatPoolSnapshotIDWithBoot(boot string, generation uint64) string {
 
 func formatPoolSnapshotID(generation uint64) string {
 	return formatPoolSnapshotIDWithBoot(apiBootNonce, generation)
+}
+
+func formatNodeSnapshotID(generation, activeRevision uint64) string {
+	return fmt.Sprintf("pool:%s:%d:%d", apiBootNonce, generation, activeRevision)
 }
 
 func formatCandidateSnapshotIDWithBoot(boot string, candidateGeneration, candidateRevision, overlayHash uint64) string {
@@ -72,6 +77,167 @@ func formatV1ProxySnapshotID(proxies []V1ProxyView) string {
 
 func formatV1ProxyPickSnapshotID(proxies []V1ProxyView) string {
 	return formatV1ProxyPickSnapshotIDWithBoot(apiBootNonce, proxies)
+}
+
+// v1ProxySnapshotHasher incrementally computes the v1 page snapshot digest
+// using a streaming sha256 hash so per-proxy feeding performs no extra
+// allocation. It replaces the historical json.Marshal of the full healthy
+// view list which allocated O(pool) bytes per request. The digest is
+// order-sensitive: feed proxies in pool iteration order (deterministic for a
+// given pool state) to preserve the snapshot identity semantics.
+type v1ProxySnapshotHasher struct {
+	boot    string
+	hash    hash.Hash
+	scratch []byte
+}
+
+func newV1ProxySnapshotHasher(boot string) *v1ProxySnapshotHasher {
+	return &v1ProxySnapshotHasher{boot: boot, hash: sha256.New(), scratch: make([]byte, 0, 256)}
+}
+
+// appendProxyURL appends the consumer URL to b.
+func appendProxyURL(b []byte, px Proxy) []byte {
+	scheme := px.Protocol
+	if scheme == "https" {
+		scheme = "http"
+	}
+	b = append(b, scheme...)
+	b = append(b, "://"...)
+	if px.Username != "" {
+		b = append(b, px.Username...)
+		b = append(b, ':')
+		b = append(b, px.Password...)
+		b = append(b, '@')
+	}
+	b = append(b, px.IP...)
+	b = append(b, ':')
+	b = append(b, px.Port...)
+	return b
+}
+
+// appendKey appends the protocol-aware key (protocol://ip:port) to b.
+func appendKey(b []byte, px Proxy) []byte {
+	b = append(b, px.Protocol...)
+	b = append(b, "://"...)
+	b = append(b, px.IP...)
+	b = append(b, ':')
+	b = append(b, px.Port...)
+	return b
+}
+
+func (h *v1ProxySnapshotHasher) feed(view V1ProxyView) {
+	b := h.scratch[:0]
+	b = append(b, view.ProxyURL...)
+	b = append(b, 0)
+	b = append(b, view.SocksURL...)
+	b = append(b, 0)
+	b = append(b, view.Username...)
+	b = append(b, 0)
+	b = append(b, view.Password...)
+	b = append(b, 0)
+	b = append(b, view.Key...)
+	b = append(b, 0)
+	b = append(b, view.Protocol...)
+	b = append(b, 0)
+	b = append(b, view.Country...)
+	b = append(b, 0)
+	b = append(b, view.City...)
+	b = append(b, 0)
+	b = strconv.AppendInt(b, view.Latency, 10)
+	b = append(b, 0)
+	b = strconv.AppendFloat(b, view.Speed, 'g', -1, 64)
+	b = append(b, 0)
+	h.hash.Write(b)
+	h.scratch = b
+}
+
+// feedProxy digests a Proxy directly without allocating a V1ProxyView (and the
+// ConsumerURL/Key strings that would otherwise be built for every healthy
+// node). The digest fields mirror feed() so identity semantics are preserved.
+// Score is mixed in only for /pick tokens; page tokens omit it.
+func (h *v1ProxySnapshotHasher) feedProxy(px Proxy, withScore bool, score float64) {
+	b := h.scratch[:0]
+	b = appendProxyURL(b, px)
+	b = append(b, 0)
+	if px.Protocol == "socks5" {
+		b = appendProxyURL(b, px)
+	}
+	b = append(b, 0)
+	b = append(b, px.Username...)
+	b = append(b, 0)
+	b = append(b, px.Password...)
+	b = append(b, 0)
+	b = appendKey(b, px)
+	b = append(b, 0)
+	b = append(b, px.Protocol...)
+	b = append(b, 0)
+	b = append(b, normalizedNodeCountry(px.Country)...)
+	b = append(b, 0)
+	b = append(b, px.City...)
+	b = append(b, 0)
+	b = strconv.AppendInt(b, px.LatencyMs, 10)
+	b = append(b, 0)
+	b = strconv.AppendFloat(b, px.SpeedKbps, 'g', -1, 64)
+	b = append(b, 0)
+	if withScore {
+		b = append(b, 0)
+		b = strconv.AppendFloat(b, score, 'g', -1, 64)
+		b = append(b, 0)
+	}
+	h.hash.Write(b)
+	h.scratch = b
+}
+
+func (h *v1ProxySnapshotHasher) feedScore(score float64) {
+	b := h.scratch[:0]
+	b = append(b, 0)
+	b = strconv.AppendFloat(b, score, 'g', -1, 64)
+	b = append(b, 0)
+	h.hash.Write(b)
+	h.scratch = b
+}
+
+func (h *v1ProxySnapshotHasher) digest() []byte {
+	return h.hash.Sum(nil)
+}
+
+func (h *v1ProxySnapshotHasher) finish() string {
+	return fmt.Sprintf("proxies:%s:%s", h.boot, hex.EncodeToString(h.digest()[:12]))
+}
+
+func (h *v1ProxySnapshotHasher) finishPick() string {
+	return fmt.Sprintf("proxy-pick:%s:%s", h.boot, hex.EncodeToString(h.digest()[:12]))
+}
+
+// v1ProxyDigestFields returns the canonical per-proxy digest input. It mirrors
+// the JSON field set that the historical marshal-based snapshot token covered
+// (ProxyURL, SocksURL, Username, Password, Key, Protocol, Country, City,
+// LatencyMs, SpeedKbps), delimited by NUL bytes so field boundaries are
+// unambiguous. Score is intentionally excluded from the page digest per the
+// historical contract; /pick appends it separately via feedScore.
+func v1ProxyDigestFields(view V1ProxyView) []byte {
+	var buf []byte
+	buf = append(buf, view.ProxyURL...)
+	buf = append(buf, 0)
+	buf = append(buf, view.SocksURL...)
+	buf = append(buf, 0)
+	buf = append(buf, view.Username...)
+	buf = append(buf, 0)
+	buf = append(buf, view.Password...)
+	buf = append(buf, 0)
+	buf = append(buf, view.Key...)
+	buf = append(buf, 0)
+	buf = append(buf, view.Protocol...)
+	buf = append(buf, 0)
+	buf = append(buf, view.Country...)
+	buf = append(buf, 0)
+	buf = append(buf, view.City...)
+	buf = append(buf, 0)
+	buf = strconv.AppendInt(buf, view.Latency, 10)
+	buf = append(buf, 0)
+	buf = strconv.AppendFloat(buf, view.Speed, 'g', -1, 64)
+	buf = append(buf, 0)
+	return buf
 }
 
 // ---- JSON helpers ----
@@ -303,27 +469,6 @@ func strictV1PageParams(r *http.Request) (page, pageSize int, err error) {
 	return page, pageSize, nil
 }
 
-func filterV1ProxyViews(all []V1ProxyView, protocol string, r *http.Request) []V1ProxyView {
-	query := r.URL.Query()
-	countryRaw := strings.TrimSpace(query.Get("country"))
-	unknownCountry := strings.EqualFold(countryRaw, "__unknown__") || nodeQueryEnabled(query.Get("country_unknown"))
-	country := normalizedNodeCountry(countryRaw)
-	filtered := make([]V1ProxyView, 0, len(all))
-	for _, view := range all {
-		if protocol != "" && view.Protocol != protocol {
-			continue
-		}
-		if unknownCountry && view.Country != "" {
-			continue
-		}
-		if !unknownCountry && country != "" && view.Country != country {
-			continue
-		}
-		filtered = append(filtered, view)
-	}
-	return filtered
-}
-
 // compactStatusSummary deliberately omits the IP-pool URL list. The default
 // /api/status response retains the registration-client contract; dashboard
 // polling only needs counters and group state.
@@ -406,6 +551,45 @@ func nodePageParams(r *http.Request) (page, pageSize int) {
 	return page, pageSize
 }
 
+func pageWindowLimit(page, pageSize int) int {
+	if page < 1 || pageSize < 1 {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	if page > maxInt/pageSize {
+		return 0
+	}
+	limit := page * pageSize
+	if limit == maxInt {
+		return 0
+	}
+	return limit
+}
+
+func pageCountForTotal(total, pageSize int) int {
+	if total < 1 || pageSize < 1 {
+		return 1
+	}
+	pageCount := total / pageSize
+	if total%pageSize != 0 {
+		pageCount++
+	}
+	return pageCount
+}
+
+// pageCollectorWindow chooses the smaller side of the sorted result set to
+// retain. Early pages keep the prefix through end; late pages keep the suffix
+// from start. In particular, the first and last pages retain at most pageSize
+// entries rather than growing the collector to the full filtered pool.
+func pageCollectorWindow(total, start, end int) (limit int, reverse bool) {
+	prefix := end
+	suffix := total - start
+	if suffix < prefix {
+		return suffix, true
+	}
+	return prefix, false
+}
+
 func nodeQueryEnabled(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "1", "true", "yes", "on":
@@ -457,4 +641,57 @@ func sortNodeViews(nodes []NodeView, sortBy string) {
 		}
 		return a.Key < b.Key
 	})
+}
+
+// boundedCollector keeps at most k elements in ascending presentation order
+// (items[0] is the "best"/first-in-page, items[k-1] is the "worst"/last-in-page).
+// The caller supplies `less`, the canonical presentation comparator
+// (less(a,b) == true means a ranks before b). add rejects items that would
+// land beyond position k, so the retained memory is bounded by k regardless
+// of input size. k is clamped to 1; a k<=0 collector drops everything.
+type boundedCollector[T any] struct {
+	items []T
+	k     int
+	less  func(a, b T) bool // canonical presentation less: a ranks before b
+}
+
+func newBoundedCollector[T any](k int, less func(a, b T) bool) *boundedCollector[T] {
+	if k < 1 {
+		k = 1
+	}
+	return &boundedCollector[T]{
+		items: make([]T, 0, k),
+		k:     k,
+		less:  less,
+	}
+}
+
+func (c *boundedCollector[T]) add(item T) {
+	// Find the first index where item ranks before items[idx].
+	idx := sort.Search(len(c.items), func(i int) bool {
+		return c.less(item, c.items[i])
+	})
+	if len(c.items) < c.k {
+		c.items = append(c.items, item)
+		copy(c.items[idx+1:], c.items[idx:len(c.items)-1])
+		c.items[idx] = item
+		return
+	}
+	// Full. If idx >= k the item ranks after the worst retained -> drop it.
+	if idx >= c.k {
+		return
+	}
+	// Insert item at idx, evicting items[k-1] (the current worst).
+	copy(c.items[idx+1:], c.items[idx:c.k-1])
+	c.items[idx] = item
+}
+
+// sortFinal returns a copy of the retained items sorted by the given
+// presentation ordering. Since items are already kept in ascending order,
+// this is a stable copy; lessFinal is accepted for symmetry with callers
+// that may re-sort with a different tie-breaker.
+func (c *boundedCollector[T]) sortFinal(lessFinal func(a, b T) bool) []T {
+	out := append([]T(nil), c.items...)
+	sort.SliceStable(out, func(i, j int) bool { return lessFinal(out[i], out[j]) })
+	return out
 }

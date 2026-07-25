@@ -89,13 +89,28 @@ func (c *CandidateCatalog) persistCompletedSnapshot(snapshot *candidateSnapshot)
 
 	c.persistMu.Lock()
 	defer c.persistMu.Unlock()
+	if c.persistLocked != nil {
+		c.persistLocked()
+	}
 	snapshot.mu.RLock()
-	generation, revision := snapshot.generation, snapshot.revision
+	generation, revision, phase := snapshot.generation, snapshot.revision, snapshot.phase
 	snapshot.mu.RUnlock()
 	if generation < cache.savedGeneration || generation == cache.savedGeneration && revision <= cache.savedRevision {
 		return nil
 	}
-	if err := cache.save(snapshot); err != nil {
+	var err error
+	if phase == "checking" {
+		image := cloneCandidateSnapshot(snapshot)
+		if image.sourceErrors > 0 {
+			image.phase = "partial"
+		} else {
+			image.phase = "complete"
+		}
+		err = cache.saveImmutable(image)
+	} else {
+		err = cache.save(snapshot)
+	}
+	if err != nil {
 		log.Printf("[candidate-cache] save failed: %v", err)
 		return err
 	}
@@ -103,16 +118,103 @@ func (c *CandidateCatalog) persistCompletedSnapshot(snapshot *candidateSnapshot)
 	return nil
 }
 
+func (c *CandidateCatalog) persistImmutableSnapshot(image *candidateSnapshot, force bool) error {
+	c.cacheMu.RLock()
+	cache := c.cache
+	c.cacheMu.RUnlock()
+	if cache == nil || image == nil {
+		return nil
+	}
+
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
+	if c.persistLocked != nil {
+		c.persistLocked()
+	}
+	generation, revision := image.generation, image.revision
+	if !force && (generation < cache.savedGeneration || generation == cache.savedGeneration && revision <= cache.savedRevision) {
+		return nil
+	}
+	if err := cache.saveImmutable(image); err != nil {
+		log.Printf("[candidate-cache] save failed: %v", err)
+		return err
+	}
+	cache.savedGeneration, cache.savedRevision = generation, revision
+	return nil
+}
+
+func (c *CandidateCatalog) restoreLiveSnapshot() error {
+	for attempt := 0; attempt < candidateRemovalMaxAttempts; attempt++ {
+		live := c.snapshot.Load()
+		if live == nil {
+			return nil
+		}
+		image := cloneCandidateSnapshot(live)
+		generation, revision := image.generation, image.revision
+		if image.phase == "checking" {
+			if image.sourceErrors > 0 {
+				image.phase = "partial"
+			} else {
+				image.phase = "complete"
+			}
+		}
+		if err := c.persistImmutableSnapshot(image, true); err != nil {
+			return err
+		}
+
+		c.publicationMu.RLock()
+		live.mu.RLock()
+		consistent := c.snapshot.Load() == live && live.generation == generation && live.revision == revision
+		live.mu.RUnlock()
+		c.publicationMu.RUnlock()
+		if consistent {
+			return nil
+		}
+	}
+	return fmt.Errorf("live candidate snapshot changed during cache restoration")
+}
+
+func cloneCandidateSnapshot(snapshot *candidateSnapshot) *candidateSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	return &candidateSnapshot{
+		records:                  append([]candidateRecord(nil), snapshot.records...),
+		credentialAlternateTable: append([]ProxyCredential(nil), snapshot.credentialAlternateTable...),
+		sourceRefs:               append([]uint32(nil), snapshot.sourceRefs...),
+		sourceKeys:               append([]string(nil), snapshot.sourceKeys...),
+		sources:                  append([]string(nil), snapshot.sources...),
+		protocols:                append([]string(nil), snapshot.protocols...),
+		countries:                append([]string(nil), snapshot.countries...),
+		cities:                   append([]string(nil), snapshot.cities...),
+		sourceTotals:             append([]int(nil), snapshot.sourceTotals...),
+		sourceFacetValues:        append([]string(nil), snapshot.sourceFacetValues...),
+		sourceFacetTotals:        append([]int(nil), snapshot.sourceFacetTotals...),
+		protocolTotals:           append([]int(nil), snapshot.protocolTotals...),
+		generation:               snapshot.generation,
+		revision:                 snapshot.revision,
+		phase:                    snapshot.phase,
+		sourceErrors:             snapshot.sourceErrors,
+		seenAt:                   snapshot.seenAt,
+		refreshAttempt:           snapshot.refreshAttempt,
+		completedAt:              snapshot.completedAt,
+	}
+}
+
 func (cache *candidateCatalogCache) load() (*candidateSnapshot, error) {
 	info, err := os.Lstat(cache.path)
 	if err != nil {
 		return nil, err
 	}
-	if info.Mode().Perm() != 0o600 {
-		_ = os.Chmod(cache.path, 0o600)
-	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("candidate cache is not a regular file")
+	}
+	if info.Mode().Perm() != 0o600 {
+		if err := os.Chmod(cache.path, 0o600); err != nil {
+			return nil, fmt.Errorf("tighten candidate cache permissions: %w", err)
+		}
 	}
 	if info.Size() < 1 || info.Size() > maxCandidateCacheCompressedBytes {
 		return nil, fmt.Errorf("candidate cache compressed size %d exceeds limit %d", info.Size(), maxCandidateCacheCompressedBytes)
@@ -168,7 +270,16 @@ func (cache *candidateCatalogCache) load() (*candidateSnapshot, error) {
 	return snapshot, nil
 }
 
-func (cache *candidateCatalogCache) save(snapshot *candidateSnapshot) (returnErr error) {
+func (cache *candidateCatalogCache) save(snapshot *candidateSnapshot) error {
+	if snapshot == nil {
+		return fmt.Errorf("nil candidate snapshot")
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	return cache.saveImmutable(snapshot)
+}
+
+func (cache *candidateCatalogCache) saveImmutable(snapshot *candidateSnapshot) (returnErr error) {
 	if snapshot == nil {
 		return fmt.Errorf("nil candidate snapshot")
 	}
@@ -200,12 +311,10 @@ func (cache *candidateCatalogCache) save(snapshot *candidateSnapshot) (returnErr
 	uncompressed := &boundedCacheWriter{writer: gz, remaining: maxCandidateCacheDecodedBytes}
 	encoder := candidateCacheEncoder{writer: uncompressed}
 
-	snapshot.mu.RLock()
 	encodeErr := validateCandidateSnapshot(snapshot)
 	if encodeErr == nil {
 		encodeErr = encoder.encode(snapshot)
 	}
-	snapshot.mu.RUnlock()
 	if encodeErr != nil {
 		_ = gz.Close()
 		return fmt.Errorf("encode candidate cache: %w", encodeErr)
@@ -503,11 +612,13 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 		if record.addr, err = d.string(maxCandidateCacheStringLength); err != nil {
 			return nil, err
 		}
-		if record.username, err = d.string(maxCandidateCacheStringLength); err != nil {
-			return nil, err
-		}
-		if record.password, err = d.string(maxCandidateCacheStringLength); err != nil {
-			return nil, err
+		if version >= 2 {
+			if record.username, err = d.string(maxCandidateCacheStringLength); err != nil {
+				return nil, err
+			}
+			if record.password, err = d.string(maxCandidateCacheStringLength); err != nil {
+				return nil, err
+			}
 		}
 		for _, destination := range []*uint32{&record.sourceOffset, &record.countryID, &record.cityID} {
 			if *destination, err = d.uint32(); err != nil {
@@ -704,6 +815,14 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 	if len(snapshot.records) > maxCandidateCacheRecords || len(snapshot.sourceRefs) > maxCandidateCacheSourceRefs {
 		return fmt.Errorf("candidate snapshot exceeds record/reference limits")
 	}
+	if len(snapshot.credentialAlternateTable) > maxCandidateCacheCredentialAlts {
+		return fmt.Errorf("candidate credential alternate table exceeds limit %d", maxCandidateCacheCredentialAlts)
+	}
+	for i, credential := range snapshot.credentialAlternateTable {
+		if len(credential.Username) > maxCandidateCacheStringLength || len(credential.Password) > maxCandidateCacheStringLength {
+			return fmt.Errorf("invalid credential alternate length at index %d", i)
+		}
+	}
 	if len(snapshot.sourceKeys) != len(snapshot.sources) || len(snapshot.sources) > maxCandidateCacheSources {
 		return fmt.Errorf("candidate source dictionaries do not align")
 	}
@@ -742,7 +861,24 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 		if len(record.username) > maxCandidateCacheStringLength || len(record.password) > maxCandidateCacheStringLength {
 			return fmt.Errorf("invalid credential length at record %d", i)
 		}
-		if record.hasAuth != (record.username != "" || record.password != "" || record.credentialAlternateCount > 0) {
+		if record.credentialAlternateCount > maxAlternatesPerCandidate {
+			return fmt.Errorf("credential alternate count exceeds limit at record %d", i)
+		}
+		alternateEnd := uint64(record.credentialAlternateOffset) + uint64(record.credentialAlternateCount)
+		if alternateEnd > uint64(len(snapshot.credentialAlternateTable)) {
+			return fmt.Errorf("credential alternate range is invalid at record %d", i)
+		}
+		hasCredentials := record.username != "" || record.password != ""
+		for _, credential := range snapshot.credentialAlternateTable[record.credentialAlternateOffset:alternateEnd] {
+			if credential.Username != "" || credential.Password != "" {
+				hasCredentials = true
+				break
+			}
+		}
+		// v1 persisted only this marker, not the credential strings. Accept a
+		// legacy true marker, but never allow v2/v3 credentials to be hidden by
+		// a false marker.
+		if hasCredentials && !record.hasAuth {
 			return fmt.Errorf("authentication flag does not match credentials at record %d", i)
 		}
 		host, port, err := net.SplitHostPort(record.addr)

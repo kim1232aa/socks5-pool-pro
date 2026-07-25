@@ -263,6 +263,8 @@ func TestDialUpstreamClassifiesHTTPConnectFailures(t *testing.T) {
 		affectsHealth bool
 	}{
 		{name: "target refusal", status: "403 Forbidden", wantKind: UpstreamErrorTarget},
+		{name: "method not allowed", status: "405 Method Not Allowed", wantKind: UpstreamErrorProtocol, affectsHealth: true},
+		{name: "CONNECT not implemented", status: "501 Not Implemented", wantKind: UpstreamErrorProtocol, affectsHealth: true},
 		{name: "proxy authentication", status: "407 Proxy Authentication Required", wantKind: UpstreamErrorAuth, affectsHealth: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -299,6 +301,75 @@ func TestDialUpstreamClassifiesHTTPConnectFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			conn, err := DialUpstream(Proxy{IP: host, Port: port, Protocol: "http"}, "example.test:443", time.Second)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			var upstreamErr *UpstreamError
+			if !errors.As(err, &upstreamErr) || upstreamErr.Kind != test.wantKind {
+				t.Fatalf("DialUpstream() error = %#v, want kind %v", err, test.wantKind)
+			}
+			if got := upstreamFailureAffectsHealth(err); got != test.affectsHealth {
+				t.Fatalf("upstreamFailureAffectsHealth() = %v, want %v", got, test.affectsHealth)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("test upstream error: %v", err)
+			}
+		})
+	}
+}
+
+func TestDialUpstreamClassifiesSOCKSConnectFailures(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		reply         byte
+		wantKind      UpstreamErrorKind
+		affectsHealth bool
+	}{
+		{name: "general upstream failure", reply: replyGeneralFailure, wantKind: UpstreamErrorProtocol, affectsHealth: true},
+		{name: "command unsupported", reply: replyCommandNotSupported, wantKind: UpstreamErrorProtocol, affectsHealth: true},
+		{name: "network unreachable", reply: replyNetworkUnreachable, wantKind: UpstreamErrorTarget},
+		{name: "host unreachable", reply: replyHostUnreachable, wantKind: UpstreamErrorTarget},
+		{name: "connection refused", reply: replyConnectionRefused, wantKind: UpstreamErrorTarget},
+		{name: "TTL expired", reply: replyTTLExpired, wantKind: UpstreamErrorTarget},
+		{name: "address type unsupported", reply: replyAddressTypeNotSupported, wantKind: UpstreamErrorTarget},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			done := make(chan error, 1)
+			go func() {
+				conn, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					done <- acceptErr
+					return
+				}
+				defer conn.Close()
+				var greeting [3]byte
+				if _, readErr := io.ReadFull(conn, greeting[:]); readErr != nil {
+					done <- readErr
+					return
+				}
+				if _, writeErr := conn.Write([]byte{socks5Version, socks5NoAuth}); writeErr != nil {
+					done <- writeErr
+					return
+				}
+				request := make([]byte, 4+1+len("example.test")+2)
+				if _, readErr := io.ReadFull(conn, request); readErr != nil {
+					done <- readErr
+					return
+				}
+				_, writeErr := conn.Write([]byte{socks5Version, test.reply, 0, atypIPv4, 0, 0, 0, 0, 0, 0})
+				done <- writeErr
+			}()
+
+			host, port, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := DialUpstream(Proxy{IP: host, Port: port, Protocol: "socks5"}, "example.test:443", time.Second)
 			if conn != nil {
 				_ = conn.Close()
 			}

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -10,6 +11,10 @@ import (
 // health-recheck workers. A coordinator is intentionally independent of a
 // ProxyPool so tests and application instances can isolate their work queues.
 type RefreshCoordinator struct {
+	shuttingDown atomic.Bool
+	shutdownOnce sync.Once
+	lifecycleMu  sync.RWMutex
+
 	lastScrapeTime time.Time
 	nextScrapeTime time.Time
 	lastScrapeInfo ScrapeInfo
@@ -22,7 +27,12 @@ type RefreshCoordinator struct {
 	healthCycleMu     sync.Mutex
 	// sourceLifecycleMu makes source changes and the final pool install one
 	// ordered transaction, preventing stale refresh results from reviving nodes.
-	sourceLifecycleMu sync.Mutex
+	sourceLifecycleMu sync.RWMutex
+
+	// Deterministic test seams around source lifecycle finalization/mutation.
+	fullRefreshBeforeFinalValidation   func()
+	sourceRefreshBeforeFinalValidation func()
+	sourceAutoRefreshBeforeMutation    func()
 
 	refreshOpMu          sync.RWMutex
 	refreshOpSeq         uint64
@@ -91,7 +101,17 @@ func (c *RefreshCoordinator) recordScrape(info ScrapeInfo, interval time.Duratio
 }
 
 func (c *RefreshCoordinator) requestRefresh() (operation RefreshOperation, accepted bool) {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
 	c.refreshOpMu.Lock()
+	if c.shuttingDown.Load() {
+		job := c.newRefreshOperationLocked("manual", "cancelled")
+		job.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		job.Error = "application is shutting down"
+		operation = *job
+		c.refreshOpMu.Unlock()
+		return operation, false
+	}
 	if c.refreshPending != nil {
 		operation = *c.refreshPending
 		c.refreshOpMu.Unlock()
@@ -114,6 +134,9 @@ func (c *RefreshCoordinator) triggerRefresh() { _, _ = c.requestRefresh() }
 func (c *RefreshCoordinator) beginRefreshOperation() string {
 	c.refreshOpMu.Lock()
 	defer c.refreshOpMu.Unlock()
+	if c.shuttingDown.Load() {
+		return ""
+	}
 	job := c.refreshPending
 	c.refreshPending = nil
 	if job == nil {
@@ -128,6 +151,9 @@ func (c *RefreshCoordinator) beginRefreshOperation() string {
 func (c *RefreshCoordinator) beginBackgroundRefreshOperation(trigger string) string {
 	c.refreshOpMu.Lock()
 	defer c.refreshOpMu.Unlock()
+	if c.shuttingDown.Load() {
+		return ""
+	}
 	job := c.newRefreshOperationLocked(trigger, "running")
 	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	c.refreshActive = job
@@ -179,17 +205,46 @@ func (c *RefreshCoordinator) refreshOperationStatus() RefreshOperationStatus {
 }
 
 func (c *RefreshCoordinator) requestSourceRefresh(source Source, trigger string) (SourceRefreshOperation, bool) {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
 	c.sourceRefreshMu.Lock()
 	defer c.sourceRefreshMu.Unlock()
+	newOperation := func(status string) *SourceRefreshOperation {
+		c.sourceRefreshSeq++
+		now := time.Now().UTC()
+		return &SourceRefreshOperation{
+			ID:             fmt.Sprintf("source-refresh-%d-%d", now.UnixNano(), c.sourceRefreshSeq),
+			SourceID:       source.ID,
+			SourceName:     source.Name,
+			Status:         status,
+			Trigger:        trigger,
+			RequestedAt:    now.Format(time.RFC3339Nano),
+			sourceRevision: newSourceRefreshRevision(source),
+		}
+	}
+	if c.shuttingDown.Load() {
+		operation := newOperation("cancelled")
+		operation.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		operation.Error = "application is shutting down"
+		return *operation, false
+	}
+	if !source.Enabled {
+		operation := newOperation("rejected")
+		operation.Error = "source is disabled"
+		return *operation, false
+	}
+	if trigger == "scheduled" && !source.AutoRefreshEnabled {
+		operation := newOperation("rejected")
+		operation.Error = "automatic source refresh is disabled"
+		return *operation, false
+	}
 	if active := c.sourceRefreshActive[source.ID]; active != nil {
 		return *active, false
 	}
 	if pending := c.sourceRefreshPending[source.ID]; pending != nil {
 		return *pending, false
 	}
-	c.sourceRefreshSeq++
-	now := time.Now().UTC()
-	operation := &SourceRefreshOperation{ID: fmt.Sprintf("source-refresh-%d-%d", now.UnixNano(), c.sourceRefreshSeq), SourceID: source.ID, SourceName: source.Name, Status: "queued", Trigger: trigger, RequestedAt: now.Format(time.RFC3339Nano)}
+	operation := newOperation("queued")
 	c.sourceRefreshPending[source.ID] = operation
 	select {
 	case c.sourceRefreshChan <- source.ID:
@@ -205,6 +260,9 @@ func (c *RefreshCoordinator) requestSourceRefresh(source Source, trigger string)
 func (c *RefreshCoordinator) beginSourceRefresh(sourceID string) (SourceRefreshOperation, bool) {
 	c.sourceRefreshMu.Lock()
 	defer c.sourceRefreshMu.Unlock()
+	if c.shuttingDown.Load() {
+		return SourceRefreshOperation{}, false
+	}
 	operation := c.sourceRefreshPending[sourceID]
 	if operation == nil {
 		return SourceRefreshOperation{}, false
@@ -264,6 +322,11 @@ func (c *RefreshCoordinator) queueDueSourceRefreshes(store *ConfigStore, globalI
 }
 
 func (c *RefreshCoordinator) triggerRecheck() {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
+	if c.shuttingDown.Load() {
+		return
+	}
 	select {
 	case c.recheckChan <- struct{}{}:
 	default:
@@ -271,8 +334,21 @@ func (c *RefreshCoordinator) triggerRecheck() {
 }
 
 func (c *RefreshCoordinator) triggerFullRecheck(pool *ProxyPool) (HealthRecheckOperation, bool) {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
 	generation, checkURL := pool.HealthCriterion()
 	c.healthRecheckOpMu.Lock()
+	if c.shuttingDown.Load() {
+		c.healthRecheckOpSeq++
+		now := time.Now().UTC()
+		operation := HealthRecheckOperation{
+			ID: fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), c.healthRecheckOpSeq), Status: "cancelled",
+			Generation: generation, CheckURL: checkURL, RequestedAt: now.Format(time.RFC3339Nano),
+			CompletedAt: now.Format(time.RFC3339Nano),
+		}
+		c.healthRecheckOpMu.Unlock()
+		return operation, false
+	}
 	if c.healthRecheckPending != nil && c.healthRecheckPending.Generation == generation {
 		operation := *c.healthRecheckPending
 		c.healthRecheckOpMu.Unlock()
@@ -305,6 +381,11 @@ func (c *RefreshCoordinator) triggerFullRecheck(pool *ProxyPool) (HealthRecheckO
 func (c *RefreshCoordinator) beginHealthRecheckOperation(pool *ProxyPool, total int) HealthRecheckOperation {
 	c.healthRecheckOpMu.Lock()
 	defer c.healthRecheckOpMu.Unlock()
+	if c.shuttingDown.Load() {
+		generation, checkURL := pool.HealthCriterion()
+		now := time.Now().UTC()
+		return HealthRecheckOperation{Status: "cancelled", Generation: generation, CheckURL: checkURL, RequestedAt: now.Format(time.RFC3339Nano), CompletedAt: now.Format(time.RFC3339Nano)}
+	}
 	job := c.healthRecheckPending
 	c.healthRecheckPending = nil
 	if job == nil {
@@ -355,6 +436,82 @@ func (c *RefreshCoordinator) finishHealthRecheckOperation(id string, completed b
 	finished := *c.healthRecheckActive
 	c.healthRecheckLast = &finished
 	c.healthRecheckActive = nil
+}
+
+func (c *RefreshCoordinator) shutdown() {
+	c.shutdownOnce.Do(func() {
+		c.lifecycleMu.Lock()
+		defer c.lifecycleMu.Unlock()
+		c.shuttingDown.Store(true)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+
+		c.refreshOpMu.Lock()
+		operation := c.refreshActive
+		if operation == nil {
+			operation = c.refreshPending
+		}
+		if operation != nil {
+			operation.Status = "cancelled"
+			operation.CompletedAt = now
+			operation.Error = "application is shutting down"
+			finished := *operation
+			c.refreshLast = &finished
+		}
+		c.refreshActive = nil
+		c.refreshPending = nil
+		c.refreshOpMu.Unlock()
+
+		c.sourceRefreshMu.Lock()
+		for sourceID, operation := range c.sourceRefreshActive {
+			operation.Status = "cancelled"
+			operation.CompletedAt = now
+			operation.Error = "application is shutting down"
+			delete(c.sourceRefreshActive, sourceID)
+		}
+		for sourceID, operation := range c.sourceRefreshPending {
+			operation.Status = "cancelled"
+			operation.CompletedAt = now
+			operation.Error = "application is shutting down"
+			delete(c.sourceRefreshPending, sourceID)
+		}
+		c.sourceRefreshMu.Unlock()
+
+		c.healthRecheckOpMu.Lock()
+		healthOperation := c.healthRecheckActive
+		if healthOperation == nil {
+			healthOperation = c.healthRecheckPending
+		}
+		if healthOperation != nil {
+			healthOperation.Status = "cancelled"
+			healthOperation.CompletedAt = now
+			finished := *healthOperation
+			c.healthRecheckLast = &finished
+		}
+		c.healthRecheckActive = nil
+		c.healthRecheckPending = nil
+		c.healthRecheckOpMu.Unlock()
+
+		drainSignal(c.refreshChan)
+		drainSignal(c.recheckChan)
+		drainSignal(c.fullRecheckChan)
+		for {
+			select {
+			case <-c.sourceRefreshChan:
+			default:
+				return
+			}
+		}
+	})
+}
+
+func drainSignal(channel <-chan struct{}) {
+	for {
+		select {
+		case <-channel:
+		default:
+			return
+		}
+	}
 }
 
 func (c *RefreshCoordinator) healthRecheckOperationStatus() HealthRecheckOperationStatus {

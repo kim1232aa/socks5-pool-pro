@@ -85,6 +85,7 @@ type Source struct {
 	Builtin                bool   `json:"builtin"`
 	Note                   string `json:"note,omitempty"`
 	autoRefreshMissing     bool
+	revision               uint64
 }
 
 // UnmarshalJSON preserves an explicit false while defaulting legacy records
@@ -299,19 +300,38 @@ type ConfigStore struct {
 	cfg  PoolConfig
 }
 
+// ConfigPersistenceOutcome reports whether a failed persistence attempt changed
+// the configured path. Before rename, the old path is unchanged. After rename,
+// a directory open/sync/close failure leaves the new path visible but its
+// survival across a crash is uncertain.
+type ConfigPersistenceOutcome string
+
+const (
+	ConfigPersistenceNotCommitted        ConfigPersistenceOutcome = "not_committed"
+	ConfigPersistenceDurabilityUncertain ConfigPersistenceOutcome = "durability_uncertain"
+)
+
 // ConfigPersistenceError marks a failure after a validated configuration has
-// reached the filesystem write/rename/fsync stage. API handlers can use
-// errors.As to distinguish an internal durability failure (HTTP 500) from
-// validation and business-conflict errors (HTTP 400/409).
+// reached the filesystem write/rename/fsync stage. API handlers expose it as
+// config_persistence_failed (HTTP 500), including Error's explicit outcome so
+// callers are never told an uncertain post-rename update did not happen.
 type ConfigPersistenceError struct {
-	Err error
+	Outcome ConfigPersistenceOutcome
+	Err     error
 }
 
 func (e *ConfigPersistenceError) Error() string {
-	if e == nil || e.Err == nil {
+	if e == nil {
 		return "persist configuration"
 	}
-	return "persist configuration: " + e.Err.Error()
+	prefix := "persist configuration"
+	if e.Outcome == ConfigPersistenceDurabilityUncertain {
+		prefix += ": path updated but directory durability is uncertain"
+	}
+	if e.Err == nil {
+		return prefix
+	}
+	return prefix + ": " + e.Err.Error()
 }
 
 func (e *ConfigPersistenceError) Unwrap() error {
@@ -346,11 +366,16 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	persistedRules := append([]Rule(nil), cfg.Rules...)
+	persistedListeners := append([]ListenerBinding(nil), cfg.Listeners...)
 	if err := validatePersistedPoolConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 	cs.cfg = cfg
-	migrated := migrateSourceAutoRefresh(&cs.cfg)
+	migrated := listenerNodeKeysChanged(persistedListeners, cs.cfg.Listeners) || groupReferencesChanged(persistedRules, cs.cfg.Rules, persistedListeners, cs.cfg.Listeners)
+	if migrateSourceAutoRefresh(&cs.cfg) {
+		migrated = true
+	}
 	if migrateProxyIPSourceMetadata(&cs.cfg) {
 		migrated = true
 	}
@@ -360,7 +385,7 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 	}
 	if migrated {
 		if err := cs.writeLocked(); err != nil {
-			return nil, fmt.Errorf("persist source metadata migration: %w", err)
+			return nil, fmt.Errorf("persist config migration: %w", err)
 		}
 	}
 	return cs, nil
@@ -540,12 +565,19 @@ func (cs *ConfigStore) writeConfigLocked(cfg PoolConfig) error {
 		return fmt.Errorf("pool config exceeds %d bytes", maxPoolConfigBytes)
 	}
 	if err := writePrivateFileAtomic(cs.path, data); err != nil {
-		return &ConfigPersistenceError{Err: err}
+		outcome := ConfigPersistenceNotCommitted
+		if atomicErr, ok := err.(*privateFileAtomicError); ok && atomicErr.renamed {
+			outcome = ConfigPersistenceDurabilityUncertain
+		}
+		return &ConfigPersistenceError{Outcome: outcome, Err: err}
 	}
 	return nil
 }
 
-// mutate runs fn with exclusive access to the config, then persists it.
+// mutate runs fn with exclusive access to the config, then persists it. A
+// post-rename durability error is still returned, but the renamed config is
+// published: the visible path has already changed, so retaining the old memory
+// snapshot would make the API disagree with disk and with the next restart.
 func (cs *ConfigStore) mutate(fn func(*PoolConfig) error) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -560,6 +592,9 @@ func (cs *ConfigStore) mutate(fn func(*PoolConfig) error) error {
 		return fmt.Errorf("validate config: %w", err)
 	}
 	if err := cs.writeConfigLocked(next); err != nil {
+		if persistenceErr, ok := err.(*ConfigPersistenceError); ok && persistenceErr.Outcome == ConfigPersistenceDurabilityUncertain {
+			cs.cfg = next
+		}
 		return err
 	}
 	cs.cfg = next
@@ -658,7 +693,10 @@ func (cs *ConfigStore) ToggleSource(id string, enabled bool) error {
 	return cs.mutate(func(c *PoolConfig) error {
 		for i, s := range c.Sources {
 			if s.ID == id {
-				c.Sources[i].Enabled = enabled
+				if c.Sources[i].Enabled != enabled {
+					c.Sources[i].Enabled = enabled
+					c.Sources[i].revision++
+				}
 				return nil
 			}
 		}
@@ -760,10 +798,20 @@ func validatePersistedPoolConfig(cfg *PoolConfig) error {
 	if len(cfg.Groups) > maxConfigGroups {
 		return fmt.Errorf("group count %d exceeds limit %d", len(cfg.Groups), maxConfigGroups)
 	}
+	seenGroupIDs := make(map[string]struct{}, len(cfg.Groups))
 	for i, group := range cfg.Groups {
 		for _, value := range []string{group.ID, group.Name, group.Strategy} {
 			if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
 				return fmt.Errorf("group %d contains an oversized or control-character value", i)
+			}
+		}
+		if _, exists := seenGroupIDs[group.ID]; exists {
+			return fmt.Errorf("group %d has duplicate id %q", i, group.ID)
+		}
+		seenGroupIDs[group.ID] = struct{}{}
+		for previous := 0; previous < i; previous++ {
+			if strings.EqualFold(cfg.Groups[previous].Name, group.Name) {
+				return fmt.Errorf("group %d has duplicate name %q", i, group.Name)
 			}
 		}
 		for _, values := range [][]string{group.Countries, group.Protocols, group.Sources, group.Nodes} {
@@ -776,6 +824,16 @@ func validatePersistedPoolConfig(cfg *PoolConfig) error {
 				}
 			}
 		}
+	}
+	for i := range cfg.Rules {
+		if strings.TrimSpace(cfg.Rules[i].Group) == "" {
+			return fmt.Errorf("rule %d group is required", i)
+		}
+		resolved, ok := resolveGroupReference(cfg.Rules[i].Group, cfg.Groups)
+		if !ok {
+			return fmt.Errorf("rule %d routing target does not exist: %s", i, cfg.Rules[i].Group)
+		}
+		cfg.Rules[i].Group = resolved.canonical
 	}
 	if len(cfg.Listeners) > maxConfigListeners {
 		return fmt.Errorf("listener count %d exceeds limit %d", len(cfg.Listeners), maxConfigListeners)
@@ -813,7 +871,7 @@ func validateListenerBinding(cfg *PoolConfig, listener ListenerBinding, allowEmp
 	listener.ID = strings.TrimSpace(listener.ID)
 	listener.Name = strings.TrimSpace(listener.Name)
 	listener.Mode = strings.ToLower(strings.TrimSpace(listener.Mode))
-	listener.Group = canonicalReservedGroup(listener.Group)
+	listener.Group = strings.TrimSpace(listener.Group)
 	listener.NodeKey = strings.TrimSpace(listener.NodeKey)
 	for _, value := range []string{listener.ID, listener.Name, listener.Mode, listener.Group, listener.NodeKey} {
 		if len(value) > maxConfigValueBytes || hasLogControlCharacters(value) {
@@ -837,15 +895,11 @@ func validateListenerBinding(cfg *PoolConfig, listener ListenerBinding, allowEmp
 		if listener.Group == "" {
 			return ListenerBinding{}, fmt.Errorf("group is required for group mode")
 		}
-		if code, ok := parseCountryGroup(listener.Group); ok {
-			if !validCountryGroupCode(code) {
-				return ListenerBinding{}, fmt.Errorf("country group must use a two-letter ASCII country code")
-			}
-			listener.Group = countryGroupPrefix + strings.ToUpper(code)
-		}
-		if !routingTargetExists(cfg, listener.Group) {
+		resolved, ok := resolveGroupReference(listener.Group, cfg.Groups)
+		if !ok {
 			return ListenerBinding{}, fmt.Errorf("listener group does not exist: %s", listener.Group)
 		}
+		listener.Group = resolved.canonical
 		if listener.NodeKey != "" {
 			return ListenerBinding{}, fmt.Errorf("node_key is only allowed for fixed mode")
 		}
@@ -853,9 +907,11 @@ func validateListenerBinding(cfg *PoolConfig, listener ListenerBinding, allowEmp
 		if listener.NodeKey == "" {
 			return ListenerBinding{}, fmt.Errorf("node_key is required for fixed mode")
 		}
-		if err := validateListenerNodeKey(listener.NodeKey); err != nil {
+		canonicalKey, err := canonicalListenerNodeKey(listener.NodeKey)
+		if err != nil {
 			return ListenerBinding{}, err
 		}
+		listener.NodeKey = canonicalKey
 		if listener.Group != "" {
 			return ListenerBinding{}, fmt.Errorf("group is only allowed for group mode")
 		}
@@ -867,16 +923,45 @@ func validateListenerBinding(cfg *PoolConfig, listener ListenerBinding, allowEmp
 	return listener, nil
 }
 
-func validateListenerNodeKey(key string) error {
-	u, err := url.Parse(key)
-	if err != nil || !isForwardingProtocol(strings.ToLower(u.Scheme)) || u.User != nil || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("node_key must be a protocol-aware proxy key")
+func canonicalListenerNodeKey(key string) (string, error) {
+	canonical, err := canonicalProxyKey(key)
+	if err != nil {
+		return "", fmt.Errorf("node_key must be a protocol-aware proxy key: %w", err)
 	}
-	port, err := strconv.ParseUint(u.Port(), 10, 16)
-	if err != nil || port == 0 {
-		return fmt.Errorf("node_key must include a port between 1 and 65535")
+	schemeEnd := strings.Index(canonical, "://")
+	if schemeEnd < 0 || !isForwardingProtocol(canonical[:schemeEnd]) {
+		return "", fmt.Errorf("node_key must use socks5, http, or https")
 	}
-	return nil
+	return canonical, nil
+}
+
+func listenerNodeKeysChanged(before, after []ListenerBinding) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for i := range before {
+		if before[i].NodeKey != after[i].NodeKey {
+			return true
+		}
+	}
+	return false
+}
+
+func groupReferencesChanged(beforeRules, afterRules []Rule, beforeListeners, afterListeners []ListenerBinding) bool {
+	if len(beforeRules) != len(afterRules) || len(beforeListeners) != len(afterListeners) {
+		return true
+	}
+	for i := range beforeRules {
+		if beforeRules[i].Group != afterRules[i].Group {
+			return true
+		}
+	}
+	for i := range beforeListeners {
+		if beforeListeners[i].Group != afterListeners[i].Group {
+			return true
+		}
+	}
+	return false
 }
 
 func validateSourceDefinition(source Source) (Source, error) {
@@ -978,7 +1063,7 @@ func (cs *ConfigStore) AddListener(binding ListenerBinding) (ListenerBinding, er
 func validateListenerBindingForAdd(binding ListenerBinding) (ListenerBinding, error) {
 	binding.Name = strings.TrimSpace(binding.Name)
 	binding.Mode = strings.ToLower(strings.TrimSpace(binding.Mode))
-	binding.Group = canonicalReservedGroup(binding.Group)
+	binding.Group = strings.TrimSpace(binding.Group)
 	binding.NodeKey = strings.TrimSpace(binding.NodeKey)
 	if binding.Name == "" {
 		return ListenerBinding{}, fmt.Errorf("name is required")
@@ -1078,7 +1163,7 @@ func (cs *ConfigStore) ReplaceListeners(bindings []ListenerBinding) error {
 		// manager always supplies stable IDs, so require them.
 		binding.Name = strings.TrimSpace(binding.Name)
 		binding.Mode = strings.ToLower(strings.TrimSpace(binding.Mode))
-		binding.Group = canonicalReservedGroup(binding.Group)
+		binding.Group = strings.TrimSpace(binding.Group)
 		binding.NodeKey = strings.TrimSpace(binding.NodeKey)
 		if binding.ID == "" {
 			return fmt.Errorf("listener id is required")
@@ -1170,6 +1255,30 @@ func readPrivateRegularFile(path string, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
+// privateFileAtomicError records whether rename made the replacement visible.
+// An error with renamed=true means the path contains the new bytes even though
+// syncing or closing its directory failed, so crash durability is uncertain.
+type privateFileAtomicError struct {
+	renamed bool
+	err     error
+}
+
+func (e *privateFileAtomicError) Error() string { return e.err.Error() }
+func (e *privateFileAtomicError) Unwrap() error { return e.err }
+
+var syncPrivateFileDirectory = func(dir string) error {
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
 func writePrivateFileAtomic(path string, data []byte) (returnErr error) {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("persisted state path must not be empty")
@@ -1204,16 +1313,10 @@ func writePrivateFileAtomic(path string, data []byte) (returnErr error) {
 	if err := os.Rename(tempPath, path); err != nil {
 		return err
 	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return err
+	if err := syncPrivateFileDirectory(dir); err != nil {
+		return &privateFileAtomicError{renamed: true, err: err}
 	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
+	return nil
 }
 
 func generateID(prefix string) string {

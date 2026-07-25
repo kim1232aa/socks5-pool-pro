@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,29 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func TestPageWindowLimitRejectsOverflowAndMaxInt(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	for _, pageSize := range []int{1, 2, maxNodePageSize} {
+		if got := pageWindowLimit(maxInt, pageSize); got != 0 {
+			t.Errorf("pageWindowLimit(MaxInt, %d) = %d, want 0", pageSize, got)
+		}
+	}
+	if got, want := pageWindowLimit(3, 2), 6; got != want {
+		t.Fatalf("pageWindowLimit(3, 2) = %d, want %d", got, want)
+	}
+}
+
+func TestPageCollectorWindowBoundsFirstAndLastPages(t *testing.T) {
+	for _, total := range []int{100, 1000, 10000} {
+		if limit, reverse := pageCollectorWindow(total, 0, 1); limit != 1 || reverse {
+			t.Errorf("total=%d first page window = (%d, %v), want (1, false)", total, limit, reverse)
+		}
+		if limit, reverse := pageCollectorWindow(total, total-1, total); limit != 1 || !reverse {
+			t.Errorf("total=%d last page window = (%d, %v), want (1, true)", total, limit, reverse)
+		}
+	}
+}
 
 func TestNodesPageFiltersSortsBoundsAndKeepsLegacyNodesArray(t *testing.T) {
 	server, nodes := pagedNodeTestServer(t)
@@ -85,6 +109,75 @@ func TestNodesPageFiltersSortsBoundsAndKeepsLegacyNodesArray(t *testing.T) {
 	bounded := getNodePage(t, handler, "/api/nodes/page?page=999&page_size=100000")
 	if bounded.PageSize != maxNodePageSize || bounded.Page != 1 || len(bounded.Nodes) != 5 {
 		t.Fatalf("bounded page = %#v, want clamped page 1 size %d and 5 rows", bounded, maxNodePageSize)
+	}
+
+	maxInt := int(^uint(0) >> 1)
+	hugePath := fmt.Sprintf("/api/nodes/page?page=%d&page_size=2&sort=latency", maxInt)
+	huge := getNodePage(t, handler, hugePath)
+	if huge.Page != 3 || huge.PageSize != 2 || huge.FilteredTotal != 5 || len(huge.Nodes) != 1 || huge.Nodes[0].Key != nodes["socks-us"].Key() {
+		t.Fatalf("overflow-safe last page = %#v", huge)
+	}
+}
+
+func TestNodePageSnapshotRejectsStaleActiveCursor(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(t *testing.T, server *StatusServer, nodes map[string]Proxy)
+	}{
+		{
+			name: "force sticky",
+			change: func(t *testing.T, server *StatusServer, nodes map[string]Proxy) {
+				if !server.pool.ForceSticky(GroupAny, nodes["http-jp"].Key()) {
+					t.Fatal("ForceSticky(ANY) = false")
+				}
+			},
+		},
+		{
+			name: "rotate sticky",
+			change: func(t *testing.T, server *StatusServer, _ map[string]Proxy) {
+				server.pool.SetAuto(GroupAny)
+				if _, ok := server.pool.RotateSticky(GroupAny); !ok {
+					t.Fatal("RotateSticky(ANY) = false")
+				}
+			},
+		},
+		{
+			name: "pick after clearing pin",
+			change: func(t *testing.T, server *StatusServer, nodes map[string]Proxy) {
+				server.pool.SetAuto(GroupAny)
+				if _, ok, _ := server.pool.PickExcluding(GroupAny, nil, map[string]bool{nodes["socks-us"].Key(): true}); !ok {
+					t.Fatal("PickExcluding(ANY) = false")
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, nodes := pagedNodeTestServer(t)
+			handler := server.handler()
+			original := getNodePage(t, handler, "/api/nodes/page?page=1&page_size=2")
+			test.change(t, server, nodes)
+
+			recorder := httptest.NewRecorder()
+			path := "/api/nodes/page?page=2&page_size=2&snapshot_id=" + url.QueryEscape(original.SnapshotID)
+			handler.ServeHTTP(recorder, localTestRequest(http.MethodGet, path, nil))
+			if got, want := recorder.Code, http.StatusConflict; got != want {
+				t.Fatalf("stale active snapshot status = %d, want %d; body=%s", got, want, recorder.Body.String())
+			}
+			var body struct {
+				Code string `json:"code"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode stale snapshot response: %v", err)
+			}
+			if body.Code != "snapshot_changed" {
+				t.Fatalf("stale active snapshot code = %q, want snapshot_changed", body.Code)
+			}
+			if got := recorder.Header().Get("X-Snapshot-ID"); got == "" || got == original.SnapshotID {
+				t.Fatalf("current snapshot header = %q, want a new token", got)
+			}
+		})
 	}
 }
 

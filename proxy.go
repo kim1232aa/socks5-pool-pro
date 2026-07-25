@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -95,12 +97,10 @@ type Proxy struct {
 	// itself via request headers.
 	Anonymity string
 
-	// Available reflects the most recent health check that actually tested
-	// this node: true if it passed, false if it was tested and failed.
-	// Nodes are never dropped from the pool just for failing a check - only
-	// this flag flips, so a node that starts working again (common for
-	// free/rotating proxies) self-heals on its next successful check
-	// instead of having to be rediscovered from a source feed.
+	// Available reflects the most recent accepted health result for this node.
+	// A complete automatic or manual check that ultimately fails makes the node
+	// terminally unavailable. Automatic checks cannot recover that state; only a
+	// later successful explicit manual verification can make it available again.
 	Available bool `json:"available"`
 }
 
@@ -143,7 +143,77 @@ func (p Proxy) urlWithScheme(scheme string) string {
 // The same ip:port may legitimately support one advertised protocol but not
 // another, so HTTP and SOCKS declarations must never share failure state.
 func (p Proxy) Key() string {
+	key, err := canonicalProxyEndpointKey(p.Protocol, p.IP, p.Port)
+	if err == nil {
+		return key
+	}
 	return p.Protocol + "://" + p.Addr()
+}
+
+// canonicalProxyKey validates and canonicalizes a protocol-aware proxy key.
+// It is shared by persisted fixed-listener keys and Proxy.Key API output.
+func canonicalProxyKey(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("proxy key must contain only a scheme, host, and port")
+	}
+	if u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(raw, "#") {
+		return "", fmt.Errorf("proxy key must not contain userinfo, path, query, or fragment")
+	}
+	return canonicalProxyEndpointKey(u.Scheme, u.Hostname(), u.Port())
+}
+
+func canonicalProxyEndpointKey(scheme, host, port string) (string, error) {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if !isProxyProtocol(scheme) {
+		return "", fmt.Errorf("unsupported proxy protocol %q", scheme)
+	}
+
+	host, err := canonicalProxyHost(host)
+	if err != nil {
+		return "", err
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return "", fmt.Errorf("proxy key port must be between 1 and 65535")
+	}
+	return scheme + "://" + net.JoinHostPort(host, strconv.FormatUint(portNumber, 10)), nil
+}
+
+func canonicalProxyHost(host string) (string, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Zone() != "" {
+			return "", fmt.Errorf("proxy key IP zones are not supported")
+		}
+		return addr.String(), nil
+	}
+
+	parts := strings.Split(host, ".")
+	if len(parts) == net.IPv4len {
+		var octets [net.IPv4len]byte
+		allNumeric := true
+		for i, part := range parts {
+			value, err := strconv.ParseUint(part, 10, 8)
+			if err != nil || part == "" {
+				allNumeric = false
+				break
+			}
+			octets[i] = byte(value)
+		}
+		if allNumeric {
+			return netip.AddrFrom4(octets).String(), nil
+		}
+		if looksLikeIPv4Literal(host) {
+			return "", fmt.Errorf("proxy key contains an invalid IPv4 address")
+		}
+	}
+
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if !validProxyHostname(host) {
+		return "", fmt.Errorf("proxy key contains an invalid host")
+	}
+	return host, nil
 }
 
 func (p Proxy) credentialCandidates() []Proxy {

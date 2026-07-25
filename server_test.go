@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -224,6 +226,76 @@ func TestReadConnectRequestAcceptsStrictDNSBoundaries(t *testing.T) {
 	}
 }
 
+func TestSendReplyEncodesBoundAddress(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		addr net.Addr
+		want []byte
+	}{
+		{
+			name: "IPv4",
+			addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.44"), Port: 32123},
+			want: []byte{socks5Version, replySucceeded, 0, atypIPv4, 192, 0, 2, 44, 0x7d, 0x7b},
+		},
+		{
+			name: "IPv6",
+			addr: &net.TCPAddr{IP: net.ParseIP("2001:db8::44"), Port: 443},
+			want: append([]byte{socks5Version, replySucceeded, 0, atypIPv6}, append(net.ParseIP("2001:db8::44").To16(), 0x01, 0xbb)...),
+		},
+		{
+			name: "failure without address",
+			want: []byte{socks5Version, replyGeneralFailure, 0, atypIPv4, 0, 0, 0, 0, 0, 0},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			serverSide, clientSide := net.Pipe()
+			defer serverSide.Close()
+			defer clientSide.Close()
+			status := byte(replySucceeded)
+			if test.addr == nil {
+				status = replyGeneralFailure
+			}
+			done := make(chan struct{})
+			go func() {
+				NewServer("", nil, nil).sendReply(serverSide, status, test.addr)
+				close(done)
+			}()
+			got := make([]byte, len(test.want))
+			if _, err := io.ReadFull(clientSide, got); err != nil {
+				t.Fatal(err)
+			}
+			<-done
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("SOCKS reply = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDirectDialErrorReplyMapsRFC1928Status(t *testing.T) {
+	timeoutErr := &net.DNSError{IsTimeout: true}
+	for _, test := range []struct {
+		name string
+		err  error
+		want byte
+	}{
+		{name: "connection refused", err: syscall.ECONNREFUSED, want: replyConnectionRefused},
+		{name: "network unreachable", err: syscall.ENETUNREACH, want: replyNetworkUnreachable},
+		{name: "host unreachable", err: syscall.EHOSTUNREACH, want: replyHostUnreachable},
+		{name: "DNS", err: &net.DNSError{Err: "no such host", Name: "missing.example", IsNotFound: true}, want: replyHostUnreachable},
+		{name: "timeout", err: timeoutErr, want: replyTTLExpired},
+		{name: "unsupported family", err: syscall.EAFNOSUPPORT, want: replyAddressTypeNotSupported},
+		{name: "wrapped errno", err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, want: replyConnectionRefused},
+		{name: "unknown", err: errors.New("unexpected dial failure"), want: replyGeneralFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := directDialErrorReply(test.err); got != test.want {
+				t.Fatalf("directDialErrorReply(%v) = %#02x, want %#02x", test.err, got, test.want)
+			}
+		})
+	}
+}
+
 func testSOCKSDomainFrame(domain string, port int) []byte {
 	frame := []byte{socks5Version, cmdConnect, 0, atypDomain, byte(len(domain))}
 	frame = append(frame, domain...)
@@ -257,12 +329,14 @@ func TestHandleConnAcceptsFragmentedFramesAndRelays(t *testing.T) {
 	defer targetListener.Close()
 
 	targetDone := make(chan error, 1)
+	acceptedRemote := make(chan net.Addr, 1)
 	go func() {
 		conn, err := targetListener.Accept()
 		if err != nil {
 			targetDone <- err
 			return
 		}
+		acceptedRemote <- conn.RemoteAddr()
 		defer conn.Close()
 		_, err = io.Copy(conn, conn)
 		targetDone <- err
@@ -310,6 +384,13 @@ func TestHandleConnAcceptsFragmentedFramesAndRelays(t *testing.T) {
 	}
 	if connectReply[1] != replySucceeded {
 		t.Fatalf("CONNECT reply status = %d, want success", connectReply[1])
+	}
+	remoteAddr := (<-acceptedRemote).(*net.TCPAddr)
+	if gotIP := net.IP(connectReply[4:8]); !gotIP.Equal(remoteAddr.IP) {
+		t.Fatalf("CONNECT BND.ADDR = %s, want tunnel local address %s", gotIP, remoteAddr.IP)
+	}
+	if gotPort := int(connectReply[8])<<8 | int(connectReply[9]); gotPort != remoteAddr.Port {
+		t.Fatalf("CONNECT BND.PORT = %d, want tunnel local port %d", gotPort, remoteAddr.Port)
 	}
 
 	deadlines := recorded.recordedDeadlines()
@@ -398,6 +479,9 @@ func TestHandleConnRetriesAuthenticationCandidateAndPromotesIt(t *testing.T) {
 	}
 	if connectReply[1] != replySucceeded {
 		t.Fatalf("credential retry CONNECT reply = %d", connectReply[1])
+	}
+	if gotPort := int(connectReply[8])<<8 | int(connectReply[9]); gotPort == 0 {
+		t.Fatal("upstream CONNECT reply returned a zero BND.PORT instead of the tunnel local address")
 	}
 	const payload = "credential alternate carried this tunnel"
 	_, _ = clientSide.Write([]byte(payload))
@@ -623,6 +707,165 @@ func TestHandleConnTargetRefusalDoesNotMarkUpstreamUnavailable(t *testing.T) {
 	}
 }
 
+type controlledRelayConn struct {
+	readErr  error
+	readGate chan struct{}
+	closed   chan struct{}
+	started  chan struct{}
+
+	startedOnce sync.Once
+	closeOnce   sync.Once
+	fullCloses  atomic.Int32
+	halfReads   atomic.Int32
+	halfWrites  atomic.Int32
+}
+
+func newControlledRelayConn(readErr error) *controlledRelayConn {
+	return &controlledRelayConn{
+		readErr:  readErr,
+		readGate: make(chan struct{}),
+		closed:   make(chan struct{}),
+		started:  make(chan struct{}),
+	}
+}
+
+func (c *controlledRelayConn) Read([]byte) (int, error) {
+	c.startedOnce.Do(func() { close(c.started) })
+	select {
+	case <-c.readGate:
+		return 0, c.readErr
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *controlledRelayConn) Write(p []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+		return len(p), nil
+	}
+}
+
+func (c *controlledRelayConn) Close() error {
+	c.fullCloses.Add(1)
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *controlledRelayConn) CloseRead() error {
+	c.halfReads.Add(1)
+	return nil
+}
+
+func (c *controlledRelayConn) CloseWrite() error {
+	c.halfWrites.Add(1)
+	return nil
+}
+
+func (c *controlledRelayConn) LocalAddr() net.Addr              { return testStaticAddr("local") }
+func (c *controlledRelayConn) RemoteAddr() net.Addr             { return testStaticAddr("remote") }
+func (c *controlledRelayConn) SetDeadline(time.Time) error      { return nil }
+func (c *controlledRelayConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *controlledRelayConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestRelayFirstErrorFullClosesAndJoinsWorkers(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "net.ErrClosed", err: net.ErrClosed},
+		{name: "non-EOF error", err: errors.New("controlled copy failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			left := newControlledRelayConn(test.err)
+			right := newControlledRelayConn(nil)
+			relayDone := make(chan struct{})
+			go func() {
+				relay(left, right)
+				close(relayDone)
+			}()
+
+			select {
+			case <-left.started:
+			case <-time.After(time.Second):
+				t.Fatal("relay did not start the erroring worker")
+			}
+			select {
+			case <-right.started:
+			case <-time.After(time.Second):
+				t.Fatal("relay did not start the blocked worker")
+			}
+			close(left.readGate)
+
+			select {
+			case <-relayDone:
+			case <-time.After(time.Second):
+				_ = left.Close()
+				_ = right.Close()
+				<-relayDone
+				t.Fatal("relay did not abort and join the blocked worker")
+			}
+			if left.fullCloses.Load() == 0 || right.fullCloses.Load() == 0 {
+				t.Fatalf("full closes = left:%d right:%d, want both closed", left.fullCloses.Load(), right.fullCloses.Load())
+			}
+			if left.halfReads.Load()+left.halfWrites.Load()+right.halfReads.Load()+right.halfWrites.Load() != 0 {
+				t.Fatalf("error path attempted half-close: left read/write=%d/%d right read/write=%d/%d",
+					left.halfReads.Load(), left.halfWrites.Load(), right.halfReads.Load(), right.halfWrites.Load())
+			}
+		})
+	}
+}
+
+func TestRelayFirstNetErrClosedOnTCPAbortsBlockedPeer(t *testing.T) {
+	client, relayLeft := testTCPConnectionPair(t)
+	relayRight, target := testTCPConnectionPair(t)
+	defer client.Close()
+	defer relayLeft.Close()
+	defer relayRight.Close()
+	defer target.Close()
+
+	relayDone := make(chan struct{})
+	go func() {
+		relay(relayLeft, relayRight)
+		close(relayDone)
+	}()
+
+	const probe = "relay-started"
+	if _, err := client.Write([]byte(probe)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(probe))
+	if _, err := io.ReadFull(target, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != probe {
+		t.Fatalf("TCP probe = %q, want %q", got, probe)
+	}
+
+	// Closing a relay-owned socket makes its io.Copy return net.ErrClosed while
+	// the opposite worker remains blocked on an otherwise idle TCP connection.
+	if err := relayLeft.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-relayDone:
+	case <-time.After(time.Second):
+		t.Fatal("relay remained blocked after the first TCP worker returned net.ErrClosed")
+	}
+
+	if err := target.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := target.Read(one[:]); err == nil {
+		t.Fatal("relay did not full-close the blocked TCP peer")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("relay left the blocked TCP peer open: %v", err)
+	}
+}
+
 func TestRelayPropagatesHalfCloseThroughBufferedHTTPConnection(t *testing.T) {
 	client, relayLeft := testTCPConnectionPair(t)
 	relayRight, target := testTCPConnectionPair(t)
@@ -835,13 +1078,69 @@ func TestServerShutdownHonorsContextDeadline(t *testing.T) {
 		t.Fatalf("Shutdown ignored context deadline: %s", elapsed)
 	}
 
-	// Complete the synthetic handler registration so the waiter spawned by
-	// Shutdown can exit; a real serve goroutine does this in its defer path.
+	// Complete the synthetic handler registration so the shared shutdown waiter
+	// can exit; a real serve goroutine does this in its defer path.
 	server.unregisterActiveConnection(tracked)
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
 	if err := server.Shutdown(ctx2); err != nil {
 		t.Fatalf("second Shutdown after active handler exit = %v", err)
+	}
+}
+
+func TestServerShutdownCallsShareOneActiveConnectionWaiter(t *testing.T) {
+	const calls = 200
+	for _, concurrent := range []bool{false, true} {
+		name := "consecutive"
+		if concurrent {
+			name = "concurrent"
+		}
+		t.Run(name, func(t *testing.T) {
+			server := NewServerWithCredentialsAndLimit("", NewProxyPool(), &ConfigStore{}, "", "", 1)
+			tracked, peer := net.Pipe()
+			defer peer.Close()
+			if !server.registerActiveConnection(tracked) {
+				t.Fatal("failed to register test connection")
+			}
+
+			baseline := runtime.NumGoroutine()
+			if concurrent {
+				start := make(chan struct{})
+				results := make(chan error, calls)
+				for range calls {
+					go func() {
+						<-start
+						ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+						defer cancel()
+						results <- server.Shutdown(ctx)
+					}()
+				}
+				close(start)
+				for range calls {
+					if err := <-results; !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatalf("Shutdown() error = %v, want deadline exceeded", err)
+					}
+				}
+			} else {
+				for range calls {
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					if err := server.Shutdown(ctx); !errors.Is(err, context.Canceled) {
+						t.Fatalf("Shutdown() error = %v, want context canceled", err)
+					}
+				}
+			}
+			if got := runtime.NumGoroutine() - baseline; got >= calls/2 {
+				t.Fatalf("%s Shutdown calls retained a waiter per call: goroutine delta = %d", name, got)
+			}
+
+			server.unregisterActiveConnection(tracked)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := server.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown() after active handler exit = %v", err)
+			}
+		})
 	}
 }
 

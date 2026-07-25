@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -29,7 +30,10 @@ const (
 
 	replySucceeded               = 0x00
 	replyGeneralFailure          = 0x01
+	replyNetworkUnreachable      = 0x03
 	replyHostUnreachable         = 0x04
+	replyConnectionRefused       = 0x05
+	replyTTLExpired              = 0x06
 	replyCommandNotSupported     = 0x07
 	replyAddressTypeNotSupported = 0x08
 
@@ -53,12 +57,15 @@ type Server struct {
 	routePolicy *listenerRoutePolicy
 	onStop      func(error)
 
-	stateMu      sync.Mutex
-	listener     net.Listener
-	activeConns  map[net.Conn]struct{}
-	activeWG     sync.WaitGroup
-	shuttingDown bool
-	shutdownCh   chan struct{}
+	stateMu        sync.Mutex
+	listener       net.Listener
+	activeConns    map[net.Conn]struct{}
+	activeWG       sync.WaitGroup
+	drainOnce      sync.Once
+	drainCh        chan struct{}
+	shuttingDown   bool
+	shutdownCtx    context.Context
+	cancelShutdown context.CancelFunc
 }
 
 // listenerRoutePolicy selects the route behavior for an individual SOCKS
@@ -94,15 +101,18 @@ func NewServerWithCredentialsAndLimit(listenAddr string, pool *ProxyPool, store 
 	if maxConnections <= 0 {
 		maxConnections = defaultSOCKSMaxClientConnections
 	}
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
 	return &Server{
-		listenAddr:  listenAddr,
-		pool:        pool,
-		store:       store,
-		socksUser:   socksUser,
-		socksPass:   socksPass,
-		connSlots:   make(chan struct{}, maxConnections),
-		activeConns: make(map[net.Conn]struct{}),
-		shutdownCh:  make(chan struct{}),
+		listenAddr:     listenAddr,
+		pool:           pool,
+		store:          store,
+		socksUser:      socksUser,
+		socksPass:      socksPass,
+		connSlots:      make(chan struct{}, maxConnections),
+		activeConns:    make(map[net.Conn]struct{}),
+		drainCh:        make(chan struct{}),
+		shutdownCtx:    shutdownCtx,
+		cancelShutdown: cancelShutdown,
 	}
 }
 
@@ -238,10 +248,9 @@ func (s *Server) Start() error {
 	return err
 }
 
-// Shutdown stops admission and gives active handshakes/relays until ctx's
-// deadline to finish naturally. At the deadline it force-closes every tracked
-// client and upstream connection, so an uncooperative peer can never extend
-// shutdown beyond the caller's budget.
+// Shutdown stops admission and immediately cancels this Server generation's
+// outbound dials and upstream handshakes. Existing relays may finish naturally
+// until ctx expires; at that point every tracked connection is force-closed.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -250,8 +259,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.stateMu.Lock()
 	if !s.shuttingDown {
 		s.shuttingDown = true
-		if s.shutdownCh != nil {
-			close(s.shutdownCh)
+		if s.cancelShutdown != nil {
+			s.cancelShutdown()
 		}
 	}
 	ln := s.listener
@@ -261,13 +270,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		_ = ln.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.activeWG.Wait()
-		close(done)
-	}()
+	s.drainOnce.Do(func() {
+		go func() {
+			s.activeWG.Wait()
+			close(s.drainCh)
+		}()
+	})
 	select {
-	case <-done:
+	case <-s.drainCh:
 		return nil
 	case <-ctx.Done():
 		s.closeActiveConnections()
@@ -291,6 +301,27 @@ func (s *Server) isShuttingDown() bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.shuttingDown
+}
+
+func (s *Server) generationStopped() bool {
+	select {
+	case <-s.shutdownCtx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// commitGenerationResult serializes pool publication with Shutdown. Once this
+// generation is canceled, no completed dial or handshake may mutate pool state.
+func (s *Server) commitGenerationResult(commit func()) (stopped bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.shuttingDown {
+		return true
+	}
+	commit()
+	return false
 }
 
 func (s *Server) registerActiveConnection(conn net.Conn) bool {
@@ -351,7 +382,7 @@ func (s *Server) serve(ln net.Listener) error {
 				timer := time.NewTimer(temporaryDelay)
 				select {
 				case <-timer.C:
-				case <-s.shutdownCh:
+				case <-s.shutdownCtx.Done():
 					if !timer.Stop() {
 						select {
 						case <-timer.C:
@@ -439,14 +470,21 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 
 	if groupName == GroupDirect {
-		remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		remote, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(s.shutdownCtx, "tcp", targetAddr)
 		if err != nil {
+			if s.generationStopped() {
+				return
+			}
 			log.Printf("[server] direct dial %s failed: %v", targetAddr, err)
-			s.sendReply(conn, replyGeneralFailure)
+			s.sendReply(conn, directDialErrorReply(err))
+			return
+		}
+		if s.generationStopped() {
+			_ = remote.Close()
 			return
 		}
 		log.Printf("[route] %s -> DIRECT", host)
-		s.sendReply(conn, replySucceeded)
+		s.sendReply(conn, replySucceeded, remote.LocalAddr())
 		s.relay(conn, remote)
 		return
 	}
@@ -485,31 +523,67 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		dialStart := time.Now()
 		healthGeneration := s.pool.HealthGeneration()
-		remote, verified, err := DialUpstreamCredentialCandidatesContext(context.Background(), upstream, targetAddr, 10*time.Second)
+		remote, verified, err := DialUpstreamCredentialCandidatesContext(s.shutdownCtx, upstream, targetAddr, 10*time.Second)
 		if err != nil {
-			log.Printf("[server] upstream %s (group %s) failed: %v, switching...", upstream.Addr(), groupName, err)
-			if upstreamFailureAffectsHealth(err) {
-				s.pool.RecordResult(upstream.Key(), false, 0)
-				// A completed upstream connect/auth/protocol failure is terminal for
-				// automatic routing. Target-specific refusals stay request-local.
-				s.pool.ObserveHealthResultAtGeneration(upstream.Key(), false, 0, healthGeneration)
+			if s.commitGenerationResult(func() {
+				log.Printf("[server] upstream %s (group %s) failed: %v, switching...", upstream.Addr(), groupName, err)
+				if upstreamFailureAffectsHealth(err) {
+					s.pool.RecordResult(upstream.Key(), false, 0)
+					// A completed upstream connect/auth/protocol failure is terminal for
+					// automatic routing. Target-specific refusals stay request-local.
+					s.pool.ObserveHealthResultAtGeneration(upstream.Key(), false, 0, healthGeneration)
+				}
+			}) {
+				return
 			}
 			exclude[upstream.Key()] = true
 			continue
 		}
-		s.pool.UpdateVerifiedCredentialsAtGeneration(upstream.Key(), verified, healthGeneration)
+		if s.commitGenerationResult(func() {
+			s.pool.UpdateVerifiedCredentialsAtGeneration(upstream.Key(), verified, healthGeneration)
+			s.pool.RecordResult(upstream.Key(), true, time.Since(dialStart).Milliseconds())
+		}) {
+			_ = remote.Close()
+			return
+		}
 		upstream = verified
-		s.pool.RecordResult(upstream.Key(), true, time.Since(dialStart).Milliseconds())
 
 		// Success - log which upstream carried this target, so it's
 		// visible which node each domain actually used.
 		log.Printf("[route] %s -> group %s -> %s://%s", host, groupName, upstream.Protocol, upstream.Addr())
-		s.sendReply(conn, replySucceeded)
+		s.sendReply(conn, replySucceeded, remote.LocalAddr())
 		s.relay(conn, remote)
 		return
 	}
 
 	s.sendReply(conn, replyGeneralFailure)
+}
+
+func directDialErrorReply(err error) byte {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return replyConnectionRefused
+	}
+	if errors.Is(err, syscall.ENETUNREACH) {
+		return replyNetworkUnreachable
+	}
+	if errors.Is(err, syscall.EHOSTUNREACH) {
+		return replyHostUnreachable
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		if dnsErr.Timeout() {
+			return replyTTLExpired
+		}
+		return replyHostUnreachable
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return replyTTLExpired
+	}
+	if errors.Is(err, syscall.EAFNOSUPPORT) || errors.Is(err, syscall.EPROTONOSUPPORT) {
+		return replyAddressTypeNotSupported
+	}
+	return replyGeneralFailure
 }
 
 // requiresAuthentication deliberately treats a partially supplied pair as
@@ -709,9 +783,20 @@ func writeFull(w io.Writer, p []byte) error {
 	return nil
 }
 
-func (s *Server) sendReply(conn net.Conn, status byte) {
-	// Minimal SOCKS5 reply: ver, status, rsv, atyp(ipv4), addr(0.0.0.0), port(0)
-	_ = writeFull(conn, []byte{socks5Version, status, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0})
+func (s *Server) sendReply(conn net.Conn, status byte, bound ...net.Addr) {
+	reply := []byte{socks5Version, status, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
+	if len(bound) > 0 && bound[0] != nil {
+		if tcpAddr, ok := bound[0].(*net.TCPAddr); ok && tcpAddr.Port >= 0 && tcpAddr.Port <= 65535 {
+			if ip4 := tcpAddr.IP.To4(); ip4 != nil {
+				reply = append([]byte{socks5Version, status, 0x00, atypIPv4}, ip4...)
+				reply = append(reply, byte(tcpAddr.Port>>8), byte(tcpAddr.Port))
+			} else if ip6 := tcpAddr.IP.To16(); ip6 != nil {
+				reply = append([]byte{socks5Version, status, 0x00, atypIPv6}, ip6...)
+				reply = append(reply, byte(tcpAddr.Port>>8), byte(tcpAddr.Port))
+			}
+		}
+	}
+	_ = writeFull(conn, reply)
 }
 
 // parseTarget extracts the target address from a SOCKS5 connect request.
@@ -790,14 +875,16 @@ func relay(left, right net.Conn) {
 
 	cp := func(dst, src net.Conn) {
 		_, err := io.Copy(dst, src)
-		// Try a half-close on clean completion or read EOF (which io.Copy yields as err == nil).
-		// This permits a client request body to finish (half-closing up) while the server response
-		// stream continues downloading, standard HTTP behavior.
-		if writer, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = writer.CloseWrite()
-		}
-		if reader, ok := src.(interface{ CloseRead() error }); ok {
-			_ = reader.CloseRead()
+		// io.Copy reports a read EOF as nil. Only that clean completion may propagate a
+		// half-close; every other error must abort the relay so the peer worker cannot
+		// remain blocked indefinitely.
+		if err == nil || errors.Is(err, io.EOF) {
+			if writer, ok := dst.(interface{ CloseWrite() error }); ok {
+				_ = writer.CloseWrite()
+			}
+			if reader, ok := src.(interface{ CloseRead() error }); ok {
+				_ = reader.CloseRead()
+			}
 		}
 		done <- copyResult{err: err}
 	}
@@ -805,22 +892,15 @@ func relay(left, right net.Conn) {
 	go cp(left, right)
 	go cp(right, left)
 
-	// Wait for the first direction to finish.
+	// Wait for the first direction to finish. A clean EOF preserves the other
+	// direction for half-close protocols; net.ErrClosed is only expected after
+	// our own abort, so it is anomalous when it arrives first.
 	first := <-done
-
-	// Identify anomalous errors (not EOF, and not the secondary net.ErrClosed triggered when
-	// we force-close below). A reset/timeout/malformed payload requires a hard abort - waiting
-	// for the other direction's Read to eventually unblock leaks the goroutine.
-	isAnomalous := first.err != nil && !errors.Is(first.err, net.ErrClosed)
-
-	if isAnomalous {
-		// One direction died abnormally. Don't wait for the other direction to figure it out
-		// on its own; actively break its block with a full close of both underlying sockets.
+	if first.err != nil && !errors.Is(first.err, io.EOF) {
 		_ = left.Close()
 		_ = right.Close()
 	}
 
-	// Wait for the surviving worker to notice the half-close (if normal) or the full-close
-	// (if anomalous) and exit. We must join both goroutines before we return and drop the slots.
+	// Join the surviving worker after either the normal half-close or hard abort.
 	<-done
 }

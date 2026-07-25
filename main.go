@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -43,15 +45,29 @@ type RefreshOperation struct {
 }
 
 type SourceRefreshOperation struct {
-	ID          string `json:"id"`
-	SourceID    string `json:"source_id"`
-	SourceName  string `json:"source_name"`
-	Status      string `json:"status"`
-	Trigger     string `json:"trigger"`
-	RequestedAt string `json:"requested_at"`
-	StartedAt   string `json:"started_at,omitempty"`
-	CompletedAt string `json:"completed_at,omitempty"`
-	Error       string `json:"error,omitempty"`
+	ID             string `json:"id"`
+	SourceID       string `json:"source_id"`
+	SourceName     string `json:"source_name"`
+	Status         string `json:"status"`
+	Trigger        string `json:"trigger"`
+	RequestedAt    string `json:"requested_at"`
+	StartedAt      string `json:"started_at,omitempty"`
+	CompletedAt    string `json:"completed_at,omitempty"`
+	Error          string `json:"error,omitempty"`
+	sourceRevision sourceRefreshRevision
+}
+
+type sourceRefreshRevision Source
+
+func newSourceRefreshRevision(source Source) sourceRefreshRevision {
+	return sourceRefreshRevision(source)
+}
+
+func (revision sourceRefreshRevision) matches(source Source, trigger string) bool {
+	if !source.Enabled || (trigger == "scheduled" && !source.AutoRefreshEnabled) {
+		return false
+	}
+	return revision == sourceRefreshRevision(source)
 }
 
 type RefreshOperationStatus struct {
@@ -95,6 +111,76 @@ type scrapeStatusSnapshot struct {
 	Info ScrapeInfo
 }
 
+type backgroundLifecycle struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func newBackgroundLifecycle(parent context.Context) *backgroundLifecycle {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &backgroundLifecycle{ctx: ctx, cancel: cancel}
+}
+
+func (l *backgroundLifecycle) Context() context.Context { return l.ctx }
+
+func (l *backgroundLifecycle) Go(worker func(context.Context)) {
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		worker(l.ctx)
+	}()
+}
+
+func (l *backgroundLifecycle) Cancel() { l.cancel() }
+
+func (l *backgroundLifecycle) Join(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		l.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func shutdownApplication(ctx context.Context, coordinator *RefreshCoordinator, lifecycle *backgroundLifecycle, stopAdmission func(context.Context) error, flush func() error) error {
+	coordinator.shutdown()
+	admissionErr := stopAdmission(ctx)
+	lifecycle.Cancel()
+	if err := lifecycle.Join(ctx); err != nil {
+		return errors.Join(admissionErr, fmt.Errorf("background workers did not stop before shutdown deadline: %w", err))
+	}
+	return errors.Join(admissionErr, flush())
+}
+
+func waitForShutdown(signalDone <-chan struct{}, serverErrors <-chan error, listenerFatalEvents <-chan ListenerFatalEvent) error {
+	select {
+	case <-signalDone:
+		return nil
+	case err := <-serverErrors:
+		return err
+	case event := <-listenerFatalEvents:
+		return fmt.Errorf("auxiliary listener %s (%s) stopped unexpectedly: %w", event.ID, event.Addr, event.Err)
+	}
+}
+
+func stopAndDrainTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
 func main() {
 	cfg := ParseConfig()
 	if err := cfg.Validate(); err != nil {
@@ -112,12 +198,18 @@ func main() {
 	log.Printf("  data-dir: %s", cfg.DataDir)
 	log.Printf("  scrape:   every %s", cfg.ScrapeInterval)
 
+	// Establish the root application context before any refresh, recheck,
+	// rotation, or baseline request starts.
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	background := newBackgroundLifecycle(context.Background())
+
 	// Establish the policy baseline before deciding whether a persisted pool was
 	// validated under the same require-ip-change criterion. When the policy is
 	// disabled its fingerprint is baseline-independent, so avoid delaying both
 	// listeners on an unnecessary external request.
 	if cfg.RequireIPChange {
-		InitBaselineExit(cfg.CheckTimeout)
+		_, _ = RefreshBaselineExitWithChangeContext(signalContext, cfg.CheckTimeout)
 	}
 
 	coordinator := newRefreshCoordinator()
@@ -171,17 +263,9 @@ func main() {
 		}
 	}
 
-	// Background: initial scrape + check, then periodic scrape + manual
-	// refresh, all serialized through one goroutine/loop. This runs in the
-	// background so the dashboard and cached pool are available right away
-	// instead of blocking on it - but it's still a single loop (not a
-	// separate "initial" goroutine plus this one) specifically so two
-	// refreshPool calls can never run concurrently: a manual refresh
-	// (e.g. from saving a new check-url) landing while the startup scrape
-	// is still in flight would otherwise race it, and whichever one
-	// finished last would "win" with possibly-stale settings even though
-	// the newer request should always be the one that takes effect.
-	go func() {
+	// Background: initial scrape + check, then periodic scrape + manual refresh,
+	// all serialized through one lifecycle-owned worker.
+	background.Go(func(ctx context.Context) {
 		run := func(trigger string, manual bool) {
 			var operationID string
 			if manual {
@@ -190,11 +274,17 @@ func main() {
 			} else {
 				operationID = coordinator.beginBackgroundRefreshOperation(trigger)
 			}
-			result := refreshPool(cfg, store, pool, coordinator)
+			if operationID == "" {
+				return
+			}
+			result := refreshPoolContext(ctx, cfg, store, pool, coordinator)
 			coordinator.finishRefreshOperation(operationID, result)
 		}
 
 		run("startup", false)
+		if ctx.Err() != nil {
+			return
+		}
 		coordinator.markSourcesRefreshed(store.Sources(), time.Now())
 		scanInterval := cfg.ScrapeInterval
 		if scanInterval > time.Minute {
@@ -204,6 +294,8 @@ func main() {
 		defer timer.Stop()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-timer.C:
 				coordinator.queueDueSourceRefreshes(store, cfg.ScrapeInterval, time.Now())
 				timer.Reset(scanInterval)
@@ -214,27 +306,24 @@ func main() {
 				if !ok {
 					continue
 				}
-				result := refreshSource(cfg, store, pool, coordinator, sourceID, operation.Trigger)
+				result := refreshSourceContext(ctx, cfg, store, pool, coordinator, sourceID, operation.Trigger, operation.sourceRevision)
 				coordinator.finishSourceRefresh(sourceID, result)
 			}
 		}
-	}()
+	})
 
-	// Establish the shutdown signal context before launching background
-	// goroutines so they can all select on it instead of using blocking sleeps.
-	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
-
-	// Background: random rotation of the default (ANY) group every 3-6
-	// minutes. If the pool is empty, trigger an immediate refresh instead.
-	go func() {
+	// Background: random rotation of the default (ANY) group every 3-6 minutes.
+	background.Go(func(ctx context.Context) {
 		for {
 			delay := 3*time.Minute + time.Duration(rand.Intn(4))*time.Minute
 			timer := time.NewTimer(delay)
 			select {
-			case <-timer.C:
-			case <-signalContext.Done():
+			case <-ctx.Done():
 				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if ctx.Err() != nil {
 				return
 			}
 			if pool.Size() == 0 {
@@ -244,39 +333,27 @@ func main() {
 				pool.RotateSticky(GroupAny)
 			}
 		}
-	}()
+	})
 
-	// Background: periodically re-check known nodes' latency/health so the
-	// latency/score strategies (and each node's Available flag) stay
-	// current between full refreshes. Runs once shortly after startup too -
-	// otherwise nodes restored from an older cache file (before the
-	// Available field existed) would sit defaulted to Available=false, and
-	// so hidden by the dashboard's default filter, for up to 5 minutes.
-	go func() {
+	// Background: periodically re-check known nodes' latency and health.
+	background.Go(func(ctx context.Context) {
 		timer := time.NewTimer(15 * time.Second)
 		defer timer.Stop()
 		for {
 			full := false
 			select {
+			case <-ctx.Done():
+				return
 			case <-timer.C:
 			case <-coordinator.recheckChan:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
+				stopAndDrainTimer(timer)
 			case <-coordinator.fullRecheckChan:
 				full = true
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
+				stopAndDrainTimer(timer)
 			}
-			// A full request is stronger than a bounded one. Coalesce it even if a
-			// periodic/manual bounded signal won the select above first.
+			if ctx.Err() != nil {
+				return
+			}
 			if !full {
 				select {
 				case <-coordinator.fullRecheckChan:
@@ -285,7 +362,10 @@ func main() {
 				}
 			}
 			if cfg.RequireIPChange {
-				_, baselineChanged := RefreshBaselineExitWithChange(cfg.CheckTimeout)
+				_, baselineChanged := RefreshBaselineExitWithChangeContext(ctx, cfg.CheckTimeout)
+				if ctx.Err() != nil {
+					return
+				}
 				if baselineChanged && pool.SetRequireIPChangePolicy(true) {
 					pool.InvalidateHealth(store.CheckURL())
 					pool.candidates.ResetHealthOutcomes()
@@ -301,13 +381,16 @@ func main() {
 				}
 			}
 			if full {
-				reCheckAllAlive(cfg, store, pool, coordinator)
+				reCheckAllAliveContext(ctx, cfg, store, pool, coordinator)
 			} else {
-				reCheckAlive(cfg, store, pool, coordinator)
+				reCheckAliveContext(ctx, cfg, store, pool, coordinator)
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			timer.Reset(5 * time.Minute)
 		}
-	}()
+	})
 
 	status := NewStatusServerWithAdminCredentialsAndCoordinator(pool, store, coordinator, cfg.AdminUser, cfg.AdminPass)
 	listenerManager := NewListenerManager(
@@ -339,30 +422,20 @@ func main() {
 	}()
 	go func() { serverErrors <- server.Start() }()
 
-	var exitErr error
-	select {
-	case <-signalContext.Done():
+	exitErr := waitForShutdown(signalContext.Done(), serverErrors, listenerManager.FatalEvents())
+	if exitErr == nil {
 		log.Printf("[main] shutdown requested")
-	case err := <-serverErrors:
-		if err != nil {
-			exitErr = err
-			log.Printf("[main] listener failed: %v", err)
-		}
+	} else {
+		log.Printf("[main] listener failed: %v", exitErr)
 	}
 
 	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelShutdown()
-	if err := status.Shutdown(shutdownContext); err != nil {
-		log.Printf("[status] shutdown: %v", err)
-	}
-	if err := listenerManager.Shutdown(shutdownContext); err != nil {
-		log.Printf("[listeners] shutdown: %v", err)
-	}
-	if err := server.Shutdown(shutdownContext); err != nil {
-		log.Printf("[server] shutdown: %v", err)
-	}
-	if err := pool.FlushCache(); err != nil {
-		log.Printf("[cache] shutdown flush failed: %v", err)
+	shutdownErr := shutdownApplication(shutdownContext, coordinator, background, func(ctx context.Context) error {
+		return errors.Join(status.Shutdown(ctx), listenerManager.Shutdown(ctx), server.Shutdown(ctx))
+	}, pool.FlushCache)
+	if shutdownErr != nil {
+		log.Printf("[main] shutdown incomplete: %v", shutdownErr)
 	}
 	if exitErr != nil {
 		log.Fatalf("[main] stopped after listener failure: %v", exitErr)
@@ -374,10 +447,18 @@ func main() {
 // without an unbounded retained pool turning a five-minute background pass
 // into a multi-hour job. No scraping or geo lookups happen here.
 func reCheckAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
-	_, _ = reCheckNodes(cfg, store, pool, coordinator, pool.RecheckCandidates(cfg.MaxCandidates), pool.Size(), "recheck", "")
+	reCheckAliveContext(context.Background(), cfg, store, pool, coordinator)
+}
+
+func reCheckAliveContext(ctx context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
+	_, _ = reCheckNodesContext(ctx, cfg, store, pool, coordinator, pool.RecheckCandidates(cfg.MaxCandidates), pool.Size(), "recheck", "")
 }
 
 func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
+	reCheckAllAliveContext(context.Background(), cfg, store, pool, coordinator)
+}
+
+func reCheckAllAliveContext(ctx context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
 	all := pool.All()
 	nodes := all[:0]
 	for _, px := range all {
@@ -386,7 +467,7 @@ func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinat
 		}
 	}
 	operation := coordinator.beginHealthRecheckOperation(pool, len(nodes))
-	generation, completed := reCheckNodes(cfg, store, pool, coordinator, nodes, len(nodes), "full-recheck", operation.ID)
+	generation, completed := reCheckNodesContext(ctx, cfg, store, pool, coordinator, nodes, len(nodes), "full-recheck", operation.ID)
 	if completed {
 		completed = pool.CompleteHealthRecheck(generation)
 		if completed {
@@ -399,6 +480,13 @@ func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinat
 }
 
 func reCheckNodes(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, nodes []Proxy, knownTotal int, logLabel, operationID string) (uint64, bool) {
+	return reCheckNodesContext(context.Background(), cfg, store, pool, coordinator, nodes, knownTotal, logLabel, operationID)
+}
+
+func reCheckNodesContext(parent context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, nodes []Proxy, knownTotal int, logLabel, operationID string) (uint64, bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	coordinator.healthCycleMu.Lock()
 	defer coordinator.healthCycleMu.Unlock()
 	healthGeneration, testURL := currentHealthCriterion(pool, store)
@@ -410,6 +498,12 @@ func reCheckNodes(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator 
 		return healthGeneration, false
 	}
 	defer finishHealthWork()
+	workContext, cancelWork := context.WithCancel(healthContext)
+	stopParentCancel := context.AfterFunc(parent, cancelWork)
+	defer func() {
+		stopParentCancel()
+		cancelWork()
+	}()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	baseline := BaselineExitIP()
@@ -424,17 +518,17 @@ checkLoop:
 		}
 		select {
 		case sem <- struct{}{}:
-		case <-healthContext.Done():
+		case <-workContext.Done():
 			break checkLoop
 		}
 		wg.Add(1)
 		go func(px Proxy) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			nodeContext, cancelNode := context.WithTimeout(healthContext, cfg.CheckTimeout)
+			nodeContext, cancelNode := context.WithTimeout(workContext, cfg.CheckTimeout)
 			defer cancelNode()
 			verified, reachable, latency := checkCredentialCandidates(nodeContext, px, testURL, cfg.CheckTimeout)
-			if healthContext.Err() != nil {
+			if workContext.Err() != nil {
 				return
 			}
 			policyAllowed := true
@@ -443,7 +537,7 @@ checkLoop:
 			ipChanged := false
 			if reachable && cfg.RequireIPChange {
 				exitIP = recheckProbeExitIP(nodeContext, verified, cfg.CheckTimeout)
-				if healthContext.Err() != nil {
+				if workContext.Err() != nil {
 					return
 				}
 				policy := evaluateIPChangePolicy(exitIP, baseline, cfg.RequireIPChange)
@@ -459,7 +553,7 @@ checkLoop:
 			}
 			coordinator.recordHealthRecheckOutcome(operationID, reachable, reachable && !policyAllowed)
 			if exitIP != "" {
-				pool.UpdateGeo(px.Key(), exitIP, "", "", "", ipChanged, ipChangeKnown)
+				pool.UpdateGeoAtGeneration(px.Key(), exitIP, "", "", "", ipChanged, ipChangeKnown, healthGeneration)
 			}
 			outcomeMu.Lock()
 			checked = append(checked, px)
@@ -473,25 +567,37 @@ checkLoop:
 		}(px)
 	}
 	wg.Wait()
-	if healthContext.Err() == nil {
+	if workContext.Err() == nil {
 		pool.candidates.ApplyHealthOutcomes(checked, reachableKeys, policyFiltered)
 	}
 	log.Printf("[%s] re-probed %d/%d known nodes against %s", logLabel, len(nodes), knownTotal, safeSourceURL(testURL))
-	return healthGeneration, healthContext.Err() == nil
+	return healthGeneration, workContext.Err() == nil
 }
 
 // refreshPool fetches every enabled source concurrently, dedups the
 // combined candidate list, health-checks it, and installs the result as
 // the pool's new live proxy list.
 func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) refreshRunResult {
+	return refreshPoolContext(context.Background(), cfg, store, pool, coordinator)
+}
+
+func refreshPoolContext(ctx context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) refreshRunResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return refreshRunResult{Status: "cancelled", Error: err.Error()}
+	}
+	coordinator.sourceLifecycleMu.RLock()
 	sources := store.EnabledSources()
+	coordinator.sourceLifecycleMu.RUnlock()
 	if len(sources) == 0 {
 		log.Printf("[main] no enabled sources, skipping refresh")
 		return refreshRunResult{Status: "skipped", Error: "no enabled sources"}
 	}
-	sourceLabels := make(map[string]string, len(sources))
+	sourceRevisions := make(map[string]sourceRefreshRevision, len(sources))
 	for _, src := range sources {
-		sourceLabels[src.ID] = src.Name
+		sourceRevisions[src.ID] = newSourceRefreshRevision(src)
 	}
 
 	var (
@@ -511,7 +617,7 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 		go func() {
 			defer wg.Done()
 			for src := range jobs {
-				proxies, err := FetchSource(src)
+				proxies, err := FetchSourceContext(ctx, src)
 				if err != nil {
 					log.Printf("[error] scrape %s failed: %v", src.Name, err)
 					mu.Lock()
@@ -540,17 +646,38 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 			}
 		}()
 	}
+sendJobs:
 	for _, src := range sources {
-		jobs <- src
+		select {
+		case jobs <- src:
+		case <-ctx.Done():
+			break sendJobs
+		}
 	}
 	close(jobs)
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return refreshRunResult{Status: "cancelled", SourceErrors: sourceErrors, Error: err.Error()}
+	}
 
+	// Publish only source revisions that are still current. Source mutations take
+	// the same lock, so no disable/delete/revision change can interleave between
+	// this validation and the candidate catalog's first publication.
+	coordinator.sourceLifecycleMu.Lock()
+	validSources, sourceLabels := currentFullRefreshSources(store.Sources(), sourceRevisions)
+	all = filterCandidatesBySources(all, validSources)
+	for sourceID := range failedSources {
+		if !validSources[sourceID] {
+			delete(failedSources, sourceID)
+			sourceErrors--
+		}
+	}
 	rawCount := len(all)
 	deduped := dedupeCandidates(all)
 	all = nil
 	candidateTotal := len(deduped)
 	catalogRefresh := pool.candidates.begin(deduped, sourceLabels, failedSources, sourceErrors)
+	coordinator.sourceLifecycleMu.Unlock()
 	captureCandidateSourceIDs(deduped)
 	restoreCandidateSourceLabels(deduped, sourceLabels)
 
@@ -581,10 +708,6 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 		log.Printf("[main] %d candidates exceed max-candidates=%d, selecting an unseen-first source/protocol-balanced rotating subset (rest deferred)",
 			len(healthInventory), cfg.MaxCandidates)
 	}
-	// Once a bounded sample owns the selected Proxy values, release the large
-	// raw-capacity backing array before network checks (which can run for many
-	// seconds). When the inventory is already below the cap, candidates still
-	// aliases it and correctly keeps that small backing alive.
 	healthInventory = nil
 
 	// unreachable (from CheckProxies) is addresses that were actually dialed
@@ -600,18 +723,41 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 		pool.candidates.complete(catalogRefresh, nil, nil, nil)
 		return refreshRunResult{Status: "skipped", SourceErrors: sourceErrors, Error: "health criterion changed before checking; exhaustive recheck queued"}
 	}
-	alive, unreachable, policyFiltered := checkProxiesDetailedContext(healthContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	workContext, cancelWork := context.WithCancel(ctx)
+	stopHealthCancel := context.AfterFunc(healthContext, cancelWork)
+	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	stopHealthCancel()
+	cancelWork()
 	finishHealthWork()
-	applied := applyRefreshHealthResults(pool, store, coordinator, alive, unreachable, policyFiltered, healthGeneration)
+	if err := ctx.Err(); err != nil {
+		pool.candidates.complete(catalogRefresh, nil, nil, nil)
+		return refreshRunResult{Status: "cancelled", SourceErrors: sourceErrors, Error: err.Error()}
+	}
+	if coordinator.fullRefreshBeforeFinalValidation != nil {
+		coordinator.fullRefreshBeforeFinalValidation()
+	}
+	coordinator.sourceLifecycleMu.Lock()
+	validSources, _ = currentFullRefreshSources(store.Sources(), sourceRevisions)
+	for sourceID := range failedSources {
+		if !validSources[sourceID] {
+			delete(failedSources, sourceID)
+			sourceErrors--
+		}
+	}
+	candidates = filterRefreshResultsBySources(candidates, validSources)
+	alive = filterRefreshResultsBySources(alive, validSources)
+	unreachable = filterRefreshOutcomeKeys(unreachable, candidates)
+	policyFiltered = filterRefreshOutcomeKeys(policyFiltered, candidates)
+	reconcileFullRefreshCatalog(pool.candidates, catalogRefresh, validSources, sourceErrors)
+	applied := pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration)
 	if !applied {
 		pool.candidates.complete(catalogRefresh, nil, nil, nil)
+		coordinator.sourceLifecycleMu.Unlock()
 		log.Printf("[main] discarded health results because the check criterion changed during refresh")
 		return refreshRunResult{Status: "skipped", SourceErrors: sourceErrors, Error: "health criterion changed during refresh; exhaustive recheck queued"}
 	}
-	// Reconcile against the current source configuration while the lifecycle
-	// lock is still held. This closes the race where a refresh started before a
-	// source toggle/delete and would otherwise revive its stale credentials.
 	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
+	coordinator.sourceLifecycleMu.Unlock()
 
 	coordinator.recordScrape(ScrapeInfo{
 		Raw: rawCount, Candidates: candidateTotal, Checked: len(candidates),
@@ -634,13 +780,34 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 
 // refreshSource fetches exactly one configured source. Other source
 // attributions are retained as last-good inventory by the catalog merge.
-func refreshSource(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, sourceID, trigger string) refreshRunResult {
+func refreshSource(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, sourceID, trigger string, revision sourceRefreshRevision) refreshRunResult {
+	return refreshSourceContext(context.Background(), cfg, store, pool, coordinator, sourceID, trigger, revision)
+}
+
+func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, sourceID, trigger string, revision sourceRefreshRevision) refreshRunResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return refreshRunResult{Status: "cancelled", Error: err.Error()}
+	}
+	coordinator.sourceLifecycleMu.RLock()
 	source, ok := store.SourceByID(sourceID)
 	if !ok {
+		coordinator.sourceLifecycleMu.RUnlock()
 		return refreshRunResult{Status: "skipped", Error: "source no longer exists"}
 	}
-	proxies, err := FetchSource(source)
+	if !revision.matches(source, trigger) {
+		coordinator.sourceLifecycleMu.RUnlock()
+		return refreshRunResult{Status: "skipped", Error: "source is disabled or changed before refresh"}
+	}
+	coordinator.sourceLifecycleMu.RUnlock()
+
+	proxies, err := FetchSourceContext(ctx, source)
 	if err != nil {
+		if ctx.Err() != nil {
+			return refreshRunResult{Status: "cancelled", Error: ctx.Err().Error()}
+		}
 		log.Printf("[error] source refresh %s failed: %v", source.Name, err)
 		return refreshRunResult{Status: "failed", SourceErrors: 1, Error: err.Error()}
 	}
@@ -680,14 +847,24 @@ func refreshSource(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator
 	if !current {
 		return refreshRunResult{Status: "skipped", Error: "health criterion changed before checking"}
 	}
-	alive, unreachable, policyFiltered := checkProxiesDetailedContext(healthContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	workContext, cancelWork := context.WithCancel(ctx)
+	stopHealthCancel := context.AfterFunc(healthContext, cancelWork)
+	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	stopHealthCancel()
+	cancelWork()
 	finishHealthWork()
+	if err := ctx.Err(); err != nil {
+		return refreshRunResult{Status: "cancelled", Error: err.Error()}
+	}
+	if coordinator.sourceRefreshBeforeFinalValidation != nil {
+		coordinator.sourceRefreshBeforeFinalValidation()
+	}
 
 	coordinator.sourceLifecycleMu.Lock()
 	defer coordinator.sourceLifecycleMu.Unlock()
 	currentSource, exists := store.SourceByID(sourceID)
-	if !exists || currentSource.URL != source.URL || currentSource.Format != source.Format || currentSource.Protocol != source.Protocol {
-		return refreshRunResult{Status: "skipped", Error: "source changed during refresh"}
+	if !exists || !revision.matches(currentSource, trigger) {
+		return refreshRunResult{Status: "skipped", Error: "source was disabled, deleted, or changed during refresh"}
 	}
 	catalogRefresh := pool.candidates.begin(deduped, labels, retained, 0)
 	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
@@ -721,6 +898,120 @@ func currentHealthCriterion(pool *ProxyPool, store *ConfigStore) (uint64, string
 	checkURL = store.CheckURL()
 	pool.SetHealthCriterion(checkURL)
 	return pool.HealthCriterion()
+}
+
+func currentFullRefreshSources(sources []Source, revisions map[string]sourceRefreshRevision) (map[string]bool, map[string]string) {
+	valid := make(map[string]bool, len(sources))
+	labels := make(map[string]string, len(sources))
+	for _, source := range sources {
+		revision, fetched := revisions[source.ID]
+		if !fetched {
+			continue
+		}
+		source.Name = safeLogLabel(source.Name)
+		if !revision.matches(source, "manual") {
+			continue
+		}
+		valid[source.ID] = true
+		labels[source.ID] = source.Name
+	}
+	return valid, labels
+}
+
+func filterCandidatesBySources(candidates []Proxy, validSources map[string]bool) []Proxy {
+	write := 0
+	for _, candidate := range candidates {
+		if !validSources[candidate.SourceName] {
+			continue
+		}
+		candidates[write] = candidate
+		write++
+	}
+	for i := write; i < len(candidates); i++ {
+		candidates[i] = Proxy{}
+	}
+	return candidates[:write:write]
+}
+
+func filterRefreshResultsBySources(results []Proxy, validSources map[string]bool) []Proxy {
+	write := 0
+	for _, result := range results {
+		ids := result.SourceIDs[:0]
+		for _, sourceID := range result.SourceIDs {
+			if validSources[sourceID] {
+				ids = append(ids, sourceID)
+			}
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		result.SourceIDs = ids
+		results[write] = result
+		write++
+	}
+	for i := write; i < len(results); i++ {
+		results[i] = Proxy{}
+	}
+	return results[:write:write]
+}
+
+func filterRefreshOutcomeKeys(outcomes map[string]bool, candidates []Proxy) map[string]bool {
+	if len(outcomes) == 0 {
+		return outcomes
+	}
+	validKeys := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		validKeys[candidate.Key()] = true
+	}
+	for key := range outcomes {
+		if !validKeys[key] {
+			delete(outcomes, key)
+		}
+	}
+	return outcomes
+}
+
+// reconcileFullRefreshCatalog removes attributions whose source revision became
+// stale after begin published the checking snapshot. The lifecycle lock held by
+// the caller makes this withdrawal atomic with the final pool update/complete.
+func reconcileFullRefreshCatalog(catalog *CandidateCatalog, refresh candidateRefresh, validSources map[string]bool, sourceErrors int) {
+	catalog.publicationMu.Lock()
+	defer catalog.publicationMu.Unlock()
+	current := catalog.snapshot.Load()
+	if current == nil {
+		return
+	}
+	current.mu.Lock()
+	defer current.mu.Unlock()
+	if current.generation != refresh.generation {
+		return
+	}
+	staleSource := false
+	for _, sourceID := range current.sourceKeys {
+		if !validSources[sourceID] {
+			staleSource = true
+			break
+		}
+	}
+	if !staleSource {
+		current.sourceErrors = sourceErrors
+		return
+	}
+	builder := newCandidateSnapshotBuilder(len(current.records))
+	for _, record := range current.records {
+		builder.appendFilteredRecord(current, record, validSources)
+	}
+	builder.finalizeCredentialAlternates()
+	next := builder.snapshot
+	next.generation = current.generation
+	next.revision = current.revision + 1
+	next.phase = current.phase
+	next.sourceErrors = sourceErrors
+	next.seenAt = current.seenAt
+	next.refreshAttempt = current.refreshAttempt
+	next.completedAt = current.completedAt
+	rebuildCandidateSourceFacets(next)
+	catalog.snapshot.Store(next)
 }
 
 func splitHealthInventory(candidates []Proxy) (health []Proxy, resources int) {

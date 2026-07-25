@@ -57,7 +57,7 @@ func (s *StatusServer) handleNodesDelete(w http.ResponseWriter, r *http.Request)
 	}
 	removed, notFound, persistErr := s.pool.RemoveKeys(keys)
 	if persistErr != nil {
-		writeErrCode(w, http.StatusInternalServerError, "node_delete_not_durable", fmt.Errorf("node removed from memory but cache persistence failed: %w", persistErr))
+		writeErrCode(w, http.StatusInternalServerError, "node_delete_not_durable", fmt.Errorf("删除未提交：节点缓存持久化失败: %w", persistErr))
 		return
 	}
 	writeJSON(w, inventoryDeleteResponse{Removed: nonNilInventoryKeys(removed), NotFound: nonNilInventoryKeys(notFound)})
@@ -80,7 +80,7 @@ func (s *StatusServer) handleCandidatesDelete(w http.ResponseWriter, r *http.Req
 	}
 	removed, notFound, persistErr := s.pool.candidates.RemoveKeys(keys)
 	if persistErr != nil {
-		writeErrCode(w, http.StatusInternalServerError, "candidate_delete_not_durable", fmt.Errorf("candidate removed from memory but cache persistence failed: %w", persistErr))
+		writeErrCode(w, http.StatusInternalServerError, "candidate_delete_not_durable", fmt.Errorf("删除未提交：候选缓存持久化失败: %w", persistErr))
 		return
 	}
 	writeJSON(w, inventoryDeleteResponse{Removed: nonNilInventoryKeys(removed), NotFound: nonNilInventoryKeys(notFound)})

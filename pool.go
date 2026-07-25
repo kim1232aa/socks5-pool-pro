@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -101,6 +102,7 @@ func parseCountryGroup(name string) (code string, ok bool) {
 // selection state.
 type ProxyPool struct {
 	mu                      sync.RWMutex
+	deleteMu                sync.Mutex        // serializes persist-then-publish inventory mutations
 	proxies                 []Proxy           // forwarding-capable (socks5/http/https)
 	proxyIndex              map[string]int    // protocol-aware key -> first index in proxies
 	proxyIPNodes            []Proxy           // informational-only "proxyip" nodes (see parser.go)
@@ -110,6 +112,7 @@ type ProxyPool struct {
 	cache                   *poolCache
 	cacheGeneration         uint64
 	persistTimer            *time.Timer
+	beforeDeletePersist     func() // deterministic test hook; nil in production
 	persistToken            uint64
 	persistDebounce         time.Duration
 	recheckCursor           string
@@ -126,6 +129,10 @@ type ProxyPool struct {
 	// every live connection and would otherwise make non-score picks retry.
 	routingRevision uint64
 	statsRevision   uint64
+	// activeRevision changes whenever ANY's cursor state can change the node
+	// marked Active in status snapshots. It is separate from routingRevision so
+	// ordinary cursor movement cannot invalidate optimistic routing scans.
+	activeRevision uint64
 }
 
 const defaultPoolPersistDebounce = 500 * time.Millisecond
@@ -607,6 +614,14 @@ func (p *ProxyPool) HealthCriterion() (generation uint64, checkURL string) {
 	return p.healthGeneration, p.healthCheckURL
 }
 
+// HealthCriterionAndPolicy returns one coherent health-standard snapshot for
+// asynchronous manual work. Callers must use generation to guard publication.
+func (p *ProxyPool) HealthCriterionAndPolicy() (generation uint64, checkURL string, requireIPChange bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.healthGeneration, p.healthCheckURL, p.requireIPChangePolicy
+}
+
 func (p *ProxyPool) UpdateVerifiedCredentialsAtGeneration(key string, verified Proxy, generation uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -808,6 +823,11 @@ func (p *ProxyPool) FlushCache() error {
 		p.mu.Unlock()
 		return nil
 	}
+	// Every synchronous writer owns a distinct generation. Otherwise a flush
+	// racing a persist-then-publish deletion could write the live pre-delete
+	// snapshot at the deletion's generation and make the cache reject the actual
+	// deletion as an equal-generation duplicate.
+	p.cacheGeneration++
 	generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
 	return cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
@@ -1085,69 +1105,79 @@ func mergeFreshProxy(existing, fresh Proxy) Proxy {
 	return fresh
 }
 
+const maxPoolDeletePersistAttempts = 4
+
+type poolDeletePlan struct {
+	generation           uint64
+	cache                *poolCache
+	proxies              []Proxy
+	proxyIPNodes         []Proxy
+	stats                map[string]*nodeStats
+	snapshotStats        map[string]nodeStats
+	groupState           map[string]*groupCursor
+	healthCheckURL       string
+	healthPolicy         string
+	healthRecheckPending bool
+	removed              []string
+	notFound             []string
+	beforePersist        func()
+}
+
 // ClearUnavailable permanently removes nodes currently marked
 // Available=false from the pool - an explicit, user-triggered purge (e.g.
-// a dashboard button), never automatic. The detached result is persisted
-// before publication, so a failed write leaves live routing state
-// unchanged and the operation is retryable. Returns the number removed.
+// a dashboard button), never automatic. Slow cache I/O runs without p.mu.
+// If health or refresh state changes while the snapshot is being persisted,
+// the operation retries from that newer state before publishing anything.
 func (p *ProxyPool) ClearUnavailable() (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	kept := make([]Proxy, 0, len(p.proxies))
-	removed := 0
-	for _, px := range p.proxies {
-		if px.Available {
-			kept = append(kept, px)
-		} else {
-			removed++
-		}
-	}
-	if removed == 0 {
-		return 0, nil
-	}
+	p.deleteMu.Lock()
+	defer p.deleteMu.Unlock()
+	dirtyCaches := make(map[*poolCache]struct{})
 
-	// Build the next in-memory state without mutating the live state yet.
-	// Stats are keyed by Proxy.Key(), so delete both the nodes removed by this
-	// operation and any older orphan entries left by a protocol reclassification.
-	liveKeys := make(map[string]bool, len(kept))
-	for _, px := range kept {
-		liveKeys[px.Key()] = true
-	}
-	nextStats := make(map[string]*nodeStats, len(p.stats))
-	for key, value := range p.stats {
-		if !liveKeys[key] || value == nil {
-			continue
+	for attempt := 0; attempt < maxPoolDeletePersistAttempts; attempt++ {
+		p.mu.Lock()
+		plan := p.buildDeletePlanLocked(func(px Proxy) bool { return !px.Available }, nil)
+		if len(plan.removed) == 0 {
+			p.mu.Unlock()
+			if err := p.restoreLiveStateToCaches(dirtyCaches); err != nil {
+				return 0, fmt.Errorf("restore live pool after concurrent clear: %w", err)
+			}
+			return 0, nil
 		}
-		copy := *value
-		nextStats[key] = &copy
-	}
-	nextGroupState := cleanedGroupState(p.groupState, liveKeys)
+		if plan.cache == nil {
+			p.publishDeletePlanLocked(plan)
+			p.mu.Unlock()
+			log.Printf("[pool] cleared %d unavailable node(s), %d remaining", len(plan.removed), len(plan.proxies))
+			return len(plan.removed), nil
+		}
+		p.mu.Unlock()
 
-	// Persist the detached next snapshot first. On failure, leave the live
-	// pool untouched so the caller can retry without data loss.
-	generation := p.cacheGeneration + 1
-	if p.cache != nil {
-		snapshotStats := make(map[string]nodeStats, len(nextStats))
-		for key, value := range nextStats {
-			snapshotStats[key] = *value
+		if plan.beforePersist != nil {
+			plan.beforePersist()
 		}
-		if err := p.cache.saveWithHealthState(generation, cloneProxySlice(kept), cloneProxySlice(p.proxyIPNodes), snapshotStats, p.healthCheckURL, p.healthPolicyFingerprint, p.healthRecheckPending); err != nil {
+		dirtyCaches[plan.cache] = struct{}{}
+		if err := plan.cache.saveWithHealthState(plan.generation, plan.proxies, plan.proxyIPNodes, plan.snapshotStats, plan.healthCheckURL, plan.healthPolicy, plan.healthRecheckPending); err != nil {
+			p.requeuePersistenceAfterDeleteFailure(plan.generation)
+			if restoreErr := p.restoreLiveStateToCaches(dirtyCaches); restoreErr != nil {
+				err = fmt.Errorf("%w; restore live pool: %v", err, restoreErr)
+			}
 			log.Printf("[cache] clear unavailable persistence failed: %v", err)
 			return 0, err
 		}
-	}
 
-	// Publish the durable result into live memory.
-	p.proxies = kept
-	p.rebuildProxyIndexLocked()
-	p.stats = nextStats
-	p.groupState = nextGroupState
-	p.routingRevision++
-	p.statsRevision++
-	p.cacheGeneration = generation
-	p.cancelScheduledPersistenceLocked()
-	log.Printf("[pool] cleared %d unavailable node(s), %d remaining", removed, len(kept))
-	return removed, nil
+		p.mu.Lock()
+		if p.cache == plan.cache && p.cacheGeneration == plan.generation {
+			p.publishDeletePlanLocked(plan)
+			p.mu.Unlock()
+			log.Printf("[pool] cleared %d unavailable node(s), %d remaining", len(plan.removed), len(plan.proxies))
+			return len(plan.removed), nil
+		}
+		p.mu.Unlock()
+	}
+	err := fmt.Errorf("pool changed during %d clear persistence attempts", maxPoolDeletePersistAttempts)
+	if restoreErr := p.restoreLiveStateToCaches(dirtyCaches); restoreErr != nil {
+		err = fmt.Errorf("%w; restore live pool: %v", err, restoreErr)
+	}
+	return 0, err
 }
 
 func cleanedGroupState(current map[string]*groupCursor, liveKeys map[string]bool) map[string]*groupCursor {
@@ -1173,10 +1203,9 @@ func cleanedGroupState(current map[string]*groupCursor, liveKeys map[string]bool
 
 // RemoveKeys explicitly removes forwarding nodes by protocol-aware key. It is
 // the inventory-management counterpart to ClearUnavailable: a deliberate
-// operator action, not an automatic health outcome. The detached result is
-// synchronously persisted before publication, so a failed write leaves live
-// memory unchanged and the operation is retryable. Each requested key is
-// reported as removed or not_found so partial hits are unambiguous.
+// operator action, not an automatic health outcome. Slow cache I/O runs without
+// p.mu, and a changed snapshot is rebuilt so concurrent health/update state is
+// included rather than overwritten. Each key is reported exactly once.
 func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persistErr error) {
 	if len(keys) == 0 {
 		return nil, nil, nil
@@ -1185,67 +1214,144 @@ func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persi
 	for _, key := range keys {
 		wanted[key] = struct{}{}
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	kept := make([]Proxy, 0, len(p.proxies))
-	found := make(map[string]bool, len(keys))
-	for _, px := range p.proxies {
-		key := px.Key()
-		if _, remove := wanted[key]; remove {
-			found[key] = true
-			removed = append(removed, key)
-			continue
-		}
-		kept = append(kept, px)
-	}
-	for _, key := range keys {
-		if !found[key] {
-			notFound = append(notFound, key)
-		}
-	}
-	if len(removed) == 0 {
-		return nil, notFound, nil
-	}
+	p.deleteMu.Lock()
+	defer p.deleteMu.Unlock()
+	dirtyCaches := make(map[*poolCache]struct{})
 
-	// Build the next in-memory state without mutating the live state yet.
-	liveKeys := make(map[string]bool, len(kept))
-	for _, px := range kept {
-		liveKeys[px.Key()] = true
-	}
-	nextStats := make(map[string]*nodeStats, len(p.stats))
-	for key, value := range p.stats {
-		if _, deleted := wanted[key]; deleted || value == nil {
-			continue
+	for attempt := 0; attempt < maxPoolDeletePersistAttempts; attempt++ {
+		p.mu.Lock()
+		plan := p.buildDeletePlanLocked(func(px Proxy) bool {
+			_, remove := wanted[px.Key()]
+			return remove
+		}, keys)
+		if len(plan.removed) == 0 {
+			p.mu.Unlock()
+			if persistErr = p.restoreLiveStateToCaches(dirtyCaches); persistErr != nil {
+				return nil, nil, fmt.Errorf("restore live pool after concurrent removal: %w", persistErr)
+			}
+			return nil, plan.notFound, nil
 		}
-		copy := *value
-		nextStats[key] = &copy
-	}
-	nextGroupState := cleanedGroupState(p.groupState, liveKeys)
+		if plan.cache == nil {
+			p.publishDeletePlanLocked(plan)
+			p.mu.Unlock()
+			return plan.removed, plan.notFound, nil
+		}
+		p.mu.Unlock()
 
-	// Persist the detached next snapshot first. On failure, leave the live
-	// pool untouched so the caller can retry without data loss.
-	generation := p.cacheGeneration + 1
-	if p.cache != nil {
-		snapshotStats := make(map[string]nodeStats, len(nextStats))
-		for key, value := range nextStats {
-			snapshotStats[key] = *value
+		if plan.beforePersist != nil {
+			plan.beforePersist()
 		}
-		if persistErr = p.cache.saveWithHealthState(generation, cloneProxySlice(kept), cloneProxySlice(p.proxyIPNodes), snapshotStats, p.healthCheckURL, p.healthPolicyFingerprint, p.healthRecheckPending); persistErr != nil {
+		dirtyCaches[plan.cache] = struct{}{}
+		if persistErr = plan.cache.saveWithHealthState(plan.generation, plan.proxies, plan.proxyIPNodes, plan.snapshotStats, plan.healthCheckURL, plan.healthPolicy, plan.healthRecheckPending); persistErr != nil {
+			p.requeuePersistenceAfterDeleteFailure(plan.generation)
+			if restoreErr := p.restoreLiveStateToCaches(dirtyCaches); restoreErr != nil {
+				persistErr = fmt.Errorf("%w; restore live pool: %v", persistErr, restoreErr)
+			}
 			log.Printf("[cache] node removal persistence failed: %v", persistErr)
 			return nil, nil, persistErr
 		}
+
+		p.mu.Lock()
+		if p.cache == plan.cache && p.cacheGeneration == plan.generation {
+			p.publishDeletePlanLocked(plan)
+			p.mu.Unlock()
+			return plan.removed, plan.notFound, nil
+		}
+		p.mu.Unlock()
+	}
+	persistErr = fmt.Errorf("pool changed during %d node removal persistence attempts", maxPoolDeletePersistAttempts)
+	if restoreErr := p.restoreLiveStateToCaches(dirtyCaches); restoreErr != nil {
+		persistErr = fmt.Errorf("%w; restore live pool: %v", persistErr, restoreErr)
+	}
+	return nil, nil, persistErr
+}
+
+// buildDeletePlanLocked reserves a cache generation and detaches every value
+// used by the encoder. Reserving also cancels an older debounce timer: its state
+// is already part of this newer snapshot. Caller holds p.mu for writing.
+func (p *ProxyPool) buildDeletePlanLocked(remove func(Proxy) bool, requested []string) poolDeletePlan {
+	plan := poolDeletePlan{cache: p.cache, beforePersist: p.beforeDeletePersist}
+	found := make(map[string]bool, len(requested))
+	plan.proxies = make([]Proxy, 0, len(p.proxies))
+	for _, px := range p.proxies {
+		if remove(px) {
+			key := px.Key()
+			found[key] = true
+			plan.removed = append(plan.removed, key)
+			continue
+		}
+		plan.proxies = append(plan.proxies, cloneProxy(px))
+	}
+	for _, key := range requested {
+		if !found[key] {
+			plan.notFound = append(plan.notFound, key)
+		}
+	}
+	if len(plan.removed) == 0 {
+		return plan
 	}
 
-	// Publish the durable result into live memory.
-	p.proxies = kept
+	liveKeys := make(map[string]bool, len(plan.proxies))
+	for _, px := range plan.proxies {
+		liveKeys[px.Key()] = true
+	}
+	plan.stats = make(map[string]*nodeStats, len(p.stats))
+	plan.snapshotStats = make(map[string]nodeStats, len(p.stats))
+	for key, value := range p.stats {
+		if !liveKeys[key] || value == nil {
+			continue
+		}
+		copy := *value
+		plan.stats[key] = &copy
+		plan.snapshotStats[key] = copy
+	}
+	plan.groupState = cleanedGroupState(p.groupState, liveKeys)
+	plan.proxyIPNodes = cloneProxySlice(p.proxyIPNodes)
+	plan.healthCheckURL = p.healthCheckURL
+	plan.healthPolicy = p.healthPolicyFingerprint
+	plan.healthRecheckPending = p.healthRecheckPending
+	if plan.cache != nil {
+		p.cancelScheduledPersistenceLocked()
+		p.cacheGeneration++
+		plan.generation = p.cacheGeneration
+	}
+	return plan
+}
+
+func (p *ProxyPool) publishDeletePlanLocked(plan poolDeletePlan) {
+	p.proxies = plan.proxies
 	p.rebuildProxyIndexLocked()
-	p.stats = nextStats
-	p.groupState = nextGroupState
+	p.stats = plan.stats
+	p.groupState = plan.groupState
 	p.routingRevision++
 	p.statsRevision++
-	p.cacheGeneration = generation
-	p.cancelScheduledPersistenceLocked()
-	return removed, notFound, nil
+}
+
+func (p *ProxyPool) requeuePersistenceAfterDeleteFailure(generation uint64) {
+	p.mu.Lock()
+	if p.cacheGeneration == generation {
+		p.queuePersistenceLocked()
+	}
+	p.mu.Unlock()
+}
+
+// restoreLiveStateToCaches repairs snapshots written by abandoned optimistic
+// attempts. It is only called after the slow write has completed, and captures
+// the current live state without holding p.mu during encoding or filesystem I/O.
+func (p *ProxyPool) restoreLiveStateToCaches(caches map[*poolCache]struct{}) error {
+	for cache := range caches {
+		if cache == nil {
+			continue
+		}
+		p.mu.Lock()
+		p.cacheGeneration++
+		generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
+		p.mu.Unlock()
+		if err := cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *ProxyPool) Size() int {
@@ -1348,8 +1454,21 @@ func (p *ProxyPool) Find(key string) (Proxy, bool) {
 // proxy matching key, so a stale label (from a proxy whose exit rotated
 // since the last scrape) self-heals as soon as someone checks it.
 func (p *ProxyPool) UpdateGeo(key, exitIP, country, city, continent string, ipChanged, ipChangeKnown bool) bool {
+	return p.updateGeo(key, exitIP, country, city, continent, ipChanged, ipChangeKnown, nil)
+}
+
+// UpdateGeoAtGeneration records exit-IP/geo metadata only while the health
+// criterion used to obtain it is still current.
+func (p *ProxyPool) UpdateGeoAtGeneration(key, exitIP, country, city, continent string, ipChanged, ipChangeKnown bool, generation uint64) bool {
+	return p.updateGeo(key, exitIP, country, city, continent, ipChanged, ipChangeKnown, &generation)
+}
+
+func (p *ProxyPool) updateGeo(key, exitIP, country, city, continent string, ipChanged, ipChangeKnown bool, expectedGeneration *uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if expectedGeneration != nil && p.healthGeneration != *expectedGeneration {
+		return false
+	}
 	updated := p.mutateProxyLocked(key, func(px *Proxy) {
 		px.ExitIP = exitIP
 		px.IPChanged = ipChanged
@@ -1381,6 +1500,79 @@ func (p *ProxyPool) UpdateSpeed(key string, kbps float64, bytes, durationMs int6
 		p.queuePersistenceLocked()
 	}
 	return updated
+}
+
+// PromoteCandidateSpeed atomically admits a health-checked candidate and records
+// its speed sample. The generation and source ownership are revalidated before
+// any routing state is published.
+func (p *ProxyPool) PromoteCandidateSpeed(px Proxy, sources []Source, expectedGeneration uint64, kbps float64, bytes, durationMs int64) bool {
+	enabledIDs, enabledNames := enabledSourceSets(sources)
+	if !proxySourcesEnabled(px, enabledIDs, enabledNames) {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.healthGeneration != expectedGeneration {
+		return false
+	}
+
+	px.Available = true
+	px.SourceRetired = false
+	px.HealthInvalidated = false
+	px.PolicyExcluded = false
+	key := px.Key()
+	if index, ok := p.proxyIndexLookupLocked(key); ok {
+		px = mergeFreshProxy(p.proxies[index], px)
+		p.proxies[index] = px
+	} else {
+		p.proxies = append(p.proxies, cloneProxy(px))
+		sort.Slice(p.proxies, func(i, j int) bool {
+			if p.proxies[i].Addr() == p.proxies[j].Addr() {
+				return p.proxies[i].Protocol < p.proxies[j].Protocol
+			}
+			return p.proxies[i].Addr() < p.proxies[j].Addr()
+		})
+		p.rebuildProxyIndexLocked()
+	}
+
+	index, ok := p.proxyIndexLookupLocked(key)
+	if !ok {
+		return false
+	}
+	target := &p.proxies[index]
+	target.SpeedKbps = kbps
+	target.SpeedTestedAt = time.Now().Unix()
+	target.SpeedBytes = bytes
+	target.SpeedDurationMs = durationMs
+	stats := p.statsForKeyLocked(key)
+	stats.ConsecutiveHealthFailures = 0
+	stats.HealthFailureTerminal = false
+	stats.LastHealthSuccessAt = time.Now().UTC()
+	p.routingRevision++
+	p.queuePersistenceLocked()
+	return true
+}
+
+func proxySourcesEnabled(px Proxy, enabledIDs, enabledNames map[string]bool) bool {
+	if len(px.SourceIDs) > 0 {
+		for _, id := range px.SourceIDs {
+			if !enabledIDs[id] {
+				return false
+			}
+		}
+		return true
+	}
+	names := px.SourceNames
+	if len(names) == 0 && strings.TrimSpace(px.SourceName) != "" {
+		names = []string{px.SourceName}
+	}
+	for _, name := range names {
+		if !enabledNames[strings.ToLower(strings.TrimSpace(name))] {
+			return false
+		}
+	}
+	return true
 }
 
 func filterAvailable(list []Proxy) []Proxy {
@@ -1454,48 +1646,48 @@ func resolveGroup(all []Proxy, groupName string, groups []Group) ([]Proxy, strin
 // (GroupAny / COUNTRY:xx / named Group), before any Available preference is
 // applied by resolveGroup.
 func resolveGroupCandidates(all []Proxy, groupName string, groups []Group) ([]Proxy, string) {
-	if groupName == "" || groupName == GroupAny {
+	resolved, ok := resolveGroupReference(groupName, groups)
+	if !ok || resolved.kind == groupReferenceAny {
 		return all, StrategySticky
+	}
+	if resolved.kind == groupReferenceDirect {
+		return nil, StrategySticky
 	}
 	// Dynamic country group ("COUNTRY:JP"): any live node whose real exit is
 	// in that country. Prefer the fastest such node - "give me a JP node"
 	// almost always means "the best JP node", and there's no per-country
 	// group config to carry a different strategy.
-	if cc, ok := parseCountryGroup(groupName); ok {
+	if resolved.kind == groupReferenceCountry {
 		var out []Proxy
 		for _, px := range all {
-			if strings.EqualFold(px.Country, cc) {
+			if strings.EqualFold(px.Country, resolved.country) {
 				out = append(out, px)
 			}
 		}
 		return out, StrategyLatency
 	}
-	for _, g := range groups {
-		if strings.EqualFold(g.Name, groupName) || g.ID == groupName {
-			var out []Proxy
-			for _, px := range all {
-				if len(g.Nodes) > 0 && !groupMatchesNode(g.Nodes, px) {
-					continue
-				}
-				if len(g.Countries) > 0 && !containsFold(g.Countries, px.Country) {
-					continue
-				}
-				if len(g.Protocols) > 0 && !containsFold(g.Protocols, px.Protocol) {
-					continue
-				}
-				if len(g.Sources) > 0 && !proxyMatchesSources(px, g.Sources) {
-					continue
-				}
-				out = append(out, px)
-			}
-			strategy := g.Strategy
-			if strategy == "" {
-				strategy = StrategySticky
-			}
-			return out, strategy
+	g := resolved.group
+	var out []Proxy
+	for _, px := range all {
+		if len(g.Nodes) > 0 && !groupMatchesNode(g.Nodes, px) {
+			continue
 		}
+		if len(g.Countries) > 0 && !containsFold(g.Countries, px.Country) {
+			continue
+		}
+		if len(g.Protocols) > 0 && !containsFold(g.Protocols, px.Protocol) {
+			continue
+		}
+		if len(g.Sources) > 0 && !proxyMatchesSources(px, g.Sources) {
+			continue
+		}
+		out = append(out, px)
 	}
-	return all, StrategySticky
+	strategy := g.Strategy
+	if strategy == "" {
+		strategy = StrategySticky
+	}
+	return out, strategy
 }
 
 // groupMatchesNode prefers the protocol-aware Proxy.Key identity. Existing
@@ -1533,8 +1725,11 @@ func (p *ProxyPool) PickExcluding(groupName string, groups []Group, exclude map[
 }
 
 func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bool) (Proxy, bool, bool) {
-	if groupName == GroupDirect {
-		return Proxy{}, false, true
+	if resolved, ok := resolveGroupReference(groupName, groups); ok {
+		groupName = resolved.canonical
+		if resolved.kind == groupReferenceDirect {
+			return Proxy{}, false, true
+		}
 	}
 
 	selector := newPoolGroupSelector(groupName, groups)
@@ -1583,6 +1778,7 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 			p.mu.Unlock()
 			continue
 		}
+		oldStickyKey := gc.stickyKey
 		if selector.strategy == StrategyRoundRobin {
 			gc.rrIdx++
 		}
@@ -1590,6 +1786,9 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 			gc.stickyKey = chosen.Key()
 		}
 		gc.lastPicked = chosen.Key()
+		if (groupName == GroupAny || groupName == "") && gc.stickyKey != oldStickyKey {
+			p.activeRevision++
+		}
 		live := cloneProxy(p.proxies[index])
 		p.mu.Unlock()
 		return live, true, false
@@ -1614,6 +1813,7 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 		gc = &groupCursor{}
 		p.groupState[groupName] = gc
 	}
+	oldStickyKey := gc.stickyKey
 	if selector.strategy == StrategyRoundRobin {
 		gc.rrIdx++
 	}
@@ -1621,6 +1821,9 @@ func (p *ProxyPool) pick(groupName string, groups []Group, exclude map[string]bo
 		gc.stickyKey = chosen.Key()
 	}
 	gc.lastPicked = chosen.Key()
+	if (groupName == GroupAny || groupName == "") && gc.stickyKey != oldStickyKey {
+		p.activeRevision++
+	}
 	return cloneProxy(chosen), true, false
 }
 
@@ -1653,22 +1856,21 @@ type poolGroupSelector struct {
 }
 
 func newPoolGroupSelector(groupName string, groups []Group) poolGroupSelector {
-	if groupName == "" || groupName == GroupAny {
+	resolved, ok := resolveGroupReference(groupName, groups)
+	if !ok || resolved.kind == groupReferenceAny {
 		return poolGroupSelector{strategy: StrategySticky, any: true}
 	}
-	if country, ok := parseCountryGroup(groupName); ok {
-		return poolGroupSelector{strategy: StrategyLatency, country: country}
+	if resolved.kind == groupReferenceCountry {
+		return poolGroupSelector{strategy: StrategyLatency, country: resolved.country}
 	}
-	for i := range groups {
-		if strings.EqualFold(groups[i].Name, groupName) || groups[i].ID == groupName {
-			strategy := groups[i].Strategy
-			if strategy == "" {
-				strategy = StrategySticky
-			}
-			return poolGroupSelector{strategy: strategy, group: &groups[i]}
-		}
+	if resolved.group == nil {
+		return poolGroupSelector{strategy: StrategySticky}
 	}
-	return poolGroupSelector{strategy: StrategySticky, any: true}
+	strategy := resolved.group.Strategy
+	if strategy == "" {
+		strategy = StrategySticky
+	}
+	return poolGroupSelector{strategy: strategy, group: resolved.group}
 }
 
 func (selector poolGroupSelector) matches(proxy Proxy) bool {
@@ -1825,9 +2027,13 @@ func (p *ProxyPool) forceSticky(groupName, key string) forceStickyResult {
 		gc = &groupCursor{}
 		p.groupState[groupName] = gc
 	}
+	oldStickyKey := gc.stickyKey
 	gc.stickyKey = key
 	gc.lastPicked = key
 	gc.pinned = true // manual choice: auto-rotation must not override it
+	if (groupName == GroupAny || groupName == "") && gc.stickyKey != oldStickyKey {
+		p.activeRevision++
+	}
 	return forceStickyOK
 }
 
@@ -1940,8 +2146,12 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 		}
 	}
 	next := p.proxies[nextIdx]
+	oldStickyKey := gc.stickyKey
 	gc.stickyKey = next.Key()
 	gc.lastPicked = next.Key()
+	if (groupName == GroupAny || groupName == "") && gc.stickyKey != oldStickyKey {
+		p.activeRevision++
+	}
 	log.Printf("[pool] rotated %s -> %s (%s %s)", groupName, next.Addr(), next.Country, next.City)
 	return next, true
 }
@@ -1958,8 +2168,11 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 // Returns (proxy, ok, dynamic): ok=false means the group currently has no
 // members.
 func (p *ProxyPool) EffectiveCurrent(groupName string, groups []Group) (Proxy, bool, bool) {
-	if groupName == GroupDirect {
-		return Proxy{}, false, false
+	if resolved, ok := resolveGroupReference(groupName, groups); ok {
+		groupName = resolved.canonical
+		if resolved.kind == groupReferenceDirect {
+			return Proxy{}, false, false
+		}
 	}
 	candidates, strategy := resolveGroup(p.All(), groupName, groups)
 	if len(candidates) == 0 {

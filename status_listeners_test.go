@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // fakeListenerManager is a test double for listenerManagerAPI. It records the
@@ -288,6 +290,59 @@ func TestListenersPostRequiresJSONBody(t *testing.T) {
 	}
 	if mgr.lastAdd.ID != "" {
 		t.Fatalf("manager.Add should not be called on bad body; lastAdd=%#v", mgr.lastAdd)
+	}
+}
+
+func TestListenerAPIMutationsReturnObservable500AfterDurabilityUncertain(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewListenerManager("127.0.0.1:1", NewProxyPool(), store, "", "", 8)
+	if err := manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = manager.Shutdown(ctx)
+	})
+	server := NewStatusServer(NewProxyPool(), store)
+	server.SetListenerManager(manager)
+	handler := server.handler()
+
+	assertUncertainResponse := func(recorder *httptest.ResponseRecorder) {
+		t.Helper()
+		if recorder.Code != http.StatusInternalServerError || !bytes.Contains(recorder.Body.Bytes(), []byte(`"code":"config_persistence_failed"`)) || !bytes.Contains(recorder.Body.Bytes(), []byte("path updated but directory durability is uncertain")) {
+			t.Fatalf("uncertain listener response = %d %s", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	addPort := freeListenerPort(t)
+	syncErr := injectConfigDirectorySyncFailure(t)
+	add := doListener(t, handler, http.MethodPost, "/api/listeners", ListenerBinding{Name: "api add", Port: addPort, Mode: ListenerModeRules, Enabled: true})
+	assertUncertainResponse(add)
+	if !bytes.Contains(add.Body.Bytes(), []byte(syncErr.Error())) {
+		t.Fatalf("add response omitted injected failure: %s", add.Body.String())
+	}
+	bindings := store.Listeners()
+	if len(bindings) != 1 {
+		t.Fatalf("listeners after add = %#v", bindings)
+	}
+
+	updated := bindings[0]
+	updated.Name = "api update"
+	updated.Port = freeListenerPort(t)
+	update := doListener(t, handler, http.MethodPost, "/api/listeners/update", updated)
+	assertUncertainResponse(update)
+	if got := store.Listeners(); len(got) != 1 || got[0].Name != updated.Name || got[0].Port != updated.Port {
+		t.Fatalf("listeners after update = %#v", got)
+	}
+
+	deleteResponse := doListener(t, handler, http.MethodPost, "/api/listeners/delete", map[string]string{"id": updated.ID})
+	assertUncertainResponse(deleteResponse)
+	if got := store.Listeners(); len(got) != 0 {
+		t.Fatalf("listeners after delete = %#v", got)
 	}
 }
 

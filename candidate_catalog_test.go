@@ -6,9 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -117,6 +120,265 @@ func TestCandidateCatalogPageClassificationFilteringAndCredentials(t *testing.T)
 	assertCandidateStatus(t, updatedByKey, available.Key(), "known_unavailable")
 }
 
+func TestCandidateCatalogRemoveKeysRetriesAfterConcurrentHealthOutcome(t *testing.T) {
+	dir := t.TempDir()
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(newCandidateCatalogCache(dir))
+	remove := Proxy{IP: "8.8.8.81", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	keep := Proxy{IP: "8.8.4.51", Port: "8080", Protocol: "http", SourceName: "feed"}
+	refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
+	catalog.complete(refresh, nil, nil, nil)
+
+	hookCalls := 0
+	catalog.removeBeforeCommit = func() {
+		if hookCalls != 0 {
+			return
+		}
+		hookCalls++
+		if changed := catalog.ApplyHealthOutcomes([]Proxy{keep}, nil, nil); changed != 1 {
+			t.Fatalf("concurrent health outcomes changed %d candidates, want 1", changed)
+		}
+	}
+	removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
+	if err != nil || len(removed) != 1 || removed[0] != remove.Key() || len(notFound) != 0 {
+		t.Fatalf("RemoveKeys result removed=%v notFound=%v err=%v", removed, notFound, err)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("remove commit hook calls = %d, want 1", hookCalls)
+	}
+	live := catalog.snapshot.Load()
+	live.mu.RLock()
+	keepIndex := live.find(keep.Protocol, keep.Addr())
+	if keepIndex < 0 || live.records[keepIndex].status != candidateCheckedFailed || live.records[keepIndex].checkedUnix == 0 {
+		live.mu.RUnlock()
+		t.Fatalf("live concurrent health outcome was lost: index=%d", keepIndex)
+	}
+	liveRevision := live.revision
+	live.mu.RUnlock()
+
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(dir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("LoadDiskCache = %v, %v", loaded, err)
+	}
+	persisted := restored.snapshot.Load()
+	persisted.mu.RLock()
+	persistedKeepIndex := persisted.find(keep.Protocol, keep.Addr())
+	if persistedKeepIndex < 0 || persisted.records[persistedKeepIndex].status != candidateCheckedFailed || persisted.revision != liveRevision {
+		persisted.mu.RUnlock()
+		t.Fatalf("persisted retry lost health outcome/revision: index=%d revision=%d want=%d", persistedKeepIndex, persisted.revision, liveRevision)
+	}
+	persisted.mu.RUnlock()
+}
+
+func TestCandidateCatalogRemoveKeysDoesNotHoldPublicationLocksDuringPersistence(t *testing.T) {
+	dir := t.TempDir()
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(newCandidateCatalogCache(dir))
+	remove := Proxy{IP: "8.8.8.83", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	keep := Proxy{IP: "8.8.4.53", Port: "8080", Protocol: "http", SourceName: "feed"}
+	refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
+	catalog.complete(refresh, nil, nil, nil)
+	current := catalog.snapshot.Load()
+	_, lease, leased := catalog.leaseByKey(remove.Key())
+	if !leased {
+		t.Fatal("failed to acquire pre-removal promotion lease")
+	}
+
+	persistLocked := make(chan struct{})
+	releasePersist := make(chan struct{})
+	catalog.persistLocked = func() {
+		close(persistLocked)
+		<-releasePersist
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := catalog.RemoveKeys([]string{remove.Key()})
+		result <- err
+	}()
+	<-persistLocked
+
+	snapshotUnlocked := current.mu.TryLock()
+	if snapshotUnlocked {
+		current.mu.Unlock()
+	}
+	publicationUnlocked := catalog.publicationMu.TryRLock()
+	if publicationUnlocked {
+		catalog.publicationMu.RUnlock()
+	}
+	if catalog.withPromotionLease(lease, func(Proxy) bool { return true }) {
+		t.Fatal("pending removal allowed promotion during disk persistence")
+	}
+	close(releasePersist)
+	if err := <-result; err != nil {
+		t.Fatalf("RemoveKeys returned %v", err)
+	}
+	if !snapshotUnlocked || !publicationUnlocked {
+		t.Fatalf("persistence held catalog locks: snapshot unlocked=%v publication unlocked=%v", snapshotUnlocked, publicationUnlocked)
+	}
+}
+
+func TestCandidateCatalogRemoveKeysRestoresCacheAfterUnpublishedStaleWrites(t *testing.T) {
+	dir := t.TempDir()
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(newCandidateCatalogCache(dir))
+	remove := Proxy{IP: "8.8.8.84", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	keep := Proxy{IP: "8.8.4.54", Port: "8080", Protocol: "http", SourceName: "feed"}
+	refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
+	catalog.complete(refresh, nil, nil, nil)
+
+	var hookCalls int
+	catalog.removeAfterPersist = func() {
+		hookCalls++
+		policy := map[string]bool(nil)
+		if hookCalls%2 == 1 {
+			policy = map[string]bool{keep.Key(): true}
+		}
+		if changed := catalog.ApplyHealthOutcomes([]Proxy{keep}, nil, policy); changed != 1 {
+			t.Errorf("conflicting health outcome changed %d candidates, want 1", changed)
+		}
+	}
+	removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
+	if err == nil || len(removed) != 0 || len(notFound) != 0 {
+		t.Fatalf("contended RemoveKeys result removed=%v notFound=%v err=%v", removed, notFound, err)
+	}
+	if hookCalls != candidateRemovalMaxAttempts {
+		t.Fatalf("post-persist conflicts = %d, want %d", hookCalls, candidateRemovalMaxAttempts)
+	}
+	if _, ok := catalog.FindByKey(remove.Key()); !ok {
+		t.Fatal("unpublished removal changed the live catalog")
+	}
+
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(dir))
+	loaded, loadErr := restored.LoadDiskCache()
+	if loadErr != nil || !loaded {
+		t.Fatalf("LoadDiskCache = %v, %v", loaded, loadErr)
+	}
+	if _, ok := restored.FindByKey(remove.Key()); !ok {
+		t.Fatal("restart observed an uncommitted stale deletion")
+	}
+}
+
+func TestCandidateCatalogCompleteRemoveAndCacheConcurrent(t *testing.T) {
+	for attempt := 0; attempt < 25; attempt++ {
+		dir := t.TempDir()
+		catalog := &CandidateCatalog{}
+		catalog.SetDiskCache(newCandidateCatalogCache(dir))
+		remove := Proxy{IP: "8.8.8.85", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+		keep := Proxy{IP: "8.8.4.55", Port: "8080", Protocol: "http", SourceName: "feed"}
+		refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
+		current := catalog.snapshot.Load()
+
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		var workers sync.WaitGroup
+		workers.Add(3)
+		go func() {
+			defer workers.Done()
+			<-start
+			catalog.complete(refresh, []Proxy{keep}, nil, nil)
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
+			if err != nil || len(removed) != 1 || len(notFound) != 0 {
+				errs <- fmt.Errorf("RemoveKeys removed=%v notFound=%v err=%v", removed, notFound, err)
+			}
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			if err := catalog.persistCompletedSnapshot(current); err != nil {
+				errs <- fmt.Errorf("persist current snapshot: %w", err)
+			}
+		}()
+		close(start)
+		done := make(chan struct{})
+		go func() {
+			workers.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("complete/remove/cache concurrency deadlocked")
+		}
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+		if _, ok := catalog.FindByKey(remove.Key()); ok {
+			t.Fatal("concurrent completion revived removed candidate")
+		}
+
+		restored := &CandidateCatalog{}
+		restored.SetDiskCache(newCandidateCatalogCache(dir))
+		loaded, err := restored.LoadDiskCache()
+		if err != nil || !loaded {
+			t.Fatalf("LoadDiskCache = %v, %v", loaded, err)
+		}
+		if _, ok := restored.FindByKey(remove.Key()); ok {
+			t.Fatal("cache retained concurrently removed candidate")
+		}
+	}
+}
+
+func TestCandidateCatalogRemoveKeysDuringCheckingPersistsWithoutEndingRefresh(t *testing.T) {
+	dir := t.TempDir()
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(newCandidateCatalogCache(dir))
+	remove := Proxy{IP: "8.8.8.82", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	keep := Proxy{IP: "8.8.4.52", Port: "8080", Protocol: "http", SourceName: "feed"}
+	refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
+
+	removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
+	if err != nil || len(removed) != 1 || removed[0] != remove.Key() || len(notFound) != 0 {
+		t.Fatalf("checking RemoveKeys result removed=%v notFound=%v err=%v", removed, notFound, err)
+	}
+	live := catalog.snapshot.Load()
+	live.mu.RLock()
+	phase := live.phase
+	live.mu.RUnlock()
+	if phase != "checking" {
+		t.Fatalf("live removal ended refresh phase: %q", phase)
+	}
+	if _, ok := catalog.FindByKey(remove.Key()); ok {
+		t.Fatal("removed checking candidate remained live")
+	}
+
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(dir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("checking removal LoadDiskCache = %v, %v", loaded, err)
+	}
+	if _, ok := restored.FindByKey(remove.Key()); ok {
+		t.Fatal("checking removal was not durable")
+	}
+	persisted := restored.snapshot.Load()
+	persisted.mu.RLock()
+	persistedPhase := persisted.phase
+	persisted.mu.RUnlock()
+	if persistedPhase != "complete" {
+		t.Fatalf("persisted checking removal phase = %q, want complete", persistedPhase)
+	}
+
+	catalog.complete(refresh, []Proxy{keep}, nil, nil)
+	completed := catalog.snapshot.Load()
+	completed.mu.RLock()
+	completedPhase := completed.phase
+	completed.mu.RUnlock()
+	if completedPhase != "complete" {
+		t.Fatalf("refresh completion after removal phase = %q", completedPhase)
+	}
+	if _, ok := catalog.FindByKey(remove.Key()); ok {
+		t.Fatal("refresh completion revived removed candidate")
+	}
+}
+
 func TestCandidateCatalogResetHealthOutcomesRetainsInventoryAndResources(t *testing.T) {
 	failed := Proxy{IP: "192.0.2.51", Port: "8080", Protocol: "http", SourceName: "feed"}
 	policy := Proxy{IP: "192.0.2.52", Port: "1080", Protocol: "socks5", SourceName: "feed"}
@@ -155,6 +417,26 @@ func TestCandidateCatalogHasAuthIncludesAlternateCredentials(t *testing.T) {
 	page := NewStatusServer(pool, &ConfigStore{}).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page", nil))
 	if len(page.Candidates) != 1 || !page.Candidates[0].HasAuth {
 		t.Fatalf("alternate credential auth marker = %#v", page.Candidates)
+	}
+}
+
+func TestCandidateCatalogPartialMergeRetainsAlternateCredentials(t *testing.T) {
+	labels := map[string]string{"old-id": "old", "new-id": "new"}
+	old := candidateFromSource("192.0.2.54", "old-id", "old")
+	old.CredentialAlternates = []ProxyCredential{{Username: "old-alt", Password: "secret"}}
+	current := candidateFromSource("192.0.2.54", "new-id", "new")
+
+	catalog := &CandidateCatalog{}
+	first := catalog.begin([]Proxy{old}, labels, nil, 0)
+	catalog.complete(first, nil, nil, nil)
+	catalog.begin([]Proxy{current}, labels, map[string]bool{"old-id": true}, 1)
+
+	got, ok := catalog.FindByKey(old.Key())
+	if !ok || !reflect.DeepEqual(got.CredentialAlternates, old.CredentialAlternates) {
+		t.Fatalf("partial merge alternates = %#v, want %#v", got.CredentialAlternates, old.CredentialAlternates)
+	}
+	if snapshot := catalog.snapshot.Load(); !snapshot.records[0].hasAuth {
+		t.Fatal("partial merge lost alternate credential auth marker")
 	}
 }
 

@@ -156,8 +156,11 @@ func TestCandidateDeleteHandlerReportsNonDurableCacheFailure(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	body := `{"keys":["` + candidate.Key() + `"]}`
 	server.handleCandidatesDelete(recorder, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body)))
-	if recorder.Code != http.StatusInternalServerError || !bytes.Contains(recorder.Body.Bytes(), []byte("candidate_delete_not_durable")) {
+	if recorder.Code != http.StatusInternalServerError || !bytes.Contains(recorder.Body.Bytes(), []byte("candidate_delete_not_durable")) || !bytes.Contains(recorder.Body.Bytes(), []byte("删除未提交")) {
 		t.Fatalf("non-durable response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, ok := catalog.FindByKey(candidate.Key()); !ok {
+		t.Fatal("candidate deletion was published despite persistence failure")
 	}
 }
 func TestNodeDeleteHandlerReportsNonDurableCacheFailure(t *testing.T) {
@@ -174,8 +177,11 @@ func TestNodeDeleteHandlerReportsNonDurableCacheFailure(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	body := `{"keys":["` + node.Key() + `"]}`
 	server.handleNodesDelete(recorder, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body)))
-	if recorder.Code != http.StatusInternalServerError || !bytes.Contains(recorder.Body.Bytes(), []byte("node_delete_not_durable")) {
+	if recorder.Code != http.StatusInternalServerError || !bytes.Contains(recorder.Body.Bytes(), []byte("node_delete_not_durable")) || !bytes.Contains(recorder.Body.Bytes(), []byte("删除未提交")) {
 		t.Fatalf("non-durable response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, ok := pool.Find(node.Key()); !ok {
+		t.Fatal("node deletion was published despite persistence failure")
 	}
 }
 func TestInventoryDeleteRoutesArePostOnlyAndRemoveFromPages(t *testing.T) {

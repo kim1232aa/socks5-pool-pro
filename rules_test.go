@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMatchGroupCanonicalizesAbsoluteDNSNames(t *testing.T) {
 	tests := []struct {
@@ -85,6 +88,37 @@ func TestAddGroupRejectsReservedCountryNamespaceAndOwnsSlices(t *testing.T) {
 	stored := store.Groups()[0]
 	if stored.Name != "private-egress" || stored.Countries[0] != "JP" || stored.Protocols[0] != "socks5" {
 		t.Fatalf("stored group aliased caller/return slices: %#v", stored)
+	}
+}
+
+func TestValidatePersistedPoolConfigRejectsCaseOnlyDuplicateGroupNames(t *testing.T) {
+	cfg := PoolConfig{Groups: []Group{
+		{ID: "group-tokyo", Name: "Tokyo-Egress", Strategy: StrategySticky},
+		{ID: "group-tokyo-duplicate", Name: "tokyo-egress", Strategy: StrategyLatency},
+	}}
+	if err := validatePersistedPoolConfig(&cfg); err == nil {
+		t.Fatal("case-only duplicate group names were accepted")
+	}
+}
+
+func TestRuleGroupIDResolutionIsExact(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := store.AddGroup(Group{Name: "Tokyo-Egress", Countries: []string{"JP"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddRule(Rule{Type: RuleDomain, Value: "example.com", Group: strings.ToUpper(group.ID)}); err == nil {
+		t.Fatal("AddRule accepted a case-folded group ID")
+	}
+	rule, err := store.AddRule(Rule{Type: RuleDomain, Value: "example.com", Group: group.ID})
+	if err != nil {
+		t.Fatalf("AddRule exact group ID: %v", err)
+	}
+	if rule.Group != group.ID {
+		t.Fatalf("stored rule group = %q, want canonical ID %q", rule.Group, group.ID)
 	}
 }
 

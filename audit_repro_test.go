@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -72,7 +73,7 @@ func TestAuditSuccessfulEmptySourceDeletesLastGoodInventory(t *testing.T) {
 	}
 }
 
-func TestAuditConfigMutationSurvivesPersistenceFailure(t *testing.T) {
+func TestAuditConfigMutationRollsBackOnNotCommittedPersistenceFailure(t *testing.T) {
 	dir := t.TempDir()
 	destinationDirectory := filepath.Join(dir, "pool_config.json")
 	if err := os.Mkdir(destinationDirectory, 0o700); err != nil {
@@ -152,13 +153,36 @@ func TestAuditHTTPConnectRelayPropagatesClientHalfClose(t *testing.T) {
 	}
 }
 
-func TestAuditDedupeDiscardsAlternateCredentials(t *testing.T) {
-	bad := Proxy{IP: "192.0.2.90", Port: "8080", Protocol: "http", Username: "old", Password: "bad", SourceName: "a-source"}
-	good := bad
-	good.Username, good.Password, good.SourceName = "rotated", "good", "b-source"
-	got := dedupeCandidates([]Proxy{good, bad})
-	if len(got) != 1 || got[0].Username != bad.Username || got[0].Password != bad.Password {
-		t.Fatalf("dedupe = %#v; want deterministic discarded alternate credential pair", got)
+func TestAuditDedupeKeepsStablePrimaryAndBoundedAlternateCredentials(t *testing.T) {
+	primary := Proxy{IP: "192.0.2.90", Port: "8080", Protocol: "http", Username: "old", Password: "bad", SourceName: "a-source"}
+	rotated := primary
+	rotated.Username, rotated.Password, rotated.SourceName = "rotated", "good", "b-source"
+	input := []Proxy{rotated, primary}
+	for i := 0; i < maxCredentialAlternates+4; i++ {
+		variant := primary
+		variant.Username = fmt.Sprintf("variant-%02d", i)
+		variant.Password = fmt.Sprintf("secret-%02d", i)
+		variant.SourceName = "z-source"
+		input = append(input, variant)
+	}
+
+	got := dedupeCandidates(input)
+	if len(got) != 1 || got[0].Username != primary.Username || got[0].Password != primary.Password {
+		t.Fatalf("dedupe = %#v; want stable primary credential pair", got)
+	}
+	if len(got[0].CredentialAlternates) != maxCredentialAlternates {
+		t.Fatalf("alternate credentials = %#v; want cap %d", got[0].CredentialAlternates, maxCredentialAlternates)
+	}
+	wantRotated := ProxyCredential{Username: rotated.Username, Password: rotated.Password}
+	foundRotated := false
+	for _, credential := range got[0].CredentialAlternates {
+		if credential == wantRotated {
+			foundRotated = true
+			break
+		}
+	}
+	if !foundRotated {
+		t.Fatalf("alternate credentials = %#v; rotated credential was discarded", got[0].CredentialAlternates)
 	}
 }
 

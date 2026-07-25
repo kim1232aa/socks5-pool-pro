@@ -81,7 +81,14 @@ var defaultSourceFetchPolicy = sourceFetchPolicy{
 // FetchSource downloads and parses a single Source's node list, tagging
 // every result with the source's name.
 func FetchSource(src Source) ([]Proxy, error) {
-	queueCtx, cancel := context.WithTimeout(context.Background(), sourceFetchQueueTimeout)
+	return FetchSourceContext(context.Background(), src)
+}
+
+func FetchSourceContext(parent context.Context, src Source) ([]Proxy, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	queueCtx, cancel := context.WithTimeout(parent, sourceFetchQueueTimeout)
 	defer cancel()
 	select {
 	case sourceFetchSlots <- struct{}{}:
@@ -95,7 +102,7 @@ func FetchSource(src Source) ([]Proxy, error) {
 		return nil, err
 	}
 	defer transport.CloseIdleConnections()
-	return fetchSourceWithClient(src, client, defaultSourceFetchPolicy)
+	return fetchSourceWithClientContext(parent, src, client, defaultSourceFetchPolicy)
 }
 
 // sourceIPResolver is the small net.Resolver surface needed by the guarded
@@ -252,15 +259,22 @@ func isPublicInternetIP(ip net.IP) bool {
 // tests. Production attempts are individually bounded by the client's timeout
 // and collectively bounded by policy.TotalTimeout.
 func fetchSourceWithClient(src Source, client *http.Client, policy sourceFetchPolicy) ([]Proxy, error) {
+	return fetchSourceWithClientContext(context.Background(), src, client, policy)
+}
+
+func fetchSourceWithClientContext(parent context.Context, src Source, client *http.Client, policy sourceFetchPolicy) ([]Proxy, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if isJSONSourceFormat(src.Format) {
-		proxies, err := downloadAndParseJSONSource(src, client, policy)
+		proxies, err := downloadAndParseJSONSourceContext(parent, src, client, policy)
 		if err != nil {
 			return nil, err
 		}
 		return finalizeFetchedProxies(src, proxies)
 	}
 
-	body, err := downloadSource(src, client, policy)
+	body, err := downloadSourceContext(parent, src, client, policy)
 	if err != nil {
 		return nil, err
 	}
@@ -322,6 +336,13 @@ func finalizeFetchedProxies(src Source, proxies []Proxy) ([]Proxy, error) {
 }
 
 func downloadAndParseJSONSource(src Source, client *http.Client, policy sourceFetchPolicy) ([]Proxy, error) {
+	return downloadAndParseJSONSourceContext(context.Background(), src, client, policy)
+}
+
+func downloadAndParseJSONSourceContext(parent context.Context, src Source, client *http.Client, policy sourceFetchPolicy) ([]Proxy, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if client == nil {
 		return nil, fmt.Errorf("fetch failed: nil HTTP client")
 	}
@@ -335,7 +356,7 @@ func downloadAndParseJSONSource(src Source, client *http.Client, policy sourceFe
 		policy.RetryDelay = 0
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), policy.TotalTimeout)
+	ctx, cancel := context.WithTimeout(parent, policy.TotalTimeout)
 	defer cancel()
 
 	var lastErr error
@@ -422,6 +443,13 @@ func downloadAndParseJSONSourceAttempt(ctx context.Context, src Source, client *
 }
 
 func downloadSource(src Source, client *http.Client, policy sourceFetchPolicy) ([]byte, error) {
+	return downloadSourceContext(context.Background(), src, client, policy)
+}
+
+func downloadSourceContext(parent context.Context, src Source, client *http.Client, policy sourceFetchPolicy) ([]byte, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if client == nil {
 		return nil, fmt.Errorf("fetch failed: nil HTTP client")
 	}
@@ -435,7 +463,7 @@ func downloadSource(src Source, client *http.Client, policy sourceFetchPolicy) (
 		policy.RetryDelay = 0
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), policy.TotalTimeout)
+	ctx, cancel := context.WithTimeout(parent, policy.TotalTimeout)
 	defer cancel()
 
 	var lastErr error

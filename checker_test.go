@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -146,6 +147,77 @@ func TestCheckCredentialCandidatesPromotesWorkingLogin(t *testing.T) {
 	}
 }
 
+func TestCheckCredentialCandidatesRetriesOnlyExplicitProxyAuthenticationRejection(t *testing.T) {
+	const goodAuthorization = "Basic Z29vZDpwYXNz" // good:pass
+	tests := []struct {
+		name              string
+		healthStatus      int
+		healthDelay       time.Duration
+		rejectPrimaryAuth bool
+		wantAttempts      int32
+		wantOK            bool
+	}{
+		{name: "proxy auth rejection", rejectPrimaryAuth: true, healthStatus: http.StatusOK, wantAttempts: 2, wantOK: true},
+		{name: "endpoint redirect", healthStatus: http.StatusFound, wantAttempts: 1},
+		{name: "endpoint forbidden", healthStatus: http.StatusForbidden, wantAttempts: 1},
+		{name: "endpoint unavailable", healthStatus: http.StatusServiceUnavailable, wantAttempts: 1},
+		{name: "endpoint timeout", healthStatus: http.StatusOK, healthDelay: 250 * time.Millisecond, wantAttempts: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodConnect {
+					http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+					return
+				}
+				attempts.Add(1)
+				if test.rejectPrimaryAuth && r.Header.Get("Proxy-Authorization") != goodAuthorization {
+					w.WriteHeader(http.StatusProxyAuthRequired)
+					return
+				}
+				conn, rw, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_, _ = rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+				_ = rw.Flush()
+				if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+					return
+				}
+				time.Sleep(test.healthDelay)
+				_, _ = io.WriteString(conn, fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", test.healthStatus, http.StatusText(test.healthStatus)))
+			}))
+			defer proxyServer.Close()
+
+			proxyURL, err := url.Parse(proxyServer.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			px := Proxy{
+				IP: proxyURL.Hostname(), Port: proxyURL.Port(), Protocol: "http",
+				Username: "primary", Password: "wrong",
+				CredentialAlternates: []ProxyCredential{{Username: "good", Password: "pass"}},
+			}
+			timeout := time.Second
+			if test.healthDelay > 0 {
+				timeout = 120 * time.Millisecond
+			}
+			checked, ok, _ := checkCredentialCandidates(context.Background(), px, "http://health.example/check", timeout)
+			if ok != test.wantOK {
+				t.Fatalf("credential check ok = %v, want %v", ok, test.wantOK)
+			}
+			if test.wantOK && (checked.Username != "good" || checked.Password != "pass") {
+				t.Fatalf("promoted credential = %q/%q, want alternate", checked.Username, checked.Password)
+			}
+			if got := attempts.Load(); got != test.wantAttempts {
+				t.Fatalf("CONNECT attempts = %d, want %d", got, test.wantAttempts)
+			}
+		})
+	}
+}
+
 func TestCheckCredentialCandidatesReservesTimeForLaterCredential(t *testing.T) {
 	const goodAuthorization = "Basic Z29vZDpwYXNz" // good:pass
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +226,7 @@ func TestCheckCredentialCandidatesReservesTimeForLaterCredential(t *testing.T) {
 			return
 		}
 		if r.Header.Get("Proxy-Authorization") != goodAuthorization {
-			time.Sleep(900 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 			w.WriteHeader(http.StatusProxyAuthRequired)
 			return
 		}

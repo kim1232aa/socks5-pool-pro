@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"sync"
 	"testing"
@@ -192,4 +196,129 @@ func TestPoolCachePersistsAutomaticHealthTerminalAndCooldown(t *testing.T) {
 	if got := stats[px.Key()]; got != want {
 		t.Fatalf("terminal stats round trip = %+v, want %+v", got, want)
 	}
+}
+
+func TestPoolCacheReadsLegacyGZIPDocument(t *testing.T) {
+	cache := newPoolCache(t.TempDir())
+	px := testProxy("socks5", "8.8.8.92", "1080", true)
+	legacy := poolCacheFile{
+		Proxies:        []Proxy{px},
+		Stats:          map[string]nodeStats{px.Key(): {Successes: 3, LastLatencyMs: 92}},
+		HealthCheckURL: defaultCheckURL,
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	writer, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache.path, compressed.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	forwarding, _, stats, criterion := cache.loadWithHealthCriterion()
+	if len(forwarding) != 1 || forwarding[0].Key() != px.Key() {
+		t.Fatalf("legacy gzip forwarding cache = %#v", forwarding)
+	}
+	if got := stats[px.Key()]; got.Successes != 3 || got.LastLatencyMs != 92 {
+		t.Fatalf("legacy gzip stats = %+v", got)
+	}
+	if criterion != defaultCheckURL {
+		t.Fatalf("legacy gzip health criterion = %q, want %q", criterion, defaultCheckURL)
+	}
+}
+
+type boundedPoolCacheTestWriter struct {
+	maxWrite int
+	written  int64
+}
+
+func (w *boundedPoolCacheTestWriter) Write(data []byte) (int, error) {
+	if len(data) > w.maxWrite {
+		return 0, fmt.Errorf("single write of %d bytes exceeds %d", len(data), w.maxWrite)
+	}
+	w.written += int64(len(data))
+	return len(data), nil
+}
+
+func TestEncodePoolCacheGZIPStreamsCompressedOutput(t *testing.T) {
+	f := benchmarkPoolCacheFile(10_000)
+	decodedOutput := &boundedPoolCacheTestWriter{maxWrite: maxCachedProxyJSONBytes}
+	if err := encodePoolCacheJSON(decodedOutput, &f); err != nil {
+		t.Fatalf("stream cache JSON: %v", err)
+	}
+	if decodedOutput.written <= int64(decodedOutput.maxWrite) {
+		t.Fatalf("JSON fixture wrote only %d bytes; test did not exercise chunked output", decodedOutput.written)
+	}
+
+	output := &boundedPoolCacheTestWriter{maxWrite: 64 << 10}
+	if err := encodePoolCacheGZIP(output, &f); err != nil {
+		t.Fatalf("stream cache gzip: %v", err)
+	}
+	if output.written <= int64(output.maxWrite) {
+		t.Fatalf("compressed fixture wrote only %d bytes; test did not exercise chunked output", output.written)
+	}
+
+	var compressed bytes.Buffer
+	if err := encodePoolCacheGZIP(&compressed, &f); err != nil {
+		t.Fatalf("encode cache gzip: %v", err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, want) {
+		t.Fatal("streamed cache JSON differs from the legacy json.Marshal document")
+	}
+}
+
+func BenchmarkEncodePoolCacheGZIP(b *testing.B) {
+	for _, nodes := range []int{100_000, 500_000} {
+		b.Run(fmt.Sprintf("nodes-%d", nodes), func(b *testing.B) {
+			f := benchmarkPoolCacheFile(nodes)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := encodePoolCacheGZIP(io.Discard, &f); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func benchmarkPoolCacheFile(nodes int) poolCacheFile {
+	proxies := make([]Proxy, nodes)
+	stats := make(map[string]nodeStats, nodes)
+	for i := range proxies {
+		proxies[i] = Proxy{
+			IP:         fmt.Sprintf("proxy-%06d.example.test", i),
+			Port:       "1080",
+			Protocol:   "socks5",
+			SourceName: fmt.Sprintf("source-%06d", i),
+			Available:  true,
+		}
+		stats[proxies[i].Key()] = nodeStats{Successes: i % 17, LastLatencyMs: int64(i%1000 + 1)}
+	}
+	return poolCacheFile{Proxies: proxies, Stats: stats}
 }

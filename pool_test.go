@@ -467,6 +467,21 @@ func TestCurrentGenerationFailureClearsWaitingForRecheckWithoutReviving(t *testi
 	}
 }
 
+func TestPromoteCandidateSpeedRejectsDisabledSourceWithoutPublishing(t *testing.T) {
+	p := NewProxyPool()
+	p.SetHealthCriterion(defaultCheckURL)
+	candidate := testProxy("http", "192.0.2.27", "8080", false)
+	candidate.SourceIDs = []string{"source-disabled"}
+	candidate.SourceNames = []string{"Disabled source"}
+
+	if p.PromoteCandidateSpeed(candidate, []Source{{ID: "source-disabled", Name: "Disabled source", Enabled: false}}, p.HealthGeneration(), 2048, 1<<20, 4000) {
+		t.Fatal("disabled-source candidate was promoted")
+	}
+	if got := p.Size(); got != 0 {
+		t.Fatalf("disabled-source candidate partially published: pool size = %d, want 0", got)
+	}
+}
+
 func TestUpdateWithEnabledSourcesAndPolicyMakesHardExclusionWin(t *testing.T) {
 	p := NewProxyPool()
 	p.SetHealthCriterion(defaultCheckURL)
@@ -598,6 +613,10 @@ func TestInvalidateHealthRetainsNodesAndAllowsImmediateRecovery(t *testing.T) {
 func TestHealthGenerationRejectsStaleAsynchronousResults(t *testing.T) {
 	p := NewProxyPool()
 	px := testProxy("socks5", "192.0.2.19", "1080", true)
+	px.ExitIP = "198.51.100.19"
+	px.Country = "US"
+	px.City = "Seattle"
+	px.Continent = "NA"
 	p.Prime([]Proxy{px}, nil)
 	oldGeneration := p.HealthGeneration()
 	p.InvalidateHealth()
@@ -605,8 +624,13 @@ func TestHealthGenerationRejectsStaleAsynchronousResults(t *testing.T) {
 	if p.ObserveHealthResultAtGeneration(px.Key(), true, 8, oldGeneration) {
 		t.Fatal("stale health observation was applied")
 	}
+	if p.UpdateGeoAtGeneration(px.Key(), "203.0.113.19", "JP", "Tokyo", "AS", true, true, oldGeneration) {
+		t.Fatal("stale geo observation was applied")
+	}
 	if got, _ := p.Find(px.Key()); got.Available {
 		t.Fatal("stale health observation restored availability")
+	} else if got.ExitIP != px.ExitIP || got.Country != px.Country || got.City != px.City || got.Continent != px.Continent || got.IPChanged || got.IPChangeKnown {
+		t.Fatalf("stale geo observation changed node: got %+v want original geo %+v", got, px)
 	}
 	if p.Update([]Proxy{px}, nil, oldGeneration) {
 		t.Fatal("stale refresh update was applied")
@@ -616,8 +640,37 @@ func TestHealthGenerationRejectsStaleAsynchronousResults(t *testing.T) {
 	if !p.ObserveHealthResultAtGeneration(px.Key(), true, 8, currentGeneration) {
 		t.Fatal("current health observation was not applied")
 	}
+	if !p.UpdateGeoAtGeneration(px.Key(), "203.0.113.19", "JP", "Tokyo", "AS", true, true, currentGeneration) {
+		t.Fatal("current geo observation was not applied")
+	}
 	if got, _ := p.Find(px.Key()); !got.Available {
 		t.Fatal("current health observation did not restore availability")
+	} else if got.ExitIP != "203.0.113.19" || got.Country != "JP" || got.City != "Tokyo" || got.Continent != "AS" || !got.IPChanged || !got.IPChangeKnown {
+		t.Fatalf("current geo observation = %+v", got)
+	}
+}
+
+func TestHealthGenerationRejectsGeoAfterHealthCommit(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.20", "1080", false)
+	px.ExitIP = "198.51.100.20"
+	px.Country = "US"
+	p.Prime([]Proxy{px}, nil)
+	generation := p.HealthGeneration()
+
+	if !p.ObserveHealthResultAtGeneration(px.Key(), true, 8, generation) {
+		t.Fatal("current health observation was not applied")
+	}
+	p.InvalidateHealth()
+	if p.UpdateGeoAtGeneration(px.Key(), "203.0.113.20", "JP", "Tokyo", "AS", true, true, generation) {
+		t.Fatal("geo observation from the completed old-generation health check was applied")
+	}
+	got, ok := p.Find(px.Key())
+	if !ok {
+		t.Fatal("node disappeared")
+	}
+	if got.ExitIP != px.ExitIP || got.Country != px.Country || got.IPChanged || got.IPChangeKnown {
+		t.Fatalf("stale geo observation changed node: got %+v want original geo %+v", got, px)
 	}
 }
 
@@ -786,6 +839,23 @@ func TestResolveGroupMatchesAnyMergedSourceName(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Key() != merged.Key() {
 		t.Fatalf("secondary source attribution did not match group: %+v", got)
+	}
+}
+
+func TestResolveGroupIDRemainsCaseSensitive(t *testing.T) {
+	jp := testProxy("socks5", "192.0.2.42", "1080", true)
+	jp.Country = "JP"
+	us := testProxy("socks5", "192.0.2.43", "1080", true)
+	us.Country = "US"
+	groups := []Group{{ID: "Group-Tokyo-ID", Name: "Tokyo-Egress", Countries: []string{"JP"}}}
+
+	exact, _ := resolveGroupCandidates([]Proxy{jp, us}, "Group-Tokyo-ID", groups)
+	if len(exact) != 1 || exact[0].Key() != jp.Key() {
+		t.Fatalf("exact group ID match = %#v, want JP node", exact)
+	}
+	wrongCase, _ := resolveGroupCandidates([]Proxy{jp, us}, "group-tokyo-id", groups)
+	if len(wrongCase) != 2 {
+		t.Fatalf("case-folded group ID unexpectedly matched: %#v", wrongCase)
 	}
 }
 
@@ -1062,4 +1132,96 @@ func TestRemoveKeysConcurrent(t *testing.T) {
 	<-done
 	<-done
 	<-done
+}
+
+func TestRemoveKeysDoesNotBlockHealthUpdateDuringPersistence(t *testing.T) {
+	remove := testProxy("socks5", "8.8.8.90", "1080", true)
+	keep := testProxy("http", "8.8.4.90", "8080", true)
+	p := NewProxyPool()
+	p.Prime([]Proxy{remove, keep}, nil)
+	cache := newPoolCache(t.TempDir())
+	p.SetCache(cache)
+
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	var once sync.Once
+	p.beforeDeletePersist = func() {
+		once.Do(func() { close(persistStarted) })
+		<-releasePersist
+	}
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.RemoveKeys([]string{remove.Key()})
+		deleteDone <- err
+	}()
+	<-persistStarted
+
+	updateDone := make(chan struct{})
+	go func() {
+		p.UpdateLatency(keep.Key(), 77)
+		p.ObserveHealthResult(keep.Key(), false, 0)
+		close(updateDone)
+	}()
+	select {
+	case <-updateDone:
+	case <-time.After(2 * time.Second):
+		close(releasePersist)
+		t.Fatal("health update blocked behind deletion persistence")
+	}
+	close(releasePersist)
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("RemoveKeys failed: %v", err)
+	}
+
+	forwarding, _, stats := cache.load()
+	if len(forwarding) != 1 || forwarding[0].Key() != keep.Key() || forwarding[0].LatencyMs != 77 || forwarding[0].Available || !forwarding[0].HealthInvalidated {
+		t.Fatalf("durable pool lost concurrent health update: %#v", forwarding)
+	}
+	if !stats[keep.Key()].HealthFailureTerminal {
+		t.Fatalf("durable stats lost concurrent health update: %+v", stats[keep.Key()])
+	}
+}
+
+func TestClearUnavailableDoesNotBlockUpdateDuringPersistence(t *testing.T) {
+	dead := testProxy("socks5", "8.8.8.91", "1080", false)
+	keep := testProxy("http", "8.8.4.91", "8080", true)
+	p := NewProxyPool()
+	p.Prime([]Proxy{dead, keep}, nil)
+	cache := newPoolCache(t.TempDir())
+	p.SetCache(cache)
+
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	var once sync.Once
+	p.beforeDeletePersist = func() {
+		once.Do(func() { close(persistStarted) })
+		<-releasePersist
+	}
+	clearDone := make(chan error, 1)
+	go func() {
+		_, err := p.ClearUnavailable()
+		clearDone <- err
+	}()
+	<-persistStarted
+
+	updateDone := make(chan struct{})
+	go func() {
+		p.UpdateLatency(keep.Key(), 88)
+		close(updateDone)
+	}()
+	select {
+	case <-updateDone:
+	case <-time.After(2 * time.Second):
+		close(releasePersist)
+		t.Fatal("pool update blocked behind clear persistence")
+	}
+	close(releasePersist)
+	if err := <-clearDone; err != nil {
+		t.Fatalf("ClearUnavailable failed: %v", err)
+	}
+
+	forwarding, _, _ := cache.load()
+	if len(forwarding) != 1 || forwarding[0].Key() != keep.Key() || forwarding[0].LatencyMs != 88 {
+		t.Fatalf("durable pool lost concurrent update: %#v", forwarding)
+	}
 }

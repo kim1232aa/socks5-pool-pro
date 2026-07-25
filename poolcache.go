@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -180,37 +181,230 @@ func (c *poolCache) saveWithHealthState(generation uint64, forwarding, proxyip [
 	if err := validatePoolCacheFile(&f); err != nil {
 		return fmt.Errorf("validate pool cache: %w", err)
 	}
-	data, err := json.Marshal(f)
-	if err != nil {
-		return fmt.Errorf("marshal pool cache: %w", err)
-	}
-	if len(data) > maxPoolCacheDecodedBytes {
-		return fmt.Errorf("decoded snapshot exceeds %d byte limit", maxPoolCacheDecodedBytes)
-	}
-	var compressed bytes.Buffer
-	writer, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-	if err != nil {
-		return fmt.Errorf("create compressor: %w", err)
-	}
-	if _, err := writer.Write(data); err != nil {
-		_ = writer.Close()
-		return fmt.Errorf("compress pool cache: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("finish compression: %w", err)
-	}
-	if compressed.Len() > maxPoolCacheBytes {
-		return fmt.Errorf("compressed snapshot exceeds %d byte limit", maxPoolCacheBytes)
-	}
-	// Pool snapshots can contain upstream credentials. The shared atomic writer
-	// uses a random 0600 temporary file, fsyncs it, renames it, then fsyncs the
-	// directory; it never follows the legacy predictable .tmp path.
-	if err := writePrivateFileAtomic(c.path, compressed.Bytes()); err != nil {
+	// Encode directly through gzip into the atomic temporary file. This avoids
+	// retaining both the complete JSON document and a complete compressed copy
+	// alongside the already-copied pool snapshot.
+	if err := writePoolCacheAtomic(c.path, &f); err != nil {
 		return fmt.Errorf("write pool cache: %w", err)
 	}
 	c.lastGeneration = generation
 	c.hasLastGeneration = true
 	return nil
+}
+
+type poolCacheSizeWriter struct {
+	writer  io.Writer
+	written int64
+	limit   int64
+	label   string
+}
+
+func (w *poolCacheSizeWriter) Write(data []byte) (int, error) {
+	if int64(len(data)) > w.limit-w.written {
+		return 0, fmt.Errorf("%s exceeds %d byte limit", w.label, w.limit)
+	}
+	n, err := w.writer.Write(data)
+	w.written += int64(n)
+	return n, err
+}
+
+type poolCacheJSONStream struct {
+	output  io.Writer
+	buffer  bytes.Buffer
+	encoder *json.Encoder
+}
+
+func newPoolCacheJSONStream(output io.Writer) *poolCacheJSONStream {
+	stream := &poolCacheJSONStream{output: output}
+	stream.encoder = json.NewEncoder(&stream.buffer)
+	return stream
+}
+
+func (s *poolCacheJSONStream) writeString(value string) error {
+	_, err := io.WriteString(s.output, value)
+	return err
+}
+
+// encodeValue uses Encoder for one bounded record at a time. Encoder appends a
+// newline, which is removed to retain the compact json.Marshal wire format.
+func (s *poolCacheJSONStream) encodeValue(value any) error {
+	s.buffer.Reset()
+	if err := s.encoder.Encode(value); err != nil {
+		return err
+	}
+	encoded := s.buffer.Bytes()
+	if len(encoded) == 0 || encoded[len(encoded)-1] != '\n' {
+		return fmt.Errorf("JSON encoder omitted record terminator")
+	}
+	_, err := s.output.Write(encoded[:len(encoded)-1])
+	return err
+}
+
+func (s *poolCacheJSONStream) encodeProxies(proxies []Proxy) error {
+	if proxies == nil {
+		return s.writeString("null")
+	}
+	if err := s.writeString("["); err != nil {
+		return err
+	}
+	for i := range proxies {
+		if i > 0 {
+			if err := s.writeString(","); err != nil {
+				return err
+			}
+		}
+		if err := s.encodeValue(&proxies[i]); err != nil {
+			return err
+		}
+	}
+	return s.writeString("]")
+}
+
+func (s *poolCacheJSONStream) encodeStats(stats map[string]nodeStats) error {
+	if err := s.writeString("{"); err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(stats))
+	for key := range stats {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for i, key := range keys {
+		if i > 0 {
+			if err := s.writeString(","); err != nil {
+				return err
+			}
+		}
+		if err := s.encodeValue(key); err != nil {
+			return err
+		}
+		if err := s.writeString(":"); err != nil {
+			return err
+		}
+		if err := s.encodeValue(stats[key]); err != nil {
+			return err
+		}
+	}
+	return s.writeString("}")
+}
+
+func encodePoolCacheJSON(output io.Writer, f *poolCacheFile) error {
+	stream := newPoolCacheJSONStream(output)
+	if err := stream.writeString(`{"proxies":`); err != nil {
+		return err
+	}
+	if err := stream.encodeProxies(f.Proxies); err != nil {
+		return err
+	}
+	if err := stream.writeString(`,"proxyip_nodes":`); err != nil {
+		return err
+	}
+	if err := stream.encodeProxies(f.ProxyIPNodes); err != nil {
+		return err
+	}
+	if len(f.Stats) > 0 {
+		if err := stream.writeString(`,"stats":`); err != nil {
+			return err
+		}
+		if err := stream.encodeStats(f.Stats); err != nil {
+			return err
+		}
+	}
+	if f.HealthCheckURL != "" {
+		if err := stream.writeString(`,"health_check_url":`); err != nil {
+			return err
+		}
+		if err := stream.encodeValue(f.HealthCheckURL); err != nil {
+			return err
+		}
+	}
+	if f.HealthPolicy != "" {
+		if err := stream.writeString(`,"health_policy":`); err != nil {
+			return err
+		}
+		if err := stream.encodeValue(f.HealthPolicy); err != nil {
+			return err
+		}
+	}
+	if f.HealthRecheckPending {
+		if err := stream.writeString(`,"health_recheck_pending":true`); err != nil {
+			return err
+		}
+	}
+	return stream.writeString("}")
+}
+
+func encodePoolCacheGZIP(output io.Writer, f *poolCacheFile) error {
+	compressed := &poolCacheSizeWriter{
+		writer: output,
+		limit:  maxPoolCacheBytes,
+		label:  "compressed snapshot",
+	}
+	writer, err := gzip.NewWriterLevel(compressed, gzip.BestSpeed)
+	if err != nil {
+		return fmt.Errorf("create compressor: %w", err)
+	}
+	decoded := &poolCacheSizeWriter{
+		writer: writer,
+		limit:  maxPoolCacheDecodedBytes,
+		label:  "decoded snapshot",
+	}
+	if err := encodePoolCacheJSON(decoded, f); err != nil {
+		_ = writer.Close()
+		return fmt.Errorf("encode pool cache: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("finish compression: %w", err)
+	}
+	return nil
+}
+
+// writePoolCacheAtomic mirrors the shared private atomic writer while allowing
+// the cache encoder to stream directly into its random 0600 temporary file.
+func writePoolCacheAtomic(path string, f *poolCacheFile) (returnErr error) {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("persisted state path must not be empty")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		if returnErr != nil {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := temp.Chmod(0o600); err != nil {
+		return err
+	}
+	if err := encodePoolCacheGZIP(temp, f); err != nil {
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func decodePoolCacheBytes(data []byte) ([]byte, error) {

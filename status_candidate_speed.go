@@ -13,7 +13,10 @@ import (
 // production operation retains SpeedTestContext's fixed 1 MiB / 18 second
 // contract. A successful explicit operator test promotes the verified
 // candidate into the forwarding pool.
-var candidateSpeedTestContext = speedTestCredentialCandidatesContext
+var (
+	candidateHealthCheckContext = checkURLCredentialCandidatesContext
+	candidateSpeedTestContext   = speedTestCredentialCandidatesContext
+)
 
 type candidateSpeedtestRequest struct {
 	Keys []string `json:"keys"`
@@ -95,11 +98,11 @@ func uniqueCandidateSpeedtestKeys(input []string) ([]string, error) {
 
 func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candidateSpeedtestItem {
 	item := candidateSpeedtestItem{Key: key}
-	px, found := s.pool.candidates.FindByKey(key)
+	px, lease, found := s.pool.candidates.leaseByKey(key)
 	if !found || px.Key() != key {
-		// FindByKey excludes ProxyIP resources and non-forwarding protocols
-		// by returning ok=false, so the not-found path also covers a
-		// candidate that cannot be dialed as an upstream.
+		// Candidate leases exclude ProxyIP resources and non-forwarding
+		// protocols, so the not-found path also covers an entry that cannot be
+		// dialed as an upstream.
 		item.Error = candidateSpeedtestError("candidate_not_found", fmt.Sprintf("candidate not found or not forwardable: %s", key))
 		return item
 	}
@@ -109,8 +112,33 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 	}
 	defer s.endSpeedTest(key, false)
 
-	healthGeneration := s.pool.HealthGeneration()
-	result, verified, err := candidateSpeedTestContext(ctx, px, speedTestOperationTimeout)
+	s.coordinator.sourceLifecycleMu.RLock()
+	healthGeneration, checkURL, requireIPChange := s.pool.HealthCriterionAndPolicy()
+	if checkURL == "" {
+		s.pool.SetHealthCriterion(s.store.CheckURL())
+		healthGeneration, checkURL, requireIPChange = s.pool.HealthCriterionAndPolicy()
+	}
+	s.coordinator.sourceLifecycleMu.RUnlock()
+
+	healthCtx, healthCancel := context.WithTimeout(ctx, manualNodeVerifyTotalTimeout)
+	defer healthCancel()
+	healthVerified, reachable, healthErr := candidateHealthCheckContext(healthCtx, px, checkURL, manualNodeVerifyTotalTimeout)
+	if healthErr != nil || !reachable {
+		item.Error = candidateSpeedtestError("candidate_healthcheck_failed", "candidate failed current health check criterion before speedtest")
+		return item
+	}
+
+	exitIP := ""
+	if requireIPChange {
+		exitIP = probeExitIPContext(healthCtx, healthVerified, manualNodeVerifyExitTimeout)
+	}
+	policy := evaluateIPChangePolicy(exitIP, BaselineExitIP(), requireIPChange)
+	if !policy.PolicyAllowed {
+		item.Error = candidateSpeedtestError("candidate_healthcheck_failed", "candidate failed IP change policy before speedtest")
+		return item
+	}
+
+	result, verified, err := candidateSpeedTestContext(ctx, healthVerified, speedTestOperationTimeout)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		item.Error = candidateSpeedtestError("request_cancelled", ctxErr.Error())
 		return item
@@ -121,19 +149,18 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 	}
 
 	s.coordinator.sourceLifecycleMu.Lock()
-	if !s.pool.UpdateWithEnabledSources([]Proxy{verified}, nil, s.store.Sources(), healthGeneration) {
-		s.coordinator.sourceLifecycleMu.Unlock()
-		item.Error = candidateSpeedtestError("health_criterion_changed", "检测标准已改变，测速结果未加入转发池")
-		return item
-	}
-	s.pool.ObserveManualHealthOutcomeAtGeneration(key, true, true, 0, healthGeneration)
-	s.pool.UpdateVerifiedCredentialsAtGeneration(key, verified, healthGeneration)
-	if !s.pool.UpdateSpeed(key, result.Kbps, result.Bytes, result.DurationMs) {
-		s.coordinator.sourceLifecycleMu.Unlock()
+	ok := s.pool.candidates.withPromotionLease(lease, func(current Proxy) bool {
+		verified.SourceName = current.SourceName
+		verified.SourceNames = append([]string(nil), current.SourceNames...)
+		verified.SourceIDs = append([]string(nil), current.SourceIDs...)
+		return s.pool.PromoteCandidateSpeed(verified, s.store.Sources(), healthGeneration, result.Kbps, result.Bytes, result.DurationMs)
+	})
+	s.coordinator.sourceLifecycleMu.Unlock()
+
+	if !ok {
 		item.Error = candidateSpeedtestError("candidate_promotion_failed", "候选在测速完成后无法加入转发池")
 		return item
 	}
-	s.coordinator.sourceLifecycleMu.Unlock()
 	if err := s.pool.FlushCache(); err != nil {
 		item.Error = candidateSpeedtestError("candidate_speedtest_not_durable", fmt.Sprintf("测速结果未持久化: %v", err))
 		return item

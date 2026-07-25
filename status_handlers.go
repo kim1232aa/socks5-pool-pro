@@ -7,7 +7,6 @@ import (
 	"html/template"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -100,112 +99,6 @@ func (s *StatusServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.buildSummary())
 }
 
-func (s *StatusServer) handleV1Proxies(w http.ResponseWriter, r *http.Request) {
-	if err := validateCountryQuery(r); err != nil {
-		writeErrCode(w, http.StatusBadRequest, "invalid_country", err)
-		return
-	}
-	protocol, err := validatedV1ProxyProtocol(r.URL.Query().Get("protocol"))
-	if err != nil {
-		writeErrCode(w, http.StatusBadRequest, "invalid_protocol", err)
-		return
-	}
-	page, pageSize, err := strictV1PageParams(r)
-	if err != nil {
-		writeErrCode(w, http.StatusBadRequest, "invalid_pagination", err)
-		return
-	}
-	all, snapshotID := s.v1HealthyProxySnapshot()
-	w.Header().Set("X-Snapshot-ID", snapshotID)
-	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != snapshotID {
-		writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
-		return
-	}
-	filtered := filterV1ProxyViews(all, protocol, r)
-	pageCount := (len(filtered) + pageSize - 1) / pageSize
-	if pageCount < 1 {
-		pageCount = 1
-	}
-	if page > pageCount {
-		writeErrCode(w, http.StatusBadRequest, "page_out_of_range", fmt.Errorf("page %d exceeds page_count %d", page, pageCount))
-		return
-	}
-	start := (page - 1) * pageSize
-	end := start + pageSize
-	if end > len(filtered) {
-		end = len(filtered)
-	}
-	rows := make([]V1ProxyView, 0, end-start)
-	if start < len(filtered) {
-		rows = append(rows, filtered[start:end]...)
-	}
-	writeJSON(w, V1ProxyPage{
-		APIVersion: "v1", SnapshotID: snapshotID, Proxies: rows,
-		Page: page, PageSize: pageSize, PageCount: pageCount, HasNext: page < pageCount,
-		FilteredTotal: len(filtered), AvailableTotal: len(all),
-	})
-}
-
-func (s *StatusServer) handleV1ProxyPick(w http.ResponseWriter, r *http.Request) {
-	if err := validateCountryQuery(r); err != nil {
-		writeErrCode(w, http.StatusBadRequest, "invalid_country", err)
-		return
-	}
-	protocol, err := validatedV1ProxyProtocol(r.URL.Query().Get("protocol"))
-	if err != nil {
-		writeErrCode(w, http.StatusBadRequest, "invalid_protocol", err)
-		return
-	}
-	all, snapshotID := s.v1HealthyProxySnapshot()
-	snapshotID = formatV1ProxyPickSnapshotID(all)
-	w.Header().Set("X-Snapshot-ID", snapshotID)
-	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != snapshotID {
-		writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
-		return
-	}
-	filtered := filterV1ProxyViews(all, protocol, r)
-	if len(filtered) == 0 {
-		writeErrCode(w, http.StatusNotFound, "proxy_not_found", fmt.Errorf("no healthy proxy matches the requested filters"))
-		return
-	}
-	selected := filtered[0]
-	for _, candidate := range filtered[1:] {
-		if candidate.score > selected.score || candidate.score == selected.score && candidate.Key < selected.Key {
-			selected = candidate
-		}
-	}
-	writeJSON(w, V1ProxyPickResponse{APIVersion: "v1", SnapshotID: snapshotID, Proxy: selected})
-}
-
-func (s *StatusServer) v1HealthyProxySnapshot() ([]V1ProxyView, string) {
-	s.pool.mu.RLock()
-	views := make([]V1ProxyView, 0, len(s.pool.proxies))
-	for _, px := range s.pool.proxies {
-		if !px.Available || !proxyHardRoutable(px) {
-			continue
-		}
-		switch px.Protocol {
-		case "socks5", "http", "https":
-		default:
-			continue
-		}
-		proxyURL := px.ConsumerURL()
-		view := V1ProxyView{
-			ProxyURL: proxyURL, Username: px.Username, Password: px.Password,
-			Key: px.Key(), Protocol: px.Protocol,
-			Country: normalizedNodeCountry(px.Country), City: px.City,
-			Latency: px.LatencyMs, Speed: px.SpeedKbps, score: s.pool.scoreLocked(px),
-		}
-		if px.Protocol == "socks5" {
-			view.SocksURL = proxyURL
-		}
-		views = append(views, view)
-	}
-	s.pool.mu.RUnlock()
-	sort.SliceStable(views, func(i, j int) bool { return views[i].Key < views[j].Key })
-	return views, formatV1ProxySnapshotID(views)
-}
-
 func (s *StatusServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	operation, accepted := s.coordinator.requestRefresh()
 	w.Header().Set("Location", "/api/refresh/status")
@@ -260,13 +153,23 @@ func (s *StatusServer) handleCheckURL(w http.ResponseWriter, r *http.Request) {
 			}{Status: "ok", URL: requestedURL, Changed: false})
 			return
 		}
-		if err := s.store.SetCheckURL(requestedURL); err != nil {
-			writeConfigStoreError(w, err)
+		storeErr := s.store.SetCheckURL(requestedURL)
+		if storeErr != nil && !isConfigDurabilityUncertain(storeErr) {
+			writeConfigStoreError(w, storeErr)
 			return
 		}
-		invalidated := s.pool.InvalidateHealth(s.store.CheckURL())
+		invalidated := s.pool.InvalidateHealth(s.store.Snapshot().CheckURL)
 		candidateOutcomesReset := s.pool.candidates.ResetHealthOutcomes()
-		s.pool.FlushCache()
+		flushErr := s.pool.FlushCache()
+		if storeErr != nil {
+			s.coordinator.triggerFullRecheck(s.pool)
+			writeConfigStoreError(w, errors.Join(storeErr, flushErr))
+			return
+		}
+		if flushErr != nil {
+			writeErrCode(w, http.StatusInternalServerError, "check_url_not_durable", fmt.Errorf("health criterion change was not persisted: %w", flushErr))
+			return
+		}
 		operation, accepted := s.coordinator.triggerFullRecheck(s.pool)
 		w.Header().Set("Location", "/api/health-recheck/status")
 		writeJSON(w, struct {
@@ -295,178 +198,6 @@ func (s *StatusServer) handleNodes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Sunset", "Thu, 31 Dec 2026 23:59:59 GMT")
 	w.Header().Add("Link", `</api/nodes/page>; rel="successor-version"`)
 	writeJSON(w, s.nodeViews())
-}
-
-const (
-	defaultNodePageSize = 20
-	maxNodePageSize     = 100
-)
-
-// handleNodesPage serves a bounded, server-filtered page for the dashboard.
-// Keep handleNodes above as-is: external callers may still rely on its legacy
-// plain JSON array contract.
-func (s *StatusServer) handleNodesPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		methodNotAllowed(w, http.MethodGet, http.MethodHead)
-		return
-	}
-	if err := validateCountryQuery(r); err != nil {
-		writeErrCode(w, http.StatusBadRequest, "invalid_country", err)
-		return
-	}
-	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" {
-		current := s.currentNodeSnapshotID()
-		w.Header().Set("X-Snapshot-ID", current)
-		if requested != current {
-			writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
-			return
-		}
-	}
-	page := s.buildNodePage(r)
-	w.Header().Set("X-Snapshot-ID", page.SnapshotID)
-	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != page.SnapshotID {
-		writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
-		return
-	}
-	writeJSON(w, page)
-}
-
-func (s *StatusServer) currentNodeSnapshotID() string {
-	s.pool.mu.RLock()
-	generation := s.pool.cacheGeneration
-	s.pool.mu.RUnlock()
-	return formatPoolSnapshotID(generation)
-}
-
-func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
-	page, pageSize := nodePageParams(r)
-	query := r.URL.Query()
-	search := strings.ToLower(strings.TrimSpace(query.Get("search")))
-	countryRaw := strings.TrimSpace(query.Get("country"))
-	unknownCountry := strings.EqualFold(countryRaw, "__unknown__") || nodeQueryEnabled(query.Get("country_unknown"))
-	country := ""
-	if !unknownCountry {
-		country = normalizedNodeCountry(countryRaw)
-	}
-	protocol := strings.ToLower(strings.TrimSpace(query.Get("protocol")))
-	onlyChanged := nodeQueryEnabled(query.Get("only_changed"))
-	onlyAvailable := nodeQueryEnabled(query.Get("available")) || nodeQueryEnabled(query.Get("hide_unavailable"))
-	sortBy := strings.ToLower(strings.TrimSpace(query.Get("sort")))
-
-	s.pool.mu.RLock()
-	poolGeneration := s.pool.cacheGeneration
-	activeProxy, activeOK := effectiveAnyCurrentLocked(s.pool.proxies, s.pool.groupState[GroupAny])
-	activeKey := ""
-	if activeOK {
-		activeKey = activeProxy.Key()
-	}
-	views := make([]NodeView, 0, len(s.pool.proxies))
-	for _, liveProxy := range s.pool.proxies {
-		px := cloneProxy(liveProxy)
-		view := nodeViewOf(px, activeKey)
-		view.Score = s.pool.scoreLocked(px)
-		if stats := s.pool.stats[px.Key()]; stats != nil {
-			view.Successes, view.Failures = stats.Successes, stats.Failures
-			view.ConsecutiveFailures = stats.ConsecutiveHealthFailures
-		}
-		views = append(views, view)
-	}
-	s.pool.mu.RUnlock()
-	snapshotID := formatPoolSnapshotID(poolGeneration)
-	countries := make(map[string]*NodeCountrySummary)
-	availableTotal := 0
-	unknownCountryTotal := 0
-	var active *NodeView
-	for _, view := range views {
-		if view.Available {
-			availableTotal++
-		}
-		if view.Active {
-			activeCopy := view
-			active = &activeCopy
-		}
-
-		if code := normalizedNodeCountry(view.Country); code != "" {
-			summary := countries[code]
-			if summary == nil {
-				summary = &NodeCountrySummary{Country: code}
-				countries[code] = summary
-			}
-			summary.Total++
-			if view.Available {
-				summary.Available++
-			}
-			if summary.Continent == "" && view.Continent != "" {
-				summary.Continent = view.Continent
-			}
-		} else {
-			unknownCountryTotal++
-		}
-	}
-
-	filtered := make([]NodeView, 0, len(views))
-	for _, view := range views {
-		if search != "" && !strings.Contains(strings.ToLower(view.Addr+" "+view.ExitIP), search) {
-			continue
-		}
-		if country != "" && normalizedNodeCountry(view.Country) != country {
-			continue
-		}
-		if unknownCountry && normalizedNodeCountry(view.Country) != "" {
-			continue
-		}
-		if protocol != "" && strings.ToLower(view.Protocol) != protocol {
-			continue
-		}
-		if onlyChanged && !(view.IPChangeKnown && view.IPChanged) {
-			continue
-		}
-		if onlyAvailable && !view.Available {
-			continue
-		}
-		filtered = append(filtered, view)
-	}
-	sortNodeViews(filtered, sortBy)
-
-	filteredTotal := len(filtered)
-	pageCount := (filteredTotal + pageSize - 1) / pageSize
-	if pageCount < 1 {
-		pageCount = 1
-	}
-	if page > pageCount {
-		page = pageCount
-	}
-	start := (page - 1) * pageSize
-	end := start + pageSize
-	if end > filteredTotal {
-		end = filteredTotal
-	}
-	pageNodes := make([]NodeView, 0, end-start)
-	if start < filteredTotal {
-		pageNodes = append(pageNodes, filtered[start:end]...)
-	}
-
-	countryList := make([]NodeCountrySummary, 0, len(countries))
-	for _, summary := range countries {
-		countryList = append(countryList, *summary)
-	}
-	sort.Slice(countryList, func(i, j int) bool { return countryList[i].Country < countryList[j].Country })
-
-	return NodePageResponse{
-		Nodes:               pageNodes,
-		SnapshotID:          snapshotID,
-		Page:                page,
-		PageSize:            pageSize,
-		PageCount:           pageCount,
-		HasNext:             page < pageCount,
-		FilteredTotal:       filteredTotal,
-		PoolTotal:           len(views),
-		AvailableTotal:      availableTotal,
-		UnavailableTotal:    len(views) - availableTotal,
-		Countries:           countryList,
-		CountryUnknownTotal: unknownCountryTotal,
-		Active:              active,
-	}
 }
 
 func (s *StatusServer) handleNodeSwitch(w http.ResponseWriter, r *http.Request) {
@@ -597,8 +328,13 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while verification was running"))
 		return
 	}
-	if exitIP != "" {
-		s.pool.UpdateGeo(in.Key, exitIP, country, city, continent, ipChanged, ipChangeKnown)
+	if exitIP != "" && !s.pool.UpdateGeoAtGeneration(in.Key, exitIP, country, city, continent, ipChanged, ipChangeKnown, healthGeneration) {
+		if s.pool.HealthGeneration() != healthGeneration {
+			writeErrCode(w, http.StatusConflict, "health_criterion_changed", fmt.Errorf("检测标准已改变，结果未应用"))
+			return
+		}
+		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while verification was running"))
+		return
 	}
 	reachableKeys := map[string]bool{}
 	policyFiltered := map[string]bool{}

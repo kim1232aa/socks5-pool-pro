@@ -100,26 +100,92 @@ type candidateSnapshot struct {
 type CandidateCatalog struct {
 	nextGeneration atomic.Uint64
 	snapshot       atomic.Pointer[candidateSnapshot]
+	publicationMu  sync.RWMutex
 	cacheMu        sync.RWMutex
 	cache          *candidateCatalogCache
 	persistMu      sync.Mutex
+	removalMu      sync.Mutex
+	removing       map[string]struct{} // guarded by publicationMu
+
+	// Deterministic test seams around persistence and removal publication.
+	persistLocked      func()
+	removeBeforeCommit func()
+	removeAfterPersist func()
+}
+
+type candidatePromotionLease struct {
+	snapshot   *candidateSnapshot
+	generation uint64
+	revision   uint64
+	key        string
 }
 
 // FindByKey returns the exact protocol-aware candidate declaration. It is
 // intentionally inventory-only: callers must still validate before admitting a
 // candidate to the forwarding pool.
 func (c *CandidateCatalog) FindByKey(key string) (Proxy, bool) {
-	protocol, addr, ok := strings.Cut(key, "://")
-	if !ok || protocol == "" || addr == "" {
-		return Proxy{}, false
-	}
 	snapshot := c.snapshot.Load()
 	if snapshot == nil {
 		return Proxy{}, false
 	}
-	protocol = strings.ToLower(protocol)
 	snapshot.mu.RLock()
 	defer snapshot.mu.RUnlock()
+	return candidateProxyByKeyLocked(snapshot, key)
+}
+
+// leaseByKey captures the catalog identity that authorized asynchronous
+// candidate verification. Publication must later use withPromotionLease rather
+// than a fresh lookup: finding the same key in a replacement snapshot does not
+// prove that the tested declaration is still current.
+func (c *CandidateCatalog) leaseByKey(key string) (Proxy, candidatePromotionLease, bool) {
+	c.publicationMu.RLock()
+	defer c.publicationMu.RUnlock()
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return Proxy{}, candidatePromotionLease{}, false
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	px, ok := candidateProxyByKeyLocked(snapshot, key)
+	if !ok {
+		return Proxy{}, candidatePromotionLease{}, false
+	}
+	return px, candidatePromotionLease{
+		snapshot: snapshot, generation: snapshot.generation, revision: snapshot.revision, key: key,
+	}, true
+}
+
+// withPromotionLease validates and holds one catalog lease through the pool
+// publication callback. Candidate removal, snapshot replacement, and revision
+// changes are excluded until the callback returns, closing the final lookup to
+// promotion TOCTOU window.
+func (c *CandidateCatalog) withPromotionLease(lease candidatePromotionLease, promote func(Proxy) bool) bool {
+	if lease.snapshot == nil || promote == nil {
+		return false
+	}
+	c.publicationMu.RLock()
+	defer c.publicationMu.RUnlock()
+	if c.snapshot.Load() != lease.snapshot {
+		return false
+	}
+	if _, pending := c.removing[lease.key]; pending {
+		return false
+	}
+	lease.snapshot.mu.RLock()
+	defer lease.snapshot.mu.RUnlock()
+	if lease.snapshot.generation != lease.generation || lease.snapshot.revision != lease.revision {
+		return false
+	}
+	px, ok := candidateProxyByKeyLocked(lease.snapshot, lease.key)
+	return ok && promote(px)
+}
+
+func candidateProxyByKeyLocked(snapshot *candidateSnapshot, key string) (Proxy, bool) {
+	protocol, addr, ok := strings.Cut(key, "://")
+	if !ok || protocol == "" || addr == "" {
+		return Proxy{}, false
+	}
+	protocol = strings.ToLower(protocol)
 	index := snapshot.find(protocol, addr)
 	if index < 0 {
 		return Proxy{}, false
@@ -136,12 +202,12 @@ func (c *CandidateCatalog) FindByKey(key string) (Proxy, bool) {
 	sourceIDs := make([]string, 0, record.sourceCount)
 	for i := uint32(0); i < uint32(record.sourceCount); i++ {
 		ref := snapshot.sourceRefs[record.sourceOffset+i]
-		key, name := snapshot.sourceKeys[ref], snapshot.sources[ref]
+		sourceKey, name := snapshot.sourceKeys[ref], snapshot.sources[ref]
 		if strings.TrimSpace(name) != "" && !strings.EqualFold(name, "Unknown") {
 			sourceNames = append(sourceNames, name)
 		}
-		if !strings.HasPrefix(key, "legacy-name:") {
-			sourceIDs = append(sourceIDs, key)
+		if !strings.HasPrefix(sourceKey, "legacy-name:") {
+			sourceIDs = append(sourceIDs, sourceKey)
 		}
 	}
 	sort.Strings(sourceNames)
@@ -165,22 +231,41 @@ func (c *CandidateCatalog) FindByKey(key string) (Proxy, bool) {
 	return px, true
 }
 
-// RemoveKeys explicitly removes candidate inventory entries. It rebuilds and
-// persists a fresh snapshot before publishing it, so a failed write leaves
-// the live catalog unchanged and the same request can be retried. A
-// subsequent successful source refresh may legitimately rediscover the same
-// address. A concurrent source refresh (begin) may replace the snapshot
-// while the disk write is in flight; in that case the operation retries
-// against the newer snapshot rather than silently dropping the removal.
+const candidateRemovalMaxAttempts = 4
+
+// RemoveKeys explicitly removes candidate inventory entries. It persists each
+// proposed snapshot before publishing it, then commits only while the source
+// pointer and revision still match the image that was copied. Concurrent source
+// replacement or health outcomes therefore force a bounded rebuild/retry rather
+// than being overwritten by stale status data.
 func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string, persistErr error) {
 	if len(keys) == 0 {
 		return nil, nil, nil
 	}
+	c.removalMu.Lock()
+	defer c.removalMu.Unlock()
+
 	wanted := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		wanted[key] = struct{}{}
 	}
-	for attempt := 0; attempt < 4; attempt++ {
+	c.publicationMu.Lock()
+	if c.removing == nil {
+		c.removing = make(map[string]struct{}, len(wanted))
+	}
+	for key := range wanted {
+		c.removing[key] = struct{}{}
+	}
+	c.publicationMu.Unlock()
+	defer func() {
+		c.publicationMu.Lock()
+		for key := range wanted {
+			delete(c.removing, key)
+		}
+		c.publicationMu.Unlock()
+	}()
+
+	for attempt := 0; attempt < candidateRemovalMaxAttempts; attempt++ {
 		current := c.snapshot.Load()
 		if current == nil {
 			return nil, keys, nil
@@ -198,8 +283,9 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 		}
 		next := builder.snapshot
 		builder.finalizeCredentialAlternates()
+		baseRevision := current.revision
 		next.generation = current.generation
-		next.revision = current.revision + 1
+		next.revision = baseRevision + 1
 		next.phase = current.phase
 		next.sourceErrors = current.sourceErrors
 		next.seenAt = current.seenAt
@@ -207,6 +293,7 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 		next.completedAt = current.completedAt
 		rebuildCandidateSourceFacets(next)
 		current.mu.RUnlock()
+
 		removed = nil
 		notFound = nil
 		for _, key := range keys {
@@ -219,19 +306,65 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 		if len(removed) == 0 {
 			return nil, notFound, nil
 		}
-		// Persist the next snapshot before publishing it. On failure, leave
-		// the live catalog unchanged so the caller can retry.
-		if persistErr = c.persistCompletedSnapshot(next); persistErr != nil {
+
+		if c.removeBeforeCommit != nil {
+			c.removeBeforeCommit()
+		}
+
+		// Reject an already-stale proposal before touching disk. The short lock
+		// only validates the base token; persistence below holds neither catalog
+		// publication nor live-snapshot locks.
+		c.publicationMu.Lock()
+		current.mu.Lock()
+		consistent := c.snapshot.Load() == current && current.revision == baseRevision
+		current.mu.Unlock()
+		c.publicationMu.Unlock()
+		if !consistent {
+			continue
+		}
+
+		// Persist the detached immutable image without taking its snapshot lock.
+		// Map an in-progress phase only in the cache image; publication below keeps
+		// "checking" so the live refresh lifecycle remains accurate.
+		cachePhase := next.phase
+		if cachePhase == "checking" {
+			if next.sourceErrors > 0 {
+				next.phase = "partial"
+			} else {
+				next.phase = "complete"
+			}
+		}
+		persistErr = c.persistImmutableSnapshot(next, false)
+		next.phase = cachePhase
+		if c.removeAfterPersist != nil {
+			c.removeAfterPersist()
+		}
+		if persistErr != nil {
+			if restoreErr := c.restoreLiveSnapshot(); restoreErr != nil {
+				return nil, nil, fmt.Errorf("persist candidate removal: %w; restore live snapshot: %v", persistErr, restoreErr)
+			}
 			return nil, nil, persistErr
 		}
-		// Publish only if the live snapshot has not been replaced by a
-		// concurrent source refresh. If it has, retry against the newer
-		// snapshot so the removal is not silently lost.
-		if c.snapshot.CompareAndSwap(current, next) {
+
+		// Publish only if the exact base pointer/revision is still live. A conflict
+		// means the deletion written above was never committed, so restore a current
+		// live image before rebuilding and retrying.
+		c.publicationMu.Lock()
+		current.mu.Lock()
+		consistent = c.snapshot.Load() == current && current.revision == baseRevision
+		if consistent {
+			consistent = c.snapshot.CompareAndSwap(current, next)
+		}
+		current.mu.Unlock()
+		c.publicationMu.Unlock()
+		if consistent {
 			return removed, notFound, nil
 		}
+		if restoreErr := c.restoreLiveSnapshot(); restoreErr != nil {
+			return nil, nil, fmt.Errorf("candidate removal lost publication guard; restore live snapshot: %w", restoreErr)
+		}
 	}
-	return nil, nil, fmt.Errorf("candidate removal could not commit after retries: concurrent refresh contention")
+	return nil, nil, fmt.Errorf("candidate removal could not commit after retries: concurrent catalog contention")
 }
 
 // ResetHealthOutcomes invalidates criterion-dependent candidate annotations
@@ -241,6 +374,8 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 // operator changes the URL. Live pool membership is still overlaid at read
 // time, and later checks repopulate these annotations under the new standard.
 func (c *CandidateCatalog) ResetHealthOutcomes() int {
+	c.publicationMu.RLock()
+	defer c.publicationMu.RUnlock()
 	snapshot := c.snapshot.Load()
 	if snapshot == nil {
 		return 0
@@ -273,8 +408,13 @@ func (c *CandidateCatalog) ResetHealthOutcomes() int {
 // process-local (startup resets criterion-dependent cache annotations), so a
 // five-minute recheck does not recompress the entire large catalog on disk.
 func (c *CandidateCatalog) ApplyHealthOutcomes(checked []Proxy, reachable, policyFiltered map[string]bool) int {
+	if len(checked) == 0 {
+		return 0
+	}
+	c.publicationMu.RLock()
+	defer c.publicationMu.RUnlock()
 	snapshot := c.snapshot.Load()
-	if snapshot == nil || len(checked) == 0 {
+	if snapshot == nil {
 		return 0
 	}
 	checkedAt := time.Now().Unix()
@@ -429,7 +569,9 @@ func (c *CandidateCatalog) begin(candidates []Proxy, sourceLabels map[string]str
 	snapshot.sourceErrors = sourceErrors
 	snapshot.seenAt = now
 	snapshot.refreshAttempt = now
+	c.publicationMu.Lock()
 	c.snapshot.Store(snapshot)
+	c.publicationMu.Unlock()
 	return refresh
 }
 
@@ -755,6 +897,36 @@ func copyCredentialAlternates(source *candidateSnapshot, record candidateRecord)
 	return append([]ProxyCredential(nil), source.credentialAlternateTable[start:end]...)
 }
 
+func mergeCredentialAlternates(primary []ProxyCredential, primaryRecord candidateRecord, fallback *candidateSnapshot, fallbackRecord candidateRecord) []ProxyCredential {
+	seen := make(map[ProxyCredential]bool, len(primary)+1+int(fallbackRecord.credentialAlternateCount))
+	seen[ProxyCredential{Username: primaryRecord.username, Password: primaryRecord.password}] = true
+	merged := make([]ProxyCredential, 0, min(maxAlternatesPerCandidate, len(primary)+1+int(fallbackRecord.credentialAlternateCount)))
+	appendCredential := func(credential ProxyCredential) {
+		if seen[credential] || len(merged) >= maxAlternatesPerCandidate {
+			return
+		}
+		seen[credential] = true
+		merged = append(merged, credential)
+	}
+	for _, credential := range primary {
+		appendCredential(credential)
+	}
+	appendCredential(ProxyCredential{Username: fallbackRecord.username, Password: fallbackRecord.password})
+	for _, credential := range copyCredentialAlternates(fallback, fallbackRecord) {
+		appendCredential(credential)
+	}
+	return merged
+}
+
+func credentialAlternatesHaveAuth(alternates []ProxyCredential) bool {
+	for _, credential := range alternates {
+		if credential.Username != "" || credential.Password != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *candidateSnapshotBuilder) finalizeCredentialAlternates() {
 	var table []ProxyCredential
 	for i := range b.snapshot.records {
@@ -852,6 +1024,11 @@ func (b *candidateSnapshotBuilder) appendFilteredRecord(source *candidateSnapsho
 
 func (b *candidateSnapshotBuilder) appendMergedRecord(metadata *candidateSnapshot, record candidateRecord, aSnapshot *candidateSnapshot, a candidateRecord, retainedFromA map[string]bool, bSnapshot *candidateSnapshot, other candidateRecord) {
 	alts := copyCredentialAlternates(bSnapshot, other)
+	if recordHasSourceIn(aSnapshot, a, retainedFromA) {
+		alts = mergeCredentialAlternates(alts, record, aSnapshot, a)
+		record.hasAuth = record.hasAuth || a.hasAuth
+	}
+	record.hasAuth = record.hasAuth || record.username != "" || record.password != "" || credentialAlternatesHaveAuth(alts)
 	protocol := metadata.protocols[record.protocolID]
 	country := metadata.countries[record.countryID]
 	city := metadata.cities[record.cityID]
