@@ -151,7 +151,12 @@ function renderGroups(groups) {
   container.innerHTML = html;
 }
 
-function protoBadge(p) { return '<span class="proto proto-' + escapeHtml(p) + '">' + escapeHtml(p) + '</span>'; }
+function protoBadge(p) {
+  var protocol = String(p || '').toLowerCase();
+  var label = protocol === 'https' ? 'https（HTTP CONNECT）' : protocol;
+  var title = protocol === 'https' ? '来源协议标签为 https；连接代理本身使用 http://' : '';
+  return '<span class="proto proto-' + escapeHtml(protocol) + '"' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '>' + escapeHtml(label) + '</span>';
+}
 
 function anonBadge(a) {
   var label = {elite:'高匿', anonymous:'普通', transparent:'透明'}[a] || '未知';
@@ -508,7 +513,7 @@ function renderCandidateProtocolCards() {
   var cards = [
     {value:'socks5', label:'SOCKS5', note:'可进入本地转发池'},
     {value:'http', label:'HTTP', note:'可进入本地转发池'},
-    {value:'https', label:'HTTPS', note:'HTTP CONNECT 来源标签'},
+    {value:'https', label:'HTTP CONNECT', note:'来源标签 https · 复制为可连接的 http://'},
     {value:'proxyip', label:'ProxyIP', note:'Cloudflare 资源 · 仅 443 / 纯 IP'}
   ];
   container.innerHTML = cards.map(function(card) {

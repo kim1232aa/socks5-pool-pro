@@ -58,6 +58,18 @@ func TestDashboardCandidateCountsUpdateActiveSummary(t *testing.T) {
 	}
 }
 
+func TestDashboardExplainsHTTPSConnectWithoutChangingConsumerURL(t *testing.T) {
+	for _, want := range []string{
+		`protocol === 'https' ? 'https（HTTP CONNECT）'`,
+		`连接代理本身使用 http://`,
+		`<option value="https">https（HTTP CONNECT）</option>`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing HTTPS CONNECT explanation %q", want)
+		}
+	}
+}
+
 func TestDashboardCandidateSummaryCardsDriveServerFilters(t *testing.T) {
 	for _, want := range []string{
 		`data-action="choose-candidate-summary" data-summary="total"`,

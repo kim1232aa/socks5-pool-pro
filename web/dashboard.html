@@ -96,7 +96,7 @@
     <button id="f-country-button" type="button" class="country-picker-trigger" data-action="open-node-country-picker" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">🗺️ 全部实测出口国家</button>
     <input id="f-country" type="hidden" value="">
     <label class="sr-only" for="f-proto">按协议筛选</label>
-    <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option>https</option></select>
+    <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option value="https">https（HTTP CONNECT）</option></select>
     <label class="sr-only" for="f-sort">节点排序方式</label>
     <select id="f-sort" onchange="onFilterChange()">
       <option value="score">按评分↓</option>
@@ -174,7 +174,7 @@
     <label class="sr-only" for="cf-source">按来源筛选候选</label>
     <select id="cf-source" onchange="onCandidateFilterChange()"><option value="">全部来源</option></select>
     <label class="sr-only" for="cf-proto">按协议筛选候选</label>
-    <select id="cf-proto" onchange="onCandidateFilterChange()"><option value="">全部协议</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https</option><option value="proxyip">proxyip（不参与转发）</option></select>
+    <select id="cf-proto" onchange="onCandidateFilterChange()"><option value="">全部协议</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https（HTTP CONNECT）</option><option value="proxyip">proxyip（不参与转发）</option></select>
     <label class="sr-only" for="cf-status">按检测状态筛选候选</label>
     <select id="cf-status" onchange="onCandidateFilterChange()">
       <option value="">全部状态</option>
