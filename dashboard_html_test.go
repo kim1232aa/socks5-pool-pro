@@ -435,4 +435,3 @@ func TestDashboardSelectionControlsAndColumnsContract(t *testing.T) {
 		}
 	}
 }
-
