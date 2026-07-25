@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -196,6 +197,7 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 			builder.appendRecord(current, record, nil)
 		}
 		next := builder.snapshot
+		builder.finalizeCredentialAlternates()
 		next.generation = current.generation
 		next.revision = current.revision + 1
 		next.phase = current.phase
@@ -467,6 +469,7 @@ func buildCandidateSnapshot(candidates []Proxy, sourceLabels map[string]string) 
 	protocolIDs := make(map[string]uint16)
 	countryIDs := map[string]uint32{"": 0}
 	cityIDs := map[string]uint32{"": 0}
+	perRecordAlts := make([][]ProxyCredential, 0, len(candidates))
 
 	internSource := func(key, label string) uint32 {
 		if key == "" {
@@ -576,18 +579,39 @@ func buildCandidateSnapshot(candidates []Proxy, sourceLabels map[string]string) 
 		}
 		snapshot.protocolTotals[protocolID]++
 		snapshot.records = append(snapshot.records, record)
+		perRecordAlts = append(perRecordAlts, px.CredentialAlternates)
 	}
 
 	// Main's dedupe output is already Key-sorted, but keeping the catalog's
 	// invariant here makes direct tests and future callers safe too.
-	sort.SliceStable(snapshot.records, func(i, j int) bool {
-		a, b := snapshot.records[i], snapshot.records[j]
-		ap, bp := snapshot.protocols[a.protocolID], snapshot.protocols[b.protocolID]
+	type candidateWithAlts struct {
+		record candidateRecord
+		alts   []ProxyCredential
+	}
+	items := make([]candidateWithAlts, len(snapshot.records))
+	for i := range snapshot.records {
+		items[i] = candidateWithAlts{record: snapshot.records[i], alts: perRecordAlts[i]}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		ap, bp := snapshot.protocols[items[i].record.protocolID], snapshot.protocols[items[j].record.protocolID]
 		if ap != bp {
 			return ap < bp
 		}
-		return a.addr < b.addr
+		return items[i].record.addr < items[j].record.addr
 	})
+	var credentialAlternates []ProxyCredential
+	for i := range items {
+		alts := items[i].alts
+		if len(alts) > maxAlternatesPerCandidate {
+			log.Printf("[candidate-cache] truncating %d credential alternates for %s://%s to %d", len(alts), snapshot.protocols[items[i].record.protocolID], items[i].record.addr, maxAlternatesPerCandidate)
+			alts = alts[:maxAlternatesPerCandidate]
+		}
+		items[i].record.credentialAlternateOffset = uint32(len(credentialAlternates))
+		items[i].record.credentialAlternateCount = uint8(len(alts))
+		credentialAlternates = append(credentialAlternates, alts...)
+		snapshot.records[i] = items[i].record
+	}
+	snapshot.credentialAlternateTable = credentialAlternates
 	rebuildCandidateSourceFacets(snapshot)
 	return snapshot
 }
@@ -650,11 +674,12 @@ func rebuildCandidateSourceFacets(snapshot *candidateSnapshot) {
 }
 
 type candidateSnapshotBuilder struct {
-	snapshot    *candidateSnapshot
-	sourceIDs   map[string]uint32
-	protocolIDs map[string]uint16
-	countryIDs  map[string]uint32
-	cityIDs     map[string]uint32
+	snapshot      *candidateSnapshot
+	sourceIDs     map[string]uint32
+	protocolIDs   map[string]uint16
+	countryIDs    map[string]uint32
+	cityIDs       map[string]uint32
+	perRecordAlts [][]ProxyCredential
 }
 
 func newCandidateSnapshotBuilder(capacity int) *candidateSnapshotBuilder {
@@ -718,10 +743,37 @@ func (b *candidateSnapshotBuilder) internCity(value string) uint32 {
 	return id
 }
 
+func copyCredentialAlternates(source *candidateSnapshot, record candidateRecord) []ProxyCredential {
+	if record.credentialAlternateCount == 0 {
+		return nil
+	}
+	start := record.credentialAlternateOffset
+	end := start + uint32(record.credentialAlternateCount)
+	if end > uint32(len(source.credentialAlternateTable)) {
+		return nil
+	}
+	return append([]ProxyCredential(nil), source.credentialAlternateTable[start:end]...)
+}
+
+func (b *candidateSnapshotBuilder) finalizeCredentialAlternates() {
+	var table []ProxyCredential
+	for i := range b.snapshot.records {
+		alts := b.perRecordAlts[i]
+		if len(alts) > maxAlternatesPerCandidate {
+			alts = alts[:maxAlternatesPerCandidate]
+		}
+		b.snapshot.records[i].credentialAlternateOffset = uint32(len(table))
+		b.snapshot.records[i].credentialAlternateCount = uint8(len(alts))
+		table = append(table, alts...)
+	}
+	b.snapshot.credentialAlternateTable = table
+}
+
 func (b *candidateSnapshotBuilder) appendRecord(source *candidateSnapshot, record candidateRecord, sourceNames []string) {
 	protocol := source.protocols[record.protocolID]
 	country := source.countries[record.countryID]
 	city := source.cities[record.cityID]
+	alts := copyCredentialAlternates(source, record)
 	originalSourceOffset, originalSourceCount := record.sourceOffset, record.sourceCount
 	record.protocolID = b.internProtocol(protocol)
 	record.countryID = b.internCountry(country)
@@ -752,6 +804,7 @@ func (b *candidateSnapshotBuilder) appendRecord(source *candidateSnapshot, recor
 	}
 	b.snapshot.protocolTotals[record.protocolID]++
 	b.snapshot.records = append(b.snapshot.records, record)
+	b.perRecordAlts = append(b.perRecordAlts, alts)
 }
 
 func recordHasSourceIn(snapshot *candidateSnapshot, record candidateRecord, allowed map[string]bool) bool {
@@ -770,6 +823,7 @@ func (b *candidateSnapshotBuilder) appendFilteredRecord(source *candidateSnapsho
 	if !recordHasSourceIn(source, record, allowed) {
 		return false
 	}
+	alts := copyCredentialAlternates(source, record)
 	originalOffset, originalCount := record.sourceOffset, record.sourceCount
 	protocol := source.protocols[record.protocolID]
 	country := source.countries[record.countryID]
@@ -792,10 +846,12 @@ func (b *candidateSnapshotBuilder) appendFilteredRecord(source *candidateSnapsho
 	}
 	b.snapshot.protocolTotals[record.protocolID]++
 	b.snapshot.records = append(b.snapshot.records, record)
+	b.perRecordAlts = append(b.perRecordAlts, alts)
 	return true
 }
 
 func (b *candidateSnapshotBuilder) appendMergedRecord(metadata *candidateSnapshot, record candidateRecord, aSnapshot *candidateSnapshot, a candidateRecord, retainedFromA map[string]bool, bSnapshot *candidateSnapshot, other candidateRecord) {
+	alts := copyCredentialAlternates(bSnapshot, other)
 	protocol := metadata.protocols[record.protocolID]
 	country := metadata.countries[record.countryID]
 	city := metadata.cities[record.cityID]
@@ -852,6 +908,7 @@ func (b *candidateSnapshotBuilder) appendMergedRecord(metadata *candidateSnapsho
 	}
 	b.snapshot.protocolTotals[record.protocolID]++
 	b.snapshot.records = append(b.snapshot.records, record)
+	b.perRecordAlts = append(b.perRecordAlts, alts)
 }
 
 func compareCandidateRecords(aSnapshot *candidateSnapshot, a candidateRecord, bSnapshot *candidateSnapshot, b candidateRecord) int {
@@ -942,6 +999,7 @@ func mergeCandidateSnapshots(previous, current *candidateSnapshot, failedSources
 		}
 	}
 	merged := builder.snapshot
+	builder.finalizeCredentialAlternates()
 	merged.seenAt = current.seenAt
 	merged.refreshAttempt = current.refreshAttempt
 	merged.completedAt = previous.completedAt

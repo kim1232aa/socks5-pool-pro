@@ -18,7 +18,7 @@ import (
 const (
 	candidateCacheFilename                  = "candidate_catalog.v1.bin.gz"
 	candidateCacheMagic                     = "SPCAND01"
-	candidateCacheVersion            uint16 = 2
+	candidateCacheVersion            uint16 = 3
 	maxCandidateCacheCompressedBytes        = 96 << 20
 	maxCandidateCacheDecodedBytes           = 256 << 20
 	maxCandidateCacheStringBytes            = 96 << 20
@@ -29,6 +29,7 @@ const (
 	maxCandidateCacheProtocols              = 64
 	maxCandidateCacheCountries              = 1_024
 	maxCandidateCacheCities                 = 600_000
+	maxCandidateCacheCredentialAlts         = 1_200_000 * maxAlternatesPerCandidate
 )
 
 type candidateCatalogCache struct {
@@ -106,6 +107,9 @@ func (cache *candidateCatalogCache) load() (*candidateSnapshot, error) {
 	info, err := os.Lstat(cache.path)
 	if err != nil {
 		return nil, err
+	}
+	if info.Mode().Perm() != 0o600 {
+		_ = os.Chmod(cache.path, 0o600)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("candidate cache is not a regular file")
@@ -331,6 +335,24 @@ func (e *candidateCacheEncoder) encode(snapshot *candidateSnapshot) error {
 		if err := e.int64(record.checkedUnix); err != nil {
 			return err
 		}
+		if err := e.uint32(record.credentialAlternateOffset); err != nil {
+			return err
+		}
+		if err := e.uint8(record.credentialAlternateCount); err != nil {
+			return err
+		}
+	}
+	table := snapshot.credentialAlternateTable
+	if err := e.uint32(uint32(len(table))); err != nil {
+		return err
+	}
+	for _, cred := range table {
+		if err := e.string(cred.Username, maxCandidateCacheStringLength); err != nil {
+			return err
+		}
+		if err := e.string(cred.Password, maxCandidateCacheStringLength); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -417,7 +439,7 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version != candidateCacheVersion {
+	if version != 1 && version != 2 && version != 3 {
 		return nil, fmt.Errorf("unsupported candidate cache version %d", version)
 	}
 	flags, err := d.uint16()
@@ -521,6 +543,33 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 		}
 		if record.checkedUnix, err = d.int64(); err != nil {
 			return nil, err
+		}
+		if version >= 3 {
+			if record.credentialAlternateOffset, err = d.uint32(); err != nil {
+				return nil, err
+			}
+			if record.credentialAlternateCount, err = d.uint8(); err != nil {
+				return nil, err
+			}
+		} else {
+			record.credentialAlternateOffset = 0
+			record.credentialAlternateCount = 0
+		}
+	}
+	if version >= 3 {
+		altCount, err := d.count(maxCandidateCacheCredentialAlts, "credential alternates")
+		if err != nil {
+			return nil, err
+		}
+		snapshot.credentialAlternateTable = make([]ProxyCredential, altCount)
+		for i := range snapshot.credentialAlternateTable {
+			cred := &snapshot.credentialAlternateTable[i]
+			if cred.Username, err = d.string(maxCandidateCacheStringLength); err != nil {
+				return nil, err
+			}
+			if cred.Password, err = d.string(maxCandidateCacheStringLength); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return snapshot, nil
@@ -693,7 +742,7 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 		if len(record.username) > maxCandidateCacheStringLength || len(record.password) > maxCandidateCacheStringLength {
 			return fmt.Errorf("invalid credential length at record %d", i)
 		}
-		if record.hasAuth != (record.username != "" || record.password != "") {
+		if record.hasAuth != (record.username != "" || record.password != "" || record.credentialAlternateCount > 0) {
 			return fmt.Errorf("authentication flag does not match credentials at record %d", i)
 		}
 		host, port, err := net.SplitHostPort(record.addr)

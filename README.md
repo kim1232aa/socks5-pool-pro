@@ -25,7 +25,7 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 
 | 层次 | 包含内容 | 是否可路由 | 持久化 |
 |---|---|---:|---:|
-| 候选目录 | 来源声明的全部去重记录，以及待检、失败、策略排除等状态 | 否 | `candidate_catalog.v1.bin.gz` |
+| 候选目录 | 来源声明的全部去重记录，以及待检、失败、策略排除等状态 | 否 | `candidate_catalog.v1.bin.gz (现在采用内部 v3 格式以支持多个备用凭据)` |
 | 已知转发池 | 曾成功通过检查的 SOCKS5/HTTP/HTTPS 节点；失败节点保留为不可用 | 是，优先当前健康节点 | `pool_cache.json`（gzip） |
 | ProxyIP 资源 | Cloudflare Worker/VLESS/Trojan 类工具使用的外部反代地址 | 否 | 候选目录 |
 

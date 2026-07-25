@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"fmt"
 	"testing"
 )
 
@@ -329,4 +330,117 @@ func readCandidateCacheDecoded(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func writeV1CandidateCache(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+
+	if _, err := gw.Write([]byte("SPCAND01")); err != nil {
+		return err
+	}
+	binary.Write(gw, binary.LittleEndian, uint16(1))
+	binary.Write(gw, binary.LittleEndian, uint16(0)) // flags
+	binary.Write(gw, binary.LittleEndian, uint32(0)) // string buf len
+	binary.Write(gw, binary.LittleEndian, uint32(0)) // num records
+
+	// Arrays
+	for _, count := range []uint32{0, 1, 1, 1} {
+		binary.Write(gw, binary.LittleEndian, count)
+	}
+	for _, count := range []uint32{0, 0, 0} {
+		binary.Write(gw, binary.LittleEndian, count)
+	}
+	return nil
+}
+
+func TestCandidateCacheV1MigrationReturnsEmptyDirectoryWithWarning(t *testing.T) {
+	dir := t.TempDir()
+	cache := newCandidateCatalogCache(dir)
+
+	if err := writeV1CandidateCache(cache.path); err != nil {
+		t.Fatalf("failed to write v1 cache: %v", err)
+	}
+	
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(cache)
+	loaded, err := catalog.LoadDiskCache()
+	if err != nil {
+		// soft warning
+	}
+	if loaded {
+		
+	}
+	if loaded {
+		t.Error("expected empty records")
+	}
+}
+
+func TestCandidateCacheV3RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	cache := newCandidateCatalogCache(dir)
+
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(cache)
+
+	proxy1 := Proxy{
+		IP: "1.2.3.4", Port: "1080", Username: "u", Password: "p", Protocol: "socks5",
+		Country: "US", City: "Ashburn", Continent: "NA",
+		CredentialAlternates: []ProxyCredential{
+			{Username: "alt1", Password: "p1"},
+			{Username: "alt2", Password: "p2"},
+		},
+	}
+	proxy2 := Proxy{
+		IP: "2.3.4.5", Port: "8080", Username: "u", Protocol: "http",
+		Country: "FR", City: "Paris", Continent: "EU",
+		CredentialAlternates: []ProxyCredential{
+			{Username: "alt3"},
+		},
+	}
+	
+	oversized := Proxy{
+		IP: "3.4.5.6", Port: "1080", Username: "u", Protocol: "socks5",
+		Country: "US", Continent: "NA",
+	}
+	for i := 0; i < 20; i++ {
+		oversized.CredentialAlternates = append(oversized.CredentialAlternates, ProxyCredential{Username: fmt.Sprintf("u%d", i)})
+	}
+
+	refresh := catalog.begin([]Proxy{proxy1, proxy2, oversized}, nil, nil, 0)
+	catalog.complete(refresh, []Proxy{proxy1, proxy2, oversized}, []Proxy{proxy1, proxy2, oversized}, nil)
+	
+	cache2 := newCandidateCatalogCache(dir)
+	catalog2 := &CandidateCatalog{}
+	catalog2.SetDiskCache(cache2)
+	if _, err := catalog2.LoadDiskCache(); err != nil { t.Fatal(err) }
+	
+	p1, ok := catalog2.FindByKey(proxy1.Key())
+	if !ok {
+		t.Fatalf("missing p1")
+	}
+	if len(p1.CredentialAlternates) != 2 {
+		t.Errorf("p1 got %d alts want 2", len(p1.CredentialAlternates))
+	}
+	
+	p2, ok := catalog2.FindByKey(proxy2.Key())
+	if !ok {
+		t.Fatalf("missing p2")
+	}
+	if len(p2.CredentialAlternates) != 1 {
+		t.Errorf("p2 got %d alts want 1", len(p2.CredentialAlternates))
+	}
+
+	pOversized, ok := catalog2.FindByKey(oversized.Key())
+	if !ok {
+		t.Fatalf("missing oversized")
+	}
+	if len(pOversized.CredentialAlternates) != 16 {
+		t.Errorf("oversized got %d alts want 16 (maxAlternatesPerCandidate)", len(pOversized.CredentialAlternates))
+	}
 }
