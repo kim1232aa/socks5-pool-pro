@@ -779,28 +779,48 @@ func parseTarget(buf []byte) (string, error) {
 
 // relay copies data bidirectionally between two connections.
 func relay(left, right net.Conn) {
+	// A full close is deferred as the ultimate fail-safe.
 	defer left.Close()
 	defer right.Close()
 
-	done := make(chan struct{}, 2)
+	type copyResult struct {
+		err error
+	}
+	done := make(chan copyResult, 2)
+
 	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
+		_, err := io.Copy(dst, src)
+		// Try a half-close on clean completion or read EOF (which io.Copy yields as err == nil).
+		// This permits a client request body to finish (half-closing up) while the server response
+		// stream continues downloading, standard HTTP behavior.
 		if writer, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = writer.CloseWrite()
 		}
 		if reader, ok := src.(interface{ CloseRead() error }); ok {
 			_ = reader.CloseRead()
 		}
-		done <- struct{}{}
+		done <- copyResult{err: err}
 	}
 
 	go cp(left, right)
 	go cp(right, left)
-	// Wait for BOTH directions to finish before closing either connection -
-	// waiting for only one (the previous behavior) meant whichever
-	// direction happened to finish first (e.g. a client that half-closes
-	// after sending its request) triggered an immediate full close of both
-	// connections, truncating the other direction's still-in-flight data.
-	<-done
+
+	// Wait for the first direction to finish.
+	first := <-done
+
+	// Identify anomalous errors (not EOF, and not the secondary net.ErrClosed triggered when
+	// we force-close below). A reset/timeout/malformed payload requires a hard abort - waiting
+	// for the other direction's Read to eventually unblock leaks the goroutine.
+	isAnomalous := first.err != nil && !errors.Is(first.err, net.ErrClosed)
+
+	if isAnomalous {
+		// One direction died abnormally. Don't wait for the other direction to figure it out
+		// on its own; actively break its block with a full close of both underlying sockets.
+		_ = left.Close()
+		_ = right.Close()
+	}
+
+	// Wait for the surviving worker to notice the half-close (if normal) or the full-close
+	// (if anomalous) and exit. We must join both goroutines before we return and drop the slots.
 	<-done
 }

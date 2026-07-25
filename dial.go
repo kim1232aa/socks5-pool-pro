@@ -300,11 +300,11 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 		authReq = append(authReq, byte(len(px.Password)))
 		authReq = append(authReq, []byte(px.Password)...)
 		if _, writeErr := conn.Write(authReq); writeErr != nil {
-			return nil, newUpstreamError(UpstreamErrorAuth, "write SOCKS5 authentication", upstreamHandshakeError(ctx, writeErr))
+			return nil, newUpstreamError(UpstreamErrorProtocol, "write SOCKS5 authentication", upstreamHandshakeError(ctx, writeErr))
 		}
 		authResp := make([]byte, 2)
 		if _, readErr := io.ReadFull(conn, authResp); readErr != nil {
-			return nil, newUpstreamError(UpstreamErrorAuth, "read SOCKS5 authentication", upstreamHandshakeError(ctx, readErr))
+			return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 authentication", upstreamHandshakeError(ctx, readErr))
 		}
 		if authResp[0] != socks5AuthVersion {
 			return nil, newUpstreamError(UpstreamErrorProtocol, "read SOCKS5 authentication", fmt.Errorf("unexpected authentication version %d", authResp[0]))
@@ -433,9 +433,15 @@ func dialHTTPConnectContext(ctx context.Context, px Proxy, target string) (resul
 	if readErr != nil {
 		return nil, newUpstreamError(UpstreamErrorProtocol, "read HTTP CONNECT response", upstreamHandshakeError(ctx, readErr))
 	}
-	_ = resp.Body.Close()
 	// RFC 9110 defines any 2xx response as a successful CONNECT tunnel.
+	// On success, do NOT close resp.Body - it may drain buffered tunnel bytes
+	// from the bufio.Reader. The tunnel payload starts immediately after the
+	// response headers; Content-Length and Transfer-Encoding are meaningless
+	// for a 2xx CONNECT response and must be ignored.
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		// Non-2xx: drain and close the response body so the connection can be
+		// reused by the credential retry loop.
+		_ = resp.Body.Close()
 		kind := UpstreamErrorTarget
 		if resp.StatusCode == http.StatusProxyAuthRequired {
 			kind = UpstreamErrorAuth
