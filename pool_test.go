@@ -46,7 +46,8 @@ func TestProxyPoolKeyIndexTracksLifecycleAndProtocolVariants(t *testing.T) {
 		t.Fatalf("new node missing after Update: found=%v proxy=%+v", ok, got)
 	}
 
-	if removed := p.ClearUnavailable(); removed != 2 {
+	removed, _ := p.ClearUnavailable()
+	if removed != 2 {
 		t.Fatalf("ClearUnavailable removed %d nodes, want SOCKS variant and dead node", removed)
 	}
 	assertProxyIndexInvariant(t, p)
@@ -827,7 +828,8 @@ func TestClearUnavailablePrunesOrphanStatsAndCursors(t *testing.T) {
 	}
 	p.groupState["nil"] = nil
 
-	if removed := p.ClearUnavailable(); removed != 1 {
+	removed, _ := p.ClearUnavailable()
+	if removed != 1 {
 		t.Fatalf("removed=%d, want 1", removed)
 	}
 	if p.Size() != 1 {
@@ -981,4 +983,83 @@ func TestOptimisticPickCommitRejectsChangedEligibilityAndMembership(t *testing.T
 		t.Fatal("node that left COUNTRY:JP remained committable")
 	}
 	p.mu.Unlock()
+}
+
+func TestClearUnavailableReportsNonDurableCacheFailure(t *testing.T) {
+	dir := t.TempDir()
+	p := NewProxyPool()
+	p.cache = newPoolCache(dir) // set cache directly for testing
+
+	validProxy := Proxy{Protocol: "socks5", IP: "127.0.0.1", Port: "1080", Available: true}
+	p.Update([]Proxy{validProxy}, nil)
+	p.Update(nil, map[string]bool{"socks5://127.0.0.1:1080": true})
+	_ = p.FlushCache()
+
+	if p.Size() != 1 {
+		t.Fatalf("size=%d, want 1", p.Size())
+	}
+
+	p.cache.path = "" + ""
+
+	removed, err := p.ClearUnavailable()
+	if err == nil {
+		t.Fatal("expected error from ClearUnavailable when cache fails")
+	}
+	if removed != 0 {
+		t.Fatalf("expected 0 removed, got %d", removed)
+	}
+
+	if p.Size() != 1 {
+		t.Fatalf("memory changed despite persistence failure: size=%d", p.Size())
+	}
+
+	p.cache.path = dir + "/cache.json.gz"
+
+	removed, err = p.ClearUnavailable()
+	if err != nil {
+		t.Fatalf("unexpected error after fixing cache: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("expected 1 removed, got %d", removed)
+	}
+
+	if p.Size() != 0 {
+		t.Fatalf("memory unchanged after successful clear: size=%d", p.Size())
+	}
+}
+
+func TestRemoveKeysConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	p := NewProxyPool()
+	p.cache = newPoolCache(dir)
+
+	proxies := []Proxy{
+		{Protocol: "socks5", IP: "127.0.0.9", Port: "1080", Available: true},
+		{Protocol: "socks5", IP: "127.0.0.10", Port: "1080", Available: true},
+	}
+	p.Update(proxies, nil)
+
+	start := make(chan struct{})
+	done := make(chan struct{}, 3)
+
+	go func() {
+		<-start
+		_, _, _ = p.RemoveKeys([]string{proxies[0].Key()})
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		_, _ = p.ClearUnavailable()
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		_ = p.FlushCache()
+		done <- struct{}{}
+	}()
+
+	close(start)
+	<-done
+	<-done
+	<-done
 }

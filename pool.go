@@ -797,18 +797,20 @@ func (p *ProxyPool) flushScheduledPersistence(token uint64) {
 
 // FlushCache synchronously persists a detached snapshot. Normal state changes
 // use the debounced writer above; this hook cancels its pending timer and is
-// useful at explicit durability boundaries and in tests.
-func (p *ProxyPool) FlushCache() {
+// useful at explicit durability boundaries and in tests. The error is only
+// surfaced to callers that explicitly request durability (manual operations,
+// criterion changes); background callers log it and continue.
+func (p *ProxyPool) FlushCache() error {
 	p.mu.Lock()
 	p.cancelScheduledPersistenceLocked()
 	cache := p.cache
 	if cache == nil {
 		p.mu.Unlock()
-		return
+		return nil
 	}
 	generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
 	p.mu.Unlock()
-	_ = cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
+	return cache.saveWithHealthState(generation, forwarding, proxyip, stats, healthCheckURL, healthPolicy, healthRecheckPending)
 }
 
 // statsSnapshot / restoreStats support persisting scores across restarts.
@@ -1085,9 +1087,12 @@ func mergeFreshProxy(existing, fresh Proxy) Proxy {
 
 // ClearUnavailable permanently removes nodes currently marked
 // Available=false from the pool - an explicit, user-triggered purge (e.g.
-// a dashboard button), never automatic. Returns the number removed.
-func (p *ProxyPool) ClearUnavailable() int {
+// a dashboard button), never automatic. The detached result is persisted
+// before publication, so a failed write leaves live routing state
+// unchanged and the operation is retryable. Returns the number removed.
+func (p *ProxyPool) ClearUnavailable() (int, error) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	kept := make([]Proxy, 0, len(p.proxies))
 	removed := 0
 	for _, px := range p.proxies {
@@ -1097,64 +1102,81 @@ func (p *ProxyPool) ClearUnavailable() int {
 			removed++
 		}
 	}
-	p.proxies = kept
-	p.rebuildProxyIndexLocked()
-	p.routingRevision++
+	if removed == 0 {
+		return 0, nil
+	}
 
+	// Build the next in-memory state without mutating the live state yet.
 	// Stats are keyed by Proxy.Key(), so delete both the nodes removed by this
 	// operation and any older orphan entries left by a protocol reclassification.
 	liveKeys := make(map[string]bool, len(kept))
 	for _, px := range kept {
 		liveKeys[px.Key()] = true
 	}
-	for key := range p.stats {
-		if !liveKeys[key] {
-			delete(p.stats, key)
-		}
-	}
-	p.statsRevision++
-
-	// Drop node references that no longer exist. A removed manual pin must not
-	// leave the group permanently pinned to nowhere; cursors with no remaining
-	// anchor are discarded so the next Pick starts cleanly.
-	for name, cursor := range p.groupState {
-		if cursor == nil {
-			delete(p.groupState, name)
+	nextStats := make(map[string]*nodeStats, len(p.stats))
+	for key, value := range p.stats {
+		if !liveKeys[key] || value == nil {
 			continue
 		}
-		orphaned := false
-		if cursor.stickyKey != "" && !liveKeys[cursor.stickyKey] {
-			cursor.stickyKey = ""
-			cursor.pinned = false
-			orphaned = true
+		copy := *value
+		nextStats[key] = &copy
+	}
+	nextGroupState := cleanedGroupState(p.groupState, liveKeys)
+
+	// Persist the detached next snapshot first. On failure, leave the live
+	// pool untouched so the caller can retry without data loss.
+	generation := p.cacheGeneration + 1
+	if p.cache != nil {
+		snapshotStats := make(map[string]nodeStats, len(nextStats))
+		for key, value := range nextStats {
+			snapshotStats[key] = *value
 		}
-		if cursor.lastPicked != "" && !liveKeys[cursor.lastPicked] {
-			cursor.lastPicked = ""
-			orphaned = true
-		}
-		if orphaned && cursor.stickyKey == "" && cursor.lastPicked == "" {
-			delete(p.groupState, name)
+		if err := p.cache.saveWithHealthState(generation, cloneProxySlice(kept), cloneProxySlice(p.proxyIPNodes), snapshotStats, p.healthCheckURL, p.healthPolicyFingerprint, p.healthRecheckPending); err != nil {
+			log.Printf("[cache] clear unavailable persistence failed: %v", err)
+			return 0, err
 		}
 	}
 
-	cache := p.cache
-	p.cacheGeneration++
+	// Publish the durable result into live memory.
+	p.proxies = kept
+	p.rebuildProxyIndexLocked()
+	p.stats = nextStats
+	p.groupState = nextGroupState
+	p.routingRevision++
+	p.statsRevision++
+	p.cacheGeneration = generation
 	p.cancelScheduledPersistenceLocked()
-	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
-	p.mu.Unlock()
-	if cache != nil {
-		_ = cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
-	}
 	log.Printf("[pool] cleared %d unavailable node(s), %d remaining", removed, len(kept))
-	return removed
+	return removed, nil
+}
+
+func cleanedGroupState(current map[string]*groupCursor, liveKeys map[string]bool) map[string]*groupCursor {
+	cleaned := make(map[string]*groupCursor, len(current))
+	for name, cursor := range current {
+		if cursor == nil {
+			continue
+		}
+		next := *cursor
+		if next.stickyKey != "" && !liveKeys[next.stickyKey] {
+			next.stickyKey = ""
+			next.pinned = false
+		}
+		if next.lastPicked != "" && !liveKeys[next.lastPicked] {
+			next.lastPicked = ""
+		}
+		if next.stickyKey != "" || next.lastPicked != "" {
+			cleaned[name] = &next
+		}
+	}
+	return cleaned
 }
 
 // RemoveKeys explicitly removes forwarding nodes by protocol-aware key. It is
 // the inventory-management counterpart to ClearUnavailable: a deliberate
-// operator action, not an automatic health outcome. The resulting snapshot is
-// synchronously persisted so a restart cannot revive an acknowledged removal.
-// Each requested key is reported as removed or not_found so partial hits are
-// unambiguous.
+// operator action, not an automatic health outcome. The detached result is
+// synchronously persisted before publication, so a failed write leaves live
+// memory unchanged and the operation is retryable. Each requested key is
+// reported as removed or not_found so partial hits are unambiguous.
 func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persistErr error) {
 	if len(keys) == 0 {
 		return nil, nil, nil
@@ -1164,6 +1186,7 @@ func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persi
 		wanted[key] = struct{}{}
 	}
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	kept := make([]Proxy, 0, len(p.proxies))
 	found := make(map[string]bool, len(keys))
 	for _, px := range p.proxies {
@@ -1171,7 +1194,6 @@ func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persi
 		if _, remove := wanted[key]; remove {
 			found[key] = true
 			removed = append(removed, key)
-			delete(p.stats, key)
 			continue
 		}
 		kept = append(kept, px)
@@ -1182,48 +1204,47 @@ func (p *ProxyPool) RemoveKeys(keys []string) (removed, notFound []string, persi
 		}
 	}
 	if len(removed) == 0 {
-		p.mu.Unlock()
 		return nil, notFound, nil
 	}
-	p.proxies = kept
-	p.rebuildProxyIndexLocked()
-	p.routingRevision++
-	p.statsRevision++
+
+	// Build the next in-memory state without mutating the live state yet.
 	liveKeys := make(map[string]bool, len(kept))
 	for _, px := range kept {
 		liveKeys[px.Key()] = true
 	}
-	for name, cursor := range p.groupState {
-		if cursor == nil {
-			delete(p.groupState, name)
+	nextStats := make(map[string]*nodeStats, len(p.stats))
+	for key, value := range p.stats {
+		if _, deleted := wanted[key]; deleted || value == nil {
 			continue
 		}
-		orphaned := false
-		if cursor.stickyKey != "" && !liveKeys[cursor.stickyKey] {
-			cursor.stickyKey = ""
-			cursor.pinned = false
-			orphaned = true
+		copy := *value
+		nextStats[key] = &copy
+	}
+	nextGroupState := cleanedGroupState(p.groupState, liveKeys)
+
+	// Persist the detached next snapshot first. On failure, leave the live
+	// pool untouched so the caller can retry without data loss.
+	generation := p.cacheGeneration + 1
+	if p.cache != nil {
+		snapshotStats := make(map[string]nodeStats, len(nextStats))
+		for key, value := range nextStats {
+			snapshotStats[key] = *value
 		}
-		if cursor.lastPicked != "" && !liveKeys[cursor.lastPicked] {
-			cursor.lastPicked = ""
-			orphaned = true
-		}
-		if orphaned && cursor.stickyKey == "" && cursor.lastPicked == "" {
-			delete(p.groupState, name)
+		if persistErr = p.cache.saveWithHealthState(generation, cloneProxySlice(kept), cloneProxySlice(p.proxyIPNodes), snapshotStats, p.healthCheckURL, p.healthPolicyFingerprint, p.healthRecheckPending); persistErr != nil {
+			log.Printf("[cache] node removal persistence failed: %v", persistErr)
+			return nil, nil, persistErr
 		}
 	}
-	cache := p.cache
-	p.cacheGeneration++
+
+	// Publish the durable result into live memory.
+	p.proxies = kept
+	p.rebuildProxyIndexLocked()
+	p.stats = nextStats
+	p.groupState = nextGroupState
+	p.routingRevision++
+	p.statsRevision++
+	p.cacheGeneration = generation
 	p.cancelScheduledPersistenceLocked()
-	generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending := p.cacheSnapshotLocked()
-	p.mu.Unlock()
-	if cache != nil {
-		persistErr = cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
-	}
-	if persistErr != nil {
-		log.Printf("[cache] node removal persistence failed: %v", persistErr)
-		return removed, notFound, persistErr
-	}
 	return removed, notFound, nil
 }
 

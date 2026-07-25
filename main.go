@@ -163,7 +163,9 @@ func main() {
 		cacheCriterionChanged = true
 	}
 	if cacheCriterionChanged {
-		pool.FlushCache()
+		if err := pool.FlushCache(); err != nil {
+			log.Printf("[cache] startup flush failed: %v", err)
+		}
 		if _, queued := coordinator.triggerFullRecheck(pool); !queued {
 			log.Printf("[main] full recheck already pending or active; not re-queued")
 		}
@@ -287,7 +289,9 @@ func main() {
 				if baselineChanged && pool.SetRequireIPChangePolicy(true) {
 					pool.InvalidateHealth(store.CheckURL())
 					pool.candidates.ResetHealthOutcomes()
-					pool.FlushCache()
+					if err := pool.FlushCache(); err != nil {
+						log.Printf("[cache] baseline change flush failed: %v", err)
+					}
 					_, _ = coordinator.triggerFullRecheck(pool)
 					full = true
 					select {
@@ -357,7 +361,9 @@ func main() {
 	if err := server.Shutdown(shutdownContext); err != nil {
 		log.Printf("[server] shutdown: %v", err)
 	}
-	pool.FlushCache()
+	if err := pool.FlushCache(); err != nil {
+		log.Printf("[cache] shutdown flush failed: %v", err)
+	}
 	if exitErr != nil {
 		log.Fatalf("[main] stopped after listener failure: %v", exitErr)
 	}
@@ -384,7 +390,9 @@ func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinat
 	if completed {
 		completed = pool.CompleteHealthRecheck(generation)
 		if completed {
-			pool.FlushCache()
+			if err := pool.FlushCache(); err != nil {
+				log.Printf("[cache] health recheck flush failed: %v", err)
+			}
 		}
 	}
 	coordinator.finishHealthRecheckOperation(operation.ID, completed)
@@ -612,7 +620,9 @@ func refreshPool(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *
 	// Persist the new pool membership immediately rather than relying on the
 	// 500ms debounce timer. A process kill between refresh completion and the
 	// debounced write would otherwise lose the freshly discovered nodes.
-	pool.FlushCache()
+	if err := pool.FlushCache(); err != nil {
+		log.Printf("[cache] pool refresh flush failed: %v", err)
+	}
 	log.Printf("[main] pool refreshed: %d fresh alive / %d checked against %s; %d known total (from %d sources, %d errors, %d raw, %d protocol-aware candidates, %d non-routable resources)",
 		len(alive), len(candidates), safeSourceURL(testURL), pool.Size(), len(sources), sourceErrors, rawCount, candidateTotal, resourceCount)
 	status := "complete"
@@ -685,7 +695,9 @@ func refreshSource(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator
 		return refreshRunResult{Status: "skipped", Error: "health criterion changed during refresh"}
 	}
 	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
-	pool.FlushCache()
+	if err := pool.FlushCache(); err != nil {
+		log.Printf("[cache] source refresh flush failed: %v", err)
+	}
 	return refreshRunResult{Status: "complete"}
 }
 

@@ -62,22 +62,26 @@ type candidateRecord struct {
 	hasAuth      bool
 	seenUnix     int64
 	checkedUnix  int64
+
+	credentialAlternateOffset uint32
+	credentialAlternateCount  uint8
 }
 
 type candidateSnapshot struct {
 	mu sync.RWMutex
 
-	records           []candidateRecord
-	sourceRefs        []uint32
-	sourceKeys        []string // stable Source.ID (or a legacy synthetic key)
-	sources           []string // display names parallel to sourceKeys
-	protocols         []string
-	countries         []string // index 0 is always unknown
-	cities            []string // index 0 is always empty
-	sourceTotals      []int
-	sourceFacetValues []string
-	sourceFacetTotals []int
-	protocolTotals    []int
+	records                  []candidateRecord
+	credentialAlternateTable []ProxyCredential
+	sourceRefs               []uint32
+	sourceKeys               []string // stable Source.ID (or a legacy synthetic key)
+	sources                  []string // display names parallel to sourceKeys
+	protocols                []string
+	countries                []string // index 0 is always unknown
+	cities                   []string // index 0 is always empty
+	sourceTotals             []int
+	sourceFacetValues        []string
+	sourceFacetTotals        []int
+	protocolTotals           []int
 
 	generation     uint64
 	revision       uint64 // changes when complete mutates phase/check outcomes in-place
@@ -150,13 +154,23 @@ func (c *CandidateCatalog) FindByKey(key string) (Proxy, bool) {
 	if len(sourceNames) > 0 {
 		px.SourceName = sourceNames[0]
 	}
+	if record.credentialAlternateCount > 0 {
+		start := record.credentialAlternateOffset
+		end := start + uint32(record.credentialAlternateCount)
+		if end <= uint32(len(snapshot.credentialAlternateTable)) {
+			px.CredentialAlternates = append([]ProxyCredential(nil), snapshot.credentialAlternateTable[start:end]...)
+		}
+	}
 	return px, true
 }
 
-// RemoveKeys explicitly removes candidate inventory entries. It rebuilds a
-// fresh snapshot and persists it before returning, so a later disk-cache load
-// cannot resurrect a removed candidate. A subsequent successful source refresh
-// may legitimately rediscover the same address.
+// RemoveKeys explicitly removes candidate inventory entries. It rebuilds and
+// persists a fresh snapshot before publishing it, so a failed write leaves
+// the live catalog unchanged and the same request can be retried. A
+// subsequent successful source refresh may legitimately rediscover the same
+// address. A concurrent source refresh (begin) may replace the snapshot
+// while the disk write is in flight; in that case the operation retries
+// against the newer snapshot rather than silently dropping the removal.
 func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string, persistErr error) {
 	if len(keys) == 0 {
 		return nil, nil, nil
@@ -165,51 +179,57 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 	for _, key := range keys {
 		wanted[key] = struct{}{}
 	}
-	current := c.snapshot.Load()
-	if current == nil {
-		return nil, keys, nil
-	}
-	current.mu.RLock()
-	builder := newCandidateSnapshotBuilder(len(current.records))
-	found := make(map[string]bool, len(keys))
-	for _, record := range current.records {
-		key := current.protocols[record.protocolID] + "://" + record.addr
-		if _, remove := wanted[key]; remove {
-			found[key] = true
-			continue
+	for attempt := 0; attempt < 4; attempt++ {
+		current := c.snapshot.Load()
+		if current == nil {
+			return nil, keys, nil
 		}
-		builder.appendRecord(current, record, nil)
-	}
-	next := builder.snapshot
-	next.generation = current.generation
-	next.revision = current.revision + 1
-	next.phase = current.phase
-	next.sourceErrors = current.sourceErrors
-	next.seenAt = current.seenAt
-	next.refreshAttempt = current.refreshAttempt
-	next.completedAt = current.completedAt
-	rebuildCandidateSourceFacets(next)
-	for _, key := range keys {
-		if found[key] {
-			removed = append(removed, key)
-		} else {
-			notFound = append(notFound, key)
+		current.mu.RLock()
+		builder := newCandidateSnapshotBuilder(len(current.records))
+		found := make(map[string]bool, len(keys))
+		for _, record := range current.records {
+			key := current.protocols[record.protocolID] + "://" + record.addr
+			if _, remove := wanted[key]; remove {
+				found[key] = true
+				continue
+			}
+			builder.appendRecord(current, record, nil)
+		}
+		next := builder.snapshot
+		next.generation = current.generation
+		next.revision = current.revision + 1
+		next.phase = current.phase
+		next.sourceErrors = current.sourceErrors
+		next.seenAt = current.seenAt
+		next.refreshAttempt = current.refreshAttempt
+		next.completedAt = current.completedAt
+		rebuildCandidateSourceFacets(next)
+		current.mu.RUnlock()
+		removed = nil
+		notFound = nil
+		for _, key := range keys {
+			if found[key] {
+				removed = append(removed, key)
+			} else {
+				notFound = append(notFound, key)
+			}
+		}
+		if len(removed) == 0 {
+			return nil, notFound, nil
+		}
+		// Persist the next snapshot before publishing it. On failure, leave
+		// the live catalog unchanged so the caller can retry.
+		if persistErr = c.persistCompletedSnapshot(next); persistErr != nil {
+			return nil, nil, persistErr
+		}
+		// Publish only if the live snapshot has not been replaced by a
+		// concurrent source refresh. If it has, retry against the newer
+		// snapshot so the removal is not silently lost.
+		if c.snapshot.CompareAndSwap(current, next) {
+			return removed, notFound, nil
 		}
 	}
-	if len(removed) == 0 {
-		current.mu.RUnlock()
-		return nil, notFound, nil
-	}
-	// Holding the old snapshot's read lock through the CAS prevents complete
-	// from mutating its revision/status after we copied it but before install.
-	// A source refresh may replace the pointer independently; retry against it.
-	if !c.snapshot.CompareAndSwap(current, next) {
-		current.mu.RUnlock()
-		return c.RemoveKeys(keys)
-	}
-	current.mu.RUnlock()
-	persistErr = c.persistCompletedSnapshot(next)
-	return removed, notFound, persistErr
+	return nil, nil, fmt.Errorf("candidate removal could not commit after retries: concurrent refresh contention")
 }
 
 // ResetHealthOutcomes invalidates criterion-dependent candidate annotations

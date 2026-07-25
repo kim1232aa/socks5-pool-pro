@@ -7,7 +7,10 @@ import (
 	"strconv"
 )
 
-const maxCredentialAlternates = 8
+const (
+	maxCredentialAlternates   = 8
+	maxAlternatesPerCandidate = 16
+)
 
 type ProxyCredential struct {
 	Username string `json:"username,omitempty"`

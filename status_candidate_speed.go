@@ -134,7 +134,10 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 		return item
 	}
 	s.coordinator.sourceLifecycleMu.Unlock()
-	s.pool.FlushCache()
+	if err := s.pool.FlushCache(); err != nil {
+		item.Error = candidateSpeedtestError("candidate_speedtest_not_durable", fmt.Sprintf("测速结果未持久化: %v", err))
+		return item
+	}
 
 	item.OK = true
 	item.Kbps = result.Kbps

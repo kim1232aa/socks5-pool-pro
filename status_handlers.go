@@ -503,7 +503,11 @@ func (s *StatusServer) handleNodesClearUnavailable(w http.ResponseWriter, r *htt
 		writeErrCode(w, http.StatusConflict, "health_recheck_in_progress", fmt.Errorf("健康标准全量复检尚未完成，暂不能永久清理不可用节点"))
 		return
 	}
-	n := s.pool.ClearUnavailable()
+	n, err := s.pool.ClearUnavailable()
+	if err != nil {
+		writeErrCode(w, http.StatusInternalServerError, "clear_unavailable_not_durable", fmt.Errorf("unavailable nodes were not cleared because cache persistence failed: %w", err))
+		return
+	}
 	writeJSON(w, map[string]int{"removed": n})
 }
 
@@ -608,7 +612,10 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	labelMatchKnown, labelMatched := manualNodeLabelMatch(country, prevCountry)
 	// Manual verification is an explicit operator action, so make the health
 	// state durable before replying instead of leaving it in the debounce window.
-	s.pool.FlushCache()
+	if err := s.pool.FlushCache(); err != nil {
+		writeErrCode(w, http.StatusInternalServerError, "node_verify_not_durable", fmt.Errorf("verification result was not persisted: %w", err))
+		return
+	}
 
 	writeJSON(w, map[string]interface{}{
 		"reachable":            reachable,
@@ -664,7 +671,10 @@ func (s *StatusServer) handleNodeSpeedtest(w http.ResponseWriter, r *http.Reques
 	completed = true
 	// Speed test results are explicit user actions, so persist them before
 	// replying rather than leaving them in the normal debounce window.
-	s.pool.FlushCache()
+	if err := s.pool.FlushCache(); err != nil {
+		writeErrCode(w, http.StatusInternalServerError, "node_speedtest_not_durable", fmt.Errorf("speed test result was not persisted: %w", err))
+		return
+	}
 	writeJSON(w, map[string]interface{}{
 		"kbps": result.Kbps, "bytes": result.Bytes, "duration_ms": result.DurationMs,
 	})
