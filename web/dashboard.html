@@ -309,6 +309,8 @@
 
   <div class="default-group-editor">
     <label for="default-group-select">默认(兜底)分组:</label>
+    {{$defaultGroup := .DefaultGroup}}
+    <select id="default-group-select">{{range .GroupOptions}}<option value="{{.}}" {{if eq . $defaultGroup}}selected{{end}}>{{.}}</option>{{end}}</select>
     <button type="button" class="btn-sm" data-action="save-default-group">保存</button>
   </div>
 </div>
@@ -320,7 +322,7 @@
   <table class="management-table">
   <caption class="sr-only">代理分组管理</caption>
   <tr><th>名称</th><th>类型</th><th>策略</th><th>过滤条件</th><th>成员数/当前</th><th>操作</th></tr>
-  {{range .Groups}}
+  {{range .StatusSummary.Groups}}
   {{if .ID}}
   <tr>
     <td data-label="分组名称">{{.Name}}</td>
@@ -332,6 +334,7 @@
       </select>
     </td>
     <td data-label="过滤条件" class="small">{{if .Nodes}}指定节点: {{range .Nodes}}{{.}} {{end}}<br>{{end}}{{if .Countries}}国家: {{range .Countries}}{{.}} {{end}}<br>{{end}}{{if .Protocols}}协议: {{range .Protocols}}{{.}} {{end}}<br>{{end}}{{if .Sources}}来源: {{range .Sources}}{{.}} {{end}}{{end}}</td>
+    <td data-label="成员数 / 当前" class="small"><strong>{{.Count}}</strong> 个{{if .Current}}<br><span class="mono">{{.Current}}</span>{{else}}<br>无可用节点{{end}}</td>
     <td data-label="操作"><button type="button" class="btn-sm danger" data-action="delete-group" data-group-id="{{.ID}}" data-group-name="{{.Name}}">删除</button></td>
   </tr>
   {{end}}

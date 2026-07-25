@@ -435,3 +435,18 @@ func TestDashboardSelectionControlsAndColumnsContract(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardManagementPagesMatchBackendDataContracts(t *testing.T) {
+	for _, want := range []string{
+		`<select id="default-group-select">`,
+		`{{range .StatusSummary.Groups}}`,
+		`data-label="成员数 / 当前"`,
+		`fetchJSON('/api/nodes/page?page=1&page_size=100&available=1')`,
+		`requestListenerNodeKeys()`,
+		`Promise.all([fetchJSON('/api/listeners'), requestListenerGroups(), requestListenerNodeKeys()])`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard management page contract is missing %q", want)
+		}
+	}
+}

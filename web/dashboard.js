@@ -2201,6 +2201,23 @@ function updateListenerNodeKeys() {
   list.innerHTML = nodes.map(function(node) { return '<option value="' + escapeHtml(node.key || '') + '">' + escapeHtml(node.proxy_url || node.addr || node.key || '') + '</option>'; }).join('');
 }
 
+function requestListenerNodeKeys() {
+  if (nodePageData && Array.isArray(nodePageData.nodes)) {
+    updateListenerNodeKeys();
+    return Promise.resolve();
+  }
+  return fetchJSON('/api/nodes/page?page=1&page_size=100&available=1')
+    .then(function(pageData) {
+      if (!nodePageData) nodePageData = pageData && typeof pageData === 'object' ? pageData : {};
+      if (!Array.isArray(nodePageData.nodes)) nodePageData.nodes = [];
+      updateListenerNodeKeys();
+    })
+    .catch(function(err) {
+      updateListenerNodeKeys();
+      notify('固定节点建议加载失败，仍可手工填写节点 key：' + String(err), 'error', 7000);
+    });
+}
+
 function syncListenerMode() {
   var form = document.getElementById('form-listener');
   if (!form) return;
@@ -2218,7 +2235,7 @@ function syncListenerMode() {
 function requestListeners(force) {
   if (listenerRequest && !force) return listenerRequest;
   setListNotice('listener-notice', 'loading', '正在读取监听端口…');
-  listenerRequest = Promise.all([fetchJSON('/api/listeners'), requestListenerGroups()])
+  listenerRequest = Promise.all([fetchJSON('/api/listeners'), requestListenerGroups(), requestListenerNodeKeys()])
     .then(function(result) { renderListeners(result[0] && result[0].listeners); updateListenerNodeKeys(); setListNotice('listener-notice', '', ''); })
     .catch(function(err) { setListNotice('listener-notice', 'error', '无法读取监听端口：' + String(err)); })
     .finally(function() { listenerRequest = null; });
