@@ -172,6 +172,66 @@ func TestCandidateCatalogRemoveKeysRetriesAfterConcurrentHealthOutcome(t *testin
 	persisted.mu.RUnlock()
 }
 
+// TestCandidateCatalogBeginDoesNotResurrectConcurrentRemoval guards against a
+// blind Store in begin(): a scrape cycle merges against a snapshot it read
+// before locking, so a concurrent RemoveKeys (which shares no lock with
+// begin) can delete a candidate and publish that deletion while the merge is
+// still in flight. If begin() then published unconditionally, the deletion
+// would be silently undone in memory and, on the following complete(), on
+// disk too - specifically via the failed-source carry-forward path, which is
+// the only way a previous-only record survives into a freshly built snapshot.
+func TestCandidateCatalogBeginDoesNotResurrectConcurrentRemoval(t *testing.T) {
+	dir := t.TempDir()
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(newCandidateCatalogCache(dir))
+	remove := Proxy{IP: "8.8.8.82", Port: "1080", Protocol: "socks5", SourceName: "flaky"}
+	keep := Proxy{IP: "8.8.4.52", Port: "8080", Protocol: "http", SourceName: "feed"}
+	refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
+	catalog.complete(refresh, nil, nil, nil)
+
+	hookCalls := 0
+	catalog.beginBeforePublish = func() {
+		if hookCalls != 0 {
+			return
+		}
+		hookCalls++
+		removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
+		if err != nil || len(removed) != 1 || len(notFound) != 0 {
+			t.Fatalf("concurrent RemoveKeys result removed=%v notFound=%v err=%v", removed, notFound, err)
+		}
+	}
+	// "flaky" fails to fetch this cycle, so `remove` is absent from the fresh
+	// candidate list and only survives via the failed-source carry-forward in
+	// mergeCandidateSnapshots - the exact path that must not resurrect a
+	// deletion that landed after this cycle read its base snapshot.
+	failedSources := map[string]bool{legacySourceKey("flaky"): true}
+	refresh2 := catalog.begin([]Proxy{keep}, nil, failedSources, 1)
+	if hookCalls != 1 {
+		t.Fatalf("begin-before-publish hook calls = %d, want 1", hookCalls)
+	}
+	if _, ok := catalog.FindByKey(remove.Key()); ok {
+		t.Fatal("begin() resurrected a candidate deleted by a concurrent RemoveKeys")
+	}
+
+	catalog.complete(refresh2, []Proxy{keep}, []Proxy{keep}, nil)
+	if _, ok := catalog.FindByKey(remove.Key()); ok {
+		t.Fatal("complete() after the race resurrected the deleted candidate")
+	}
+
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(dir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("LoadDiskCache = %v, %v", loaded, err)
+	}
+	if _, ok := restored.FindByKey(remove.Key()); ok {
+		t.Fatal("begin() resurrection was persisted to disk")
+	}
+	if _, ok := restored.FindByKey(keep.Key()); !ok {
+		t.Fatal("unrelated candidate was lost across the retried begin()")
+	}
+}
+
 func TestCandidateCatalogRemoveKeysDoesNotHoldPublicationLocksDuringPersistence(t *testing.T) {
 	dir := t.TempDir()
 	catalog := &CandidateCatalog{}

@@ -111,6 +111,7 @@ type CandidateCatalog struct {
 	persistLocked      func()
 	removeBeforeCommit func()
 	removeAfterPersist func()
+	beginBeforePublish func()
 }
 
 type candidatePromotionLease struct {
@@ -546,33 +547,48 @@ func knownCandidateStatus(known candidateKnownIndex, protocol, addr string) (Can
 func (c *CandidateCatalog) begin(candidates []Proxy, sourceLabels map[string]string, failedSources map[string]bool, sourceErrors int) candidateRefresh {
 	refresh := candidateRefresh{generation: c.nextGeneration.Add(1)}
 	now := time.Now()
-	snapshot := buildCandidateSnapshot(candidates, sourceLabels)
-	for i := range snapshot.records {
-		snapshot.records[i].seenUnix = now.Unix()
-	}
-	// A partial scrape is merged with the previous inventory by source:
-	// attribution from failed feeds remains visible, while successful feeds
-	// are replaced by exactly what they advertised this cycle. This preserves
-	// failures without turning removed entries from healthy feeds immortal.
-	if previous := c.snapshot.Load(); previous != nil && len(previous.records) > 0 {
-		previous.mu.RLock()
-		if len(failedSources) > 0 {
-			snapshot = mergeCandidateSnapshots(previous, snapshot, failedSources)
-		} else {
-			carryCandidateHistory(previous, snapshot)
+
+	// Retry against the current base instead of a blind Store: RemoveKeys can
+	// publish a deletion (it holds no lock in common with this scrape cycle)
+	// while the merge below is still running against an older snapshot. A
+	// blind Store would silently resurrect what was just deleted, both in
+	// memory and in the persisted image the end of this cycle writes to disk.
+	for {
+		previous := c.snapshot.Load()
+		snapshot := buildCandidateSnapshot(candidates, sourceLabels)
+		for i := range snapshot.records {
+			snapshot.records[i].seenUnix = now.Unix()
 		}
-		previous.mu.RUnlock()
+		// A partial scrape is merged with the previous inventory by source:
+		// attribution from failed feeds remains visible, while successful feeds
+		// are replaced by exactly what they advertised this cycle. This preserves
+		// failures without turning removed entries from healthy feeds immortal.
+		if previous != nil && len(previous.records) > 0 {
+			previous.mu.RLock()
+			if len(failedSources) > 0 {
+				snapshot = mergeCandidateSnapshots(previous, snapshot, failedSources)
+			} else {
+				carryCandidateHistory(previous, snapshot)
+			}
+			previous.mu.RUnlock()
+		}
+		snapshot.generation = refresh.generation
+		snapshot.revision = 1
+		snapshot.phase = "checking"
+		snapshot.sourceErrors = sourceErrors
+		snapshot.seenAt = now
+		snapshot.refreshAttempt = now
+
+		if c.beginBeforePublish != nil {
+			c.beginBeforePublish()
+		}
+		c.publicationMu.Lock()
+		published := c.snapshot.CompareAndSwap(previous, snapshot)
+		c.publicationMu.Unlock()
+		if published {
+			return refresh
+		}
 	}
-	snapshot.generation = refresh.generation
-	snapshot.revision = 1
-	snapshot.phase = "checking"
-	snapshot.sourceErrors = sourceErrors
-	snapshot.seenAt = now
-	snapshot.refreshAttempt = now
-	c.publicationMu.Lock()
-	c.snapshot.Store(snapshot)
-	c.publicationMu.Unlock()
-	return refresh
 }
 
 // carryCandidateHistory keeps inventory/source metadata authoritative to a
