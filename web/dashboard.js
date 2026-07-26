@@ -193,7 +193,7 @@ function speedCell(n) {
   var speed = Number(n.speed_kbps || 0);
   var speedText = (isFinite(speed) ? Math.round(speed) : 0) + ' kbps';
   var title = '最近测速：' + testedText + '；样本：' + bytesText + '；耗时：' + durationText;
-  return '<span title="' + escapeHtml(title) + '">' + speedText + '</span><span class="speed-meta">' + escapeHtml(testedText) + '<br>' + bytesText + ' / ' + durationText + '</span>';
+  return '<span title="' + escapeHtml(title) + '">' + speedText + '</span>';
 }
 
 function addressHost(addr) {
@@ -1152,13 +1152,13 @@ function applyCandidateView() {
     var emptyMessage = data.phase === 'loading' || data.phase === 'checking'
       ? '候选快照正在生成，完成后会自动显示。'
       : '完整候选快照尚未生成，请确认已启用来源后刷新。';
-    tbody.innerHTML = '<tr><td colspan="10" class="empty">' + emptyMessage + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">' + emptyMessage + '</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有符合当前筛选条件的候选</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合当前筛选条件的候选</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
@@ -1178,9 +1178,7 @@ function applyCandidateView() {
       '<td data-label="状态">' + candidateStatusBadge(status) + '</td>' +
       '<td data-label="协议">' + protoBadge(candidate.protocol || '') + (candidate.has_auth ? '<span class="auth-badge" title="该上游候选使用下列用户名和密码">需认证</span>' : '') + '</td>' +
       '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.proxy_url || candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(String(candidate.proxy_url || candidate.addr || '')) + '" aria-label="复制候选代理URL">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
-      '<td data-label="用户名" class="mono mobile-secondary">' + escapeHtml(candidate.username || '') + '</td>' +
-      '<td data-label="密码" class="mono mobile-secondary">' + escapeHtml(candidate.password || '') + '</td>' +
-      '<td data-label="来源标注地区">' + escapeHtml(location) + '</td>' +
+      '<td data-label="来源标注地区" class="loc-cell" title="' + escapeHtml(location) + '">' + escapeHtml(location) + '</td>' +
       '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '</td>' +
       '<td data-label="测速结果" class="candidate-speed-cell mobile-secondary">' + candidateResultText(candidateKey) + '</td>' +
       '<td data-label="操作" class="candidate-action-cell"><div class="candidate-row-actions"><button type="button" class="btn-sm" data-action="candidate-speedtest" aria-label="测速候选 ' + escapeHtml(candidateKey) + '">测速</button>' + (String(candidate.protocol || '').toLowerCase() === 'proxyip' ? proxyIPVerifyCellHTML(candidate.key, candidate.protocol) : '') + '<button type="button" class="btn-sm danger" data-action="candidate-delete" aria-label="删除候选 ' + escapeHtml(candidateKey) + '">删除</button></div></td></tr>';
@@ -1443,7 +1441,7 @@ function applyNodeView() {
   }
 
   if (!poolTotal) {
-    tbody.innerHTML = '<tr><td colspan="16" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">池内暂无节点，等待下次抓取周期...</td></tr>';
     updateNodeSelectionUI(pageRows);
     renderNodePagers('');
     if (banner) banner.textContent = '无 (代理池为空)';
@@ -1451,7 +1449,7 @@ function applyNodeView() {
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="16" class="empty">没有匹配的节点</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">没有匹配的节点</td></tr>';
     updateNodeSelectionUI(pageRows);
     renderNodePagers('');
   } else {
@@ -1488,14 +1486,11 @@ function applyNodeView() {
 		'<td data-label="状态">' + (n.active ? '<span class="badge-inuse">使用中</span>' : (n.source_retired ? '<span class="badge-unavail">来源已停用</span>' : (n.health_invalidated ? '<span class="badge-unavail">检测失败，需人工验证恢复</span>' : (n.policy_excluded ? '<span class="badge-unavail">出口策略排除</span>' : (n.available === false ? '<span class="badge-unavail">暂不可用</span>' : '<span class="small">可用</span>'))))) + '</td>' +
         '<td data-label="协议">' + protoBadge(n.protocol) + '</td>' +
         '<td data-label="代理URL" class="mono">' + escapeHtml(n.proxy_url || n.addr) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(n.proxy_url || n.addr) + '" aria-label="复制完整代理URL">复制</button></td>' +
-        '<td data-label="用户名" class="mono mobile-secondary">' + escapeHtml(n.username || '') + '</td>' +
-        '<td data-label="密码" class="mono mobile-secondary">' + escapeHtml(n.password || '') + '</td>' +
         '<td data-label="出口IP" class="mobile-secondary">' + exitCell + '</td>' +
         '<td data-label="匿名" class="mobile-secondary">' + anonBadge(n.anonymity) + '</td>' +
-        '<td data-label="国家/城市">' + (loc || '<span class="small">-</span>') + '</td>' +
+        '<td data-label="国家/城市" class="loc-cell" title="' + escapeHtml(loc) + '">' + (loc || '<span class="small">-</span>') + '</td>' +
         '<td data-label="评分">' + scoreCell(n.score) + '</td>' +
-		'<td data-label="累计成功/失败" class="small mobile-secondary" title="仅统计真实转发请求结果；健康检查和测速不计入">' + sf + '</td>' +
-		'<td data-label="连续健康失败" class="small mobile-secondary">' + Math.max(0, Number(n.consecutive_failures || 0)) + (n.health_invalidated ? '（终态）' : '') + '</td>' +
+		'<td data-label="健康" class="small mobile-secondary" title="累计成功/失败仅统计真实转发请求结果，不含健康检查和测速">' + sf + (Number(n.consecutive_failures || 0) > 0 ? '<br>连续失败 ' + Math.max(0, Number(n.consecutive_failures || 0)) + (n.health_invalidated ? '（终态）' : '') : '') + '</td>' +
         '<td data-label="延迟">' + lat + '</td>' +
         '<td data-label="速度" class="speed-cell mobile-secondary">' + spd + '</td>' +
         '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(n.source || '') + '</td>' +

@@ -329,7 +329,7 @@ func TestDashboardProxyIPVerifyIsExplicitResourceOnlyAction(t *testing.T) {
 	}
 }
 
-func TestDashboardCandidateManagementKeepsTenColumnShape(t *testing.T) {
+func TestDashboardCandidateManagementKeepsEightColumnShape(t *testing.T) {
 	for _, want := range []string{
 		`id="candidate-select-page"`,
 		`<th>测速结果</th><th>操作</th>`,
@@ -343,8 +343,12 @@ func TestDashboardCandidateManagementKeepsTenColumnShape(t *testing.T) {
 			t.Fatalf("dashboard is missing candidate management contract %q", want)
 		}
 	}
-	if got := strings.Count(dashboardClientSource(), `colspan="10"`); got != 3 {
-		t.Fatalf("candidate ten-column empty-state colspan count = %d, want 3", got)
+	// 用户名/密码 were dropped as separate columns: proxy_url already embeds
+	// credentials when present (see TestDashboardShowsUpstreamCredentialsInURL),
+	// so the dedicated columns were pure duplication that inflated the table
+	// past its available width on ordinary desktop viewports.
+	if got := strings.Count(dashboardClientSource(), `colspan="8"`); got != 3 {
+		t.Fatalf("candidate eight-column empty-state colspan count = %d, want 3", got)
 	}
 }
 
@@ -418,18 +422,32 @@ func TestDashboardManualVerifyHandlesUnknownLabelMatch(t *testing.T) {
 	}
 }
 
-func TestDashboardShowsAndCopiesUpstreamCredentials(t *testing.T) {
+// TestDashboardShowsUpstreamCredentialsInURL guards the shape that replaced
+// dedicated 用户名/密码 columns: ConsumerURL/proxy_url already embeds
+// user:pass@host:port when credentials exist (see proxy.go urlWithScheme),
+// so a separate username/password column showed nothing a row without
+// credentials didn't already show blank, and duplicated what a row with
+// credentials already showed inline. Candidates additionally get an explicit
+// 需认证 badge instead of a blank/filled password column.
+func TestDashboardShowsUpstreamCredentialsInURL(t *testing.T) {
 	for _, want := range []string{
-		`<th>代理URL</th><th>用户名</th><th>密码</th>`,
 		`String(candidate.proxy_url || candidate.addr || '')`,
-		`escapeHtml(candidate.username || '')`,
-		`escapeHtml(candidate.password || '')`,
+		`candidate.has_auth ? '<span class="auth-badge"`,
 		`escapeHtml(n.proxy_url || n.addr)`,
-		`escapeHtml(n.username || '')`,
-		`escapeHtml(n.password || '')`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing upstream credential display contract %q", want)
+		}
+	}
+	for _, mustNotHave := range []string{
+		`<th>用户名</th><th>密码</th>`,
+		`escapeHtml(candidate.username || '')`,
+		`escapeHtml(candidate.password || '')`,
+		`escapeHtml(n.username || '')`,
+		`escapeHtml(n.password || '')`,
+	} {
+		if strings.Contains(dashboardClientSource(), mustNotHave) {
+			t.Fatalf("dashboard still has a redundant dedicated credential column %q (credentials already show via proxy_url)", mustNotHave)
 		}
 	}
 }
