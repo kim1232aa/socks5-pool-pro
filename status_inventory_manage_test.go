@@ -262,3 +262,49 @@ func equalInventoryKeys(a, b []string) bool {
 	}
 	return true
 }
+
+func TestNodeDeleteHandlerSyncsCandidateCatalogRemoval(t *testing.T) {
+	// A node present in both the pool and candidate catalog should be removed
+	// from both when the delete handler runs.
+	node := inventoryTestProxy("socks5", "8.8.8.90", "1080", true)
+	onlyCandidate := inventoryTestProxy("http", "8.8.4.90", "8080", false)
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{node}, nil)
+	refresh := pool.candidates.begin([]Proxy{node, onlyCandidate}, nil, nil, 0)
+	pool.candidates.complete(refresh, nil, nil, nil)
+	server := NewStatusServer(pool, &ConfigStore{})
+
+	// Verify both are in the candidate catalog before deletion.
+	if _, ok := pool.candidates.FindByKey(node.Key()); !ok {
+		t.Fatal("node missing from candidate catalog before delete")
+	}
+	if _, ok := pool.candidates.FindByKey(onlyCandidate.Key()); !ok {
+		t.Fatal("other candidate missing before delete")
+	}
+
+	recorder := httptest.NewRecorder()
+	body := `{"keys":["` + node.Key() + `"]}`
+	server.handleNodesDelete(recorder, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp inventoryDeleteResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !equalInventoryKeys(resp.Removed, []string{node.Key()}) || len(resp.NotFound) != 0 {
+		t.Fatalf("delete response=%#v", resp)
+	}
+
+	// The node should be gone from both pool and candidate catalog.
+	if pool.Size() != 0 {
+		t.Fatalf("node remains in pool after delete: %#v", pool.All())
+	}
+	if _, ok := pool.candidates.FindByKey(node.Key()); ok {
+		t.Fatal("node was not removed from candidate catalog after pool delete")
+	}
+	// The unrelated candidate must survive.
+	if _, ok := pool.candidates.FindByKey(onlyCandidate.Key()); !ok {
+		t.Fatal("unrelated candidate was removed from catalog")
+	}
+}

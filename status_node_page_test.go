@@ -101,6 +101,32 @@ func TestNodesPageFiltersSortsBoundsAndKeepsLegacyNodesArray(t *testing.T) {
 		t.Fatalf("available JP changed nodes = %#v, want no rows", available)
 	}
 
+	unavailable := getNodePage(t, handler, "/api/nodes/page?unavailable=1")
+	if got, want := nodeKeys(unavailable.Nodes), []string{nodes["https-jp-dead"].Key()}; !sameStrings(got, want) {
+		t.Fatalf("unavailable=1 nodes = %v, want %v", got, want)
+	}
+	if unavailable.FilteredTotal != 1 {
+		t.Fatalf("unavailable=1 total = %d, want 1", unavailable.FilteredTotal)
+	}
+
+	both := getNodePage(t, handler, "/api/nodes/page?available=1&unavailable=1&page_size=100")
+	if got, want := both.FilteredTotal, 4; got != want {
+		t.Fatalf("available=1&unavailable=1 total = %d, want %d (available takes priority)", got, want)
+	}
+	wantBoth := map[string]bool{
+		nodes["socks-us"].Key(): true, nodes["http-jp"].Key(): true,
+		nodes["http-de"].Key(): true, nodes["socks-us-2"].Key(): true,
+	}
+	for _, n := range both.Nodes {
+		if !wantBoth[n.Key] {
+			t.Fatalf("available=1&unavailable=1 returned unexpected key %q", n.Key)
+		}
+		delete(wantBoth, n.Key)
+	}
+	if len(wantBoth) != 0 {
+		t.Fatalf("available=1&unavailable=1 missing keys: %v", wantBoth)
+	}
+
 	search := getNodePage(t, handler, "/api/nodes/page?search=203.0.113.4")
 	if got, want := nodeKeys(search.Nodes), []string{nodes["http-de"].Key()}; !sameStrings(got, want) {
 		t.Fatalf("exit-IP search keys = %v, want %v", got, want)

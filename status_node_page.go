@@ -62,7 +62,7 @@ func nodePageLightLess(a, b nodePageLight, sortBy string) bool {
 // lightMatchesFilters is the pre-materialization filter. It mirrors the
 // historical NodeView filter predicates against the light entry so rows that
 // would be discarded never become full NodeViews.
-func lightMatchesFilters(e nodePageLight, searchAddr, searchExitIP, country, protocol string, unknownCountry, onlyChanged, ipChangedKnown, ipChanged, onlyAvailable bool, proto string) bool {
+func lightMatchesFilters(e nodePageLight, searchAddr, searchExitIP, country, protocol string, unknownCountry, onlyChanged, ipChangedKnown, ipChanged, onlyAvailable, onlyUnavailable bool, proto string) bool {
 	if searchAddr != "" || searchExitIP != "" {
 		addrField := ""
 		exitField := ""
@@ -88,6 +88,9 @@ func lightMatchesFilters(e nodePageLight, searchAddr, searchExitIP, country, pro
 		return false
 	}
 	if onlyAvailable && !e.available {
+		return false
+	}
+	if onlyUnavailable && e.available {
 		return false
 	}
 	return true
@@ -143,6 +146,7 @@ func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
 	protocol := strings.ToLower(strings.TrimSpace(query.Get("protocol")))
 	onlyChanged := nodeQueryEnabled(query.Get("only_changed"))
 	onlyAvailable := nodeQueryEnabled(query.Get("available")) || nodeQueryEnabled(query.Get("hide_unavailable"))
+	onlyUnavailable := !onlyAvailable && nodeQueryEnabled(query.Get("unavailable"))
 	sortBy := strings.ToLower(strings.TrimSpace(query.Get("sort")))
 	matches := func(px *Proxy, countryCode string, available bool) bool {
 		if search != "" && !strings.Contains(strings.ToLower(px.Addr()+" "+px.ExitIP), search) {
@@ -160,7 +164,13 @@ func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
 		if onlyChanged && !(px.IPChangeKnown && px.IPChanged) {
 			return false
 		}
-		return !onlyAvailable || available
+		if onlyAvailable && !available {
+			return false
+		}
+		if onlyUnavailable && available {
+			return false
+		}
+		return true
 	}
 	less := func(a, b nodePageLight) bool { return nodePageLightLess(a, b, sortBy) }
 

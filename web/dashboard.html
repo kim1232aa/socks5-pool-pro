@@ -56,9 +56,9 @@
 
   <section class="task-metrics" aria-label="转发代理池概览">
     <div class="task-metric"><span>池内总数</span><strong id="node-total">{{.Total}}</strong></div>
-    <div class="task-metric healthy"><span>健康可用</span><strong id="node-available">加载中</strong></div>
-    <div class="task-metric warning"><span>保留但不可用</span><strong id="node-unavailable">加载中</strong></div>
-    <div class="task-metric"><span>筛选匹配</span><strong id="node-matching">加载中</strong></div>
+    <button type="button" class="task-metric healthy" data-action="filter-node-availability" data-availability="available" aria-pressed="false"><span>健康可用</span><strong id="node-available">加载中</strong></button>
+    <button type="button" class="task-metric warning" data-action="filter-node-availability" data-availability="unavailable" aria-pressed="false"><span>保留但不可用</span><strong id="node-unavailable">加载中</strong></button>
+    <button type="button" class="task-metric" data-action="filter-node-availability" data-availability="matching" aria-pressed="false"><span>筛选匹配</span><strong id="node-matching">加载中</strong></button>
   </section>
 
   <section class="health-workbench" aria-label="检测目标与刷新计划">
@@ -120,7 +120,8 @@
     <div class="node-batch-bar" aria-label="节点批量操作">
       <span id="node-selected-count" role="status" aria-live="polite">已选 0</span>
       <button type="button" class="btn-sm" data-action="copy-selected-nodes" disabled>复制已选</button>
-      <span class="candidate-speedtest-note">勾选节点后批量复制完整代理URL。</span>
+      <button type="button" class="btn-sm" data-action="speedtest-selected-nodes" disabled>批量测速</button>
+      <span class="candidate-speedtest-note">勾选节点后批量复制代理URL或测速。</span>
     </div>
   <div id="node-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
 

@@ -245,6 +245,8 @@ var candidateCountryTrigger = null;
 var countryPickerScope = 'candidates';
 var selectedCandidateKeys = Object.create(null);
 var selectedNodeURLs = Object.create(null);
+var nodeSpeedResults = Object.create(null);
+var nodeSpeedtestPending = false;
 var candidateSpeedResults = Object.create(null);
 var candidateOperationPending = false;
 var lastKnownScrape = '';
@@ -1358,12 +1360,48 @@ function updateNodeSelectionUI(rows) {
   setText('node-selected-count', '已选 ' + keys.length);
   var copyButton = document.querySelector('[data-action="copy-selected-nodes"]');
   if (copyButton) copyButton.disabled = !keys.length;
+  var speedtestButton = document.querySelector('[data-action="speedtest-selected-nodes"]');
+  if (speedtestButton) speedtestButton.disabled = !keys.length || nodeSpeedtestPending;
   var pageToggle = document.getElementById('node-select-page');
   if (pageToggle) {
     var selectedOnPage = rows.filter(function(item){ return !!selectedNodeURLs[String(item.key || '')]; }).length;
     pageToggle.checked = !!rows.length && selectedOnPage === rows.length;
     pageToggle.indeterminate = selectedOnPage > 0 && selectedOnPage < rows.length;
   }
+}
+
+function speedtestSelectedNodes() {
+  var keys = selectedNodeList();
+  if (!keys.length || nodeSpeedtestPending) return;
+  if (keys.length > 16) { notify('节点测速一次最多 16 个不同 key', 'error', 7000); return; }
+  nodeSpeedtestPending = true;
+  keys.forEach(function(key){ nodeSpeedResults[key] = {pending:true}; });
+  updateNodeSelectionUI(nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes : []);
+  notify('正在批量测速 ' + keys.length + ' 个节点…', '', 5000);
+  fetchJSON('/api/nodes/speedtest/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keys:keys})})
+    .then(function(payload){
+      var results = payload && Array.isArray(payload.results) ? payload.results : [];
+      var ok = 0, fail = 0;
+      results.forEach(function(item){
+        var key = String(item.key || '');
+        if (!key) return;
+        if (item.error || item.ok === false) { nodeSpeedResults[key] = {error: item.error || '测速失败'}; fail++; }
+        else { nodeSpeedResults[key] = item; ok++; }
+      });
+      keys.forEach(function(key){ if (!results.some(function(r){ return String(r.key||'') === key; })) { nodeSpeedResults[key] = {error:'服务端未返回该项结果'}; fail++; } });
+      notify('批量测速完成：' + ok + ' 成功' + (fail ? '，' + fail + ' 失败' : ''), ok ? 'success' : 'error', 7000);
+      nodeSnapshotID = '';
+      nodeQueryGeneration++;
+      return requestNodes(true);
+    })
+    .catch(function(err){
+      keys.forEach(function(key){ nodeSpeedResults[key] = {error:String(err)}; });
+      notify('批量测速失败：' + String(err), 'error', 7000);
+    })
+    .finally(function(){
+      nodeSpeedtestPending = false;
+      updateNodeSelectionUI(nodePageData && Array.isArray(nodePageData.nodes) ? nodePageData.nodes : []);
+    });
 }
 
 function toggleNodeSelection(button) {
@@ -1721,6 +1759,27 @@ function requiredControl(id) {
   return control;
 }
 
+var nodeAvailabilityFilter = '';
+
+function filterNodeAvailability(availability) {
+  var newFilter = nodeAvailabilityFilter === availability ? '' : availability;
+  nodeAvailabilityFilter = newFilter;
+  var hideUnavail = document.getElementById('f-hide-unavail');
+  if (hideUnavail) {
+    hideUnavail.checked = newFilter === 'available';
+  }
+  updateNodeAvailabilityButtons();
+  onFilterChange();
+}
+
+function updateNodeAvailabilityButtons() {
+  var buttons = document.querySelectorAll('.task-metrics .task-metric[data-action="filter-node-availability"]');
+  buttons.forEach(function(btn) {
+    var av = btn.getAttribute('data-availability') || '';
+    btn.setAttribute('aria-pressed', av === nodeAvailabilityFilter ? 'true' : 'false');
+  });
+}
+
 function nodePageURL() {
   var q = [
     'page=' + encodeURIComponent(nodePage),
@@ -1735,7 +1794,9 @@ function nodePageURL() {
   if (protocol) q.push('protocol=' + encodeURIComponent(protocol));
   if (sort) q.push('sort=' + encodeURIComponent(sort));
   if (requiredControl('f-ipchanged').checked) q.push('only_changed=1');
-  if (requiredControl('f-hide-unavail').checked) q.push('available=1');
+  if (nodeAvailabilityFilter === 'available') q.push('available=1');
+  else if (nodeAvailabilityFilter === 'unavailable') q.push('unavailable=1');
+  else if (requiredControl('f-hide-unavail').checked) q.push('available=1');
   if (nodePage > 1 && nodeSnapshotID) q.push('snapshot_id=' + encodeURIComponent(nodeSnapshotID));
   return '/api/nodes/page?' + q.join('&');
 }
@@ -2426,6 +2487,8 @@ document.addEventListener('click', function(event) {
     case 'node-select': toggleNodeSelection(actionElement); return;
     case 'node-select-page': toggleNodePageSelection(actionElement); return;
     case 'copy-selected-nodes': copySelectedNodes(actionElement); break;
+    case 'speedtest-selected-nodes': speedtestSelectedNodes(); break;
+    case 'filter-node-availability': filterNodeAvailability(actionElement.getAttribute('data-availability') || ''); break;
     case 'candidate-select': toggleCandidateSelection(actionElement); return;
     case 'candidate-select-page': toggleCandidatePageSelection(actionElement); return;
     case 'candidate-speedtest': speedtestCandidates([rowKey(actionElement)]); break;

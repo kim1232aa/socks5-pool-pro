@@ -107,6 +107,35 @@ func TestDashboardNodeBatchCopyContract(t *testing.T) {
 	}
 }
 
+func TestDashboardNodeBatchSpeedtestContract(t *testing.T) {
+	for _, want := range []string{
+		`data-action="speedtest-selected-nodes"`,
+		`function speedtestSelectedNodes()`,
+		`case 'speedtest-selected-nodes':`,
+		`/api/nodes/speedtest/batch`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing node batch speedtest contract %q", want)
+		}
+	}
+}
+
+func TestDashboardNodeAvailabilityFilterContract(t *testing.T) {
+	for _, want := range []string{
+		`data-action="filter-node-availability"`,
+		`data-availability="available"`,
+		`data-availability="unavailable"`,
+		`function filterNodeAvailability(`,
+		`function updateNodeAvailabilityButtons()`,
+		`case 'filter-node-availability':`,
+		`q.push('unavailable=1')`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing node availability filter contract %q", want)
+		}
+	}
+}
+
 func TestDashboardCandidatePageSizeIsResponsive(t *testing.T) {
 	for _, want := range []string{
 		`<option value="10">每页10</option>`,

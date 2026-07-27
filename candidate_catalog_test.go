@@ -120,6 +120,49 @@ func TestCandidateCatalogPageClassificationFilteringAndCredentials(t *testing.T)
 	assertCandidateStatus(t, updatedByKey, available.Key(), "known_unavailable")
 }
 
+func TestCandidateRecordStatusCheckedFailedNotOverlaidAsAvailable(t *testing.T) {
+	// A node that is in the pool as Available=true but failed its most recent
+	// check must not be relabeled "known_available" - the check result takes
+	// priority, matching candidatePolicyFiltered's behavior.
+	failedButInPool := Proxy{IP: "192.0.2.200", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{failedButInPool}, nil)
+	refresh := pool.candidates.begin([]Proxy{failedButInPool}, nil, nil, 0)
+	// complete marks the node as checked_failed because it was checked but not alive.
+	pool.candidates.complete(refresh, []Proxy{failedButInPool}, nil, nil)
+
+	// The node is in the pool (Available=true) but the candidate record says
+	// checked_failed. The rendered status must be "checked_failed", not
+	// "known_available".
+	page, _ := getCandidatePage(t, NewStatusServer(pool, &ConfigStore{}).handler(), "/api/candidates/page?page_size=100")
+	if len(page.Candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(page.Candidates))
+	}
+	if page.Candidates[0].Status != "checked_failed" {
+		t.Fatalf("candidate status = %q, want %q", page.Candidates[0].Status, "checked_failed")
+	}
+	if page.Candidates[0].Available {
+		t.Fatal("checked_failed candidate was incorrectly marked as available")
+	}
+
+	// Verify policy_filtered still takes priority as before, and that a node
+	// with deferred status still gets overlaid by known availability.
+	policyInPool := Proxy{IP: "192.0.2.201", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
+	deferredInPool := Proxy{IP: "192.0.2.202", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
+	pool2 := NewProxyPool()
+	pool2.Prime([]Proxy{policyInPool, deferredInPool}, nil)
+	r2 := pool2.candidates.begin([]Proxy{policyInPool, deferredInPool}, nil, nil, 0)
+	pool2.candidates.complete(r2, []Proxy{policyInPool, deferredInPool}, []Proxy{deferredInPool}, map[string]bool{policyInPool.Key(): true})
+
+	page2, _ := getCandidatePage(t, NewStatusServer(pool2, &ConfigStore{}).handler(), "/api/candidates/page?page_size=100")
+	byKey := make(map[string]CandidateView)
+	for _, c := range page2.Candidates {
+		byKey[c.Key] = c
+	}
+	assertCandidateStatus(t, byKey, policyInPool.Key(), "policy_filtered")
+	assertCandidateStatus(t, byKey, deferredInPool.Key(), "known_available")
+}
+
 func TestCandidateCatalogRemoveKeysRetriesAfterConcurrentHealthOutcome(t *testing.T) {
 	dir := t.TempDir()
 	catalog := &CandidateCatalog{}

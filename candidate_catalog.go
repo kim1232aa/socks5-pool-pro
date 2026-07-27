@@ -1536,12 +1536,13 @@ func candidateRecordStatus(snapshot *candidateSnapshot, record candidateRecord, 
 	if protocol == "proxyip" {
 		return candidateResource
 	}
-	// A policy exclusion is stronger than stale pool membership. Pool cleanup
-	// can happen independently, but the catalog must never relabel a candidate
-	// that just failed require-ip-change as healthy merely because it was known
-	// from an earlier cycle.
-	if record.status == candidatePolicyFiltered {
-		return candidatePolicyFiltered
+	// Policy exclusions and definitive check failures are stronger than stale
+	// pool membership. Pool cleanup can happen independently, but the catalog
+	// must never relabel a candidate that just failed require-ip-change or a
+	// reachability check as healthy merely because it was known from an earlier
+	// cycle.
+	if record.status == candidatePolicyFiltered || record.status == candidateCheckedFailed {
+		return record.status
 	}
 	if status, ok := knownCandidateStatus(known, protocol, record.addr); ok {
 		return status

@@ -60,6 +60,13 @@ func (s *StatusServer) handleNodesDelete(w http.ResponseWriter, r *http.Request)
 		writeErrCode(w, http.StatusInternalServerError, "node_delete_not_durable", fmt.Errorf("删除未提交：节点缓存持久化失败: %w", persistErr))
 		return
 	}
+	// Sync: also remove deleted nodes from the candidate catalog so the
+	// inventory view does not leave stale entries behind an explicit pool
+	// removal. Candidate removal is best-effort here — the forwarding pool
+	// deletion above is the source of truth for durability.
+	if s.pool.candidates != nil && len(removed) > 0 {
+		s.pool.candidates.RemoveKeys(removed)
+	}
 	writeJSON(w, inventoryDeleteResponse{Removed: nonNilInventoryKeys(removed), NotFound: nonNilInventoryKeys(notFound)})
 }
 

@@ -182,6 +182,7 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/nodes/clear-unavailable", requirePost(s.handleNodesClearUnavailable))
 	mux.HandleFunc("/api/nodes/delete", requirePost(s.handleNodesDelete))
 	mux.HandleFunc("/api/nodes/speedtest", requirePost(s.handleNodeSpeedtest))
+	mux.HandleFunc("/api/nodes/speedtest/batch", requirePost(s.handleNodeSpeedtestBatch))
 	mux.HandleFunc("/api/nodes/export", requireGet(s.handleNodeExport))
 
 	mux.HandleFunc("/api/sources", s.handleSources)
