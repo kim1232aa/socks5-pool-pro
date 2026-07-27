@@ -185,6 +185,7 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/nodes/export", requireGet(s.handleNodeExport))
 
 	mux.HandleFunc("/api/sources", s.handleSources)
+	mux.HandleFunc("/api/sources/import", requirePost(s.handleSourceImport))
 	mux.HandleFunc("/api/sources/toggle", requirePost(s.handleSourceToggle))
 	mux.HandleFunc("/api/sources/delete", requirePost(s.handleSourceDelete))
 	mux.HandleFunc("/api/sources/refresh", requirePost(s.handleSourceRefresh))

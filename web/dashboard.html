@@ -20,7 +20,7 @@
   <nav class="tabs" role="tablist" aria-label="管理页面">
     <a id="tab-link-nodes" href="#nodes" class="tab-link" data-tab="nodes" data-icon="◉" role="tab" aria-controls="tab-nodes">转发代理池</a>
     <a id="tab-link-candidates" href="#candidates" class="tab-link" data-tab="candidates" data-icon="◫" role="tab" aria-controls="tab-candidates">候选库存</a>
-    <a id="tab-link-sources" href="#sources" class="tab-link" data-tab="sources" data-icon="⌁" role="tab" aria-controls="tab-sources">来源订阅</a>
+    <a id="tab-link-sources" href="#sources" class="tab-link" data-tab="sources" data-icon="⌁" role="tab" aria-controls="tab-sources">来源管理</a>
     <a id="tab-link-rules" href="#rules" class="tab-link" data-tab="rules" data-icon="⑂" role="tab" aria-controls="tab-rules">分流规则</a>
     <a id="tab-link-groups" href="#groups" class="tab-link" data-tab="groups" data-icon="◇" role="tab" aria-controls="tab-groups">分组策略</a>
     <a id="tab-link-listeners" href="#listeners" class="tab-link" data-tab="listeners" data-icon="⊟" role="tab" aria-controls="tab-listeners">监听端口</a>
@@ -216,7 +216,7 @@
 </div>
 
 <div id="tab-sources" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-sources">
-  <div class="panel-heading"><div><span class="panel-kicker">Subscriptions</span><h2>订阅来源</h2><p>控制抓取入口、数据格式及启用状态；内置与自定义来源统一管理。</p></div></div>
+  <div class="panel-heading"><div><span class="panel-kicker">Sources</span><h2>来源管理</h2><p>统一管理远程订阅与本地导入文件的启用、刷新和候选边界。</p></div></div>
   <div class="scope-intro"><span class="scope-icon" aria-hidden="true">⌁</span><div><strong>来源决定候选目录的边界</strong>停用来源会让相关节点立即退出路由但保留历史库存；下一次刷新按当前启用集合重建候选并重新检测。</div></div>
   <section class="source-auto-refresh" aria-label="自动更新设置说明">
     <div class="form-title">自动更新<span>每个来源独立设置，保存到服务端并在重启后继续生效；间隔 0 表示沿用全局抓取间隔。</span></div>
@@ -224,13 +224,13 @@
   </section>
   <div class="table-scroll" tabindex="0" aria-label="来源表格，可横向滚动">
   <table class="management-table">
-  <tr><th>名称</th><th>URL</th><th>格式</th><th>类型</th><th>启用</th><th>自动更新</th><th>操作</th></tr>
+  <tr><th>名称</th><th>位置</th><th>格式</th><th>类型</th><th>启用</th><th>自动更新</th><th>操作</th></tr>
   {{range .Sources}}
   <tr>
-    <td data-label="来源名称">{{.Name}}{{if .AllowPrivate}}<span class="private-source-badge" title="该来源已显式允许访问局域网或保留地址">允许私网</span>{{end}}{{if .AllowEmpty}}<span class="empty-source-badge" title="HTTP 200 空列表会被视为权威结果，并清空该来源的上一版候选">允许空清单</span>{{end}}{{if .Note}}<div class="note-inline">{{.Note}}</div>{{end}}</td>
-    <td data-label="订阅地址" class="mono small">{{.URL}}</td>
+    <td data-label="来源名称">{{.Name}}{{if eq .Kind "upload"}}<span class="local-source-badge" title="内容保存在服务端私有数据目录；原始文件名和路径不公开">本地私有文件</span>{{end}}{{if .AllowPrivate}}<span class="private-source-badge" title="该来源已显式允许访问局域网或保留地址">允许私网</span>{{end}}{{if .AllowEmpty}}<span class="empty-source-badge" title="HTTP 200 空列表会被视为权威结果，并清空该来源的上一版候选">允许空清单</span>{{end}}{{if .Note}}<div class="note-inline">{{.Note}}</div>{{end}}</td>
+    <td data-label="来源位置" class="mono small">{{if eq .Kind "upload"}}<span class="source-private-location">服务端私有存储</span>{{else}}{{.URL}}{{end}}</td>
     <td data-label="数据格式" class="small">{{.Format}}{{if .Protocol}} ({{.Protocol}}){{end}}</td>
-    <td data-label="来源类型" class="small">{{if .Builtin}}内置{{else}}自定义{{end}}</td>
+    <td data-label="来源类型" class="small">{{if eq .Kind "upload"}}本地导入{{else if .Builtin}}内置{{else}}远程自定义{{end}}</td>
     <td data-label="启用状态">
       <label class="switch">
         <input type="checkbox" aria-label="切换来源 {{.Name}}" {{if .Enabled}}checked{{end}} onchange="postJSON('/api/sources/toggle',{id:'{{.ID}}',enabled:this.checked},reloadOrAlert)">
@@ -243,8 +243,19 @@
   </table>
   </div>
 
+  <form class="inline source-import-form" id="form-import-source">
+    <div class="form-title">导入本地代理列表<span>创建一个可独立启停、刷新和删除的本地来源</span></div>
+    <label class="sr-only" for="source-import-name">本地来源名称</label>
+    <input id="source-import-name" name="name" placeholder="来源名称" maxlength="128" required>
+    <label class="sr-only" for="source-import-file">代理列表文本文件</label>
+    <input id="source-import-file" name="file" type="file" accept="text/plain,.txt,.list" aria-describedby="source-import-help" required>
+    <button id="source-import-submit" class="btn" type="submit">导入并刷新</button>
+    <p id="source-import-help" class="source-import-help">仅接受最多 16 MiB 的文本文件，固定按 text-regex 扫描完整的 <code>scheme://host:port</code>（可带凭据）。文件内容复制到服务端私有数据目录；不会保存或返回原始文件名和路径，也不会进入 Git。有效条目进入候选库存，大文件每轮只按 MaxCandidates 有界抽样检查。</p>
+    <span id="source-import-status" class="source-import-status small" role="status" aria-live="polite"></span>
+  </form>
+
   <form class="inline" id="form-add-source">
-    <div class="form-title">添加自定义来源<span>支持纯文本、JSON 与 ProxyIP 专用目录</span></div>
+    <div class="form-title">添加远程自定义来源<span>支持纯文本、JSON 与 ProxyIP 专用目录</span></div>
     <label class="sr-only" for="source-name">来源名称</label>
     <input id="source-name" name="name" placeholder="名称" required>
     <label class="sr-only" for="source-url">来源 URL</label>
@@ -262,7 +273,7 @@
     </details>
     <button class="btn" type="submit">添加来源</button>
   </form>
-  <p class="note">格式说明: text-regex = 文本中扫描 "scheme://ip:port"; edt-json = EDT-Pages 风格 JSON 数组; proxyip-json = Cloudflare ProxyIP 专用格式; plain-list = 每行一个 "ip:port"(需填协议); json-array = JSON 字符串数组,每项 "ip:port"(需填协议)。</p>
+  <p class="note">格式说明: text-regex = 文本中扫描 "scheme://ip:port"; edt-json = EDT-Pages 风格 JSON 数组; proxyip-json = Cloudflare ProxyIP 专用格式; plain-list = 每行一个 "ip:port"(需填协议); json-array = JSON 字符串数组,每项 "ip:port"(需填协议)。本地导入固定使用 text-regex。</p>
 </div>
 
 <div id="tab-rules" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-rules">

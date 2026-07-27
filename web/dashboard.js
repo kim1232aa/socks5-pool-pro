@@ -2298,7 +2298,7 @@ function showTab(name) {
   var viewMeta = {
     nodes: ['转发代理池','健康节点、真实出口与全量复检。'],
     candidates: ['候选库存','按资源类型与来源地区浏览完整快照。'],
-    sources: ['来源订阅','抓取入口、格式与库存保留策略。'],
+    sources: ['来源管理','远程订阅、本地导入与库存保留策略。'],
     rules: ['分流规则','从上到下构建可预测的路由决策。'],
     groups: ['分组策略','组合节点、地区、协议与来源。'],
     listeners: ['监听端口','独立 SOCKS5 入口与专属路由方式。']
@@ -2464,6 +2464,78 @@ syncTabFromHash();
 pollStatus(false);
 schedulePoll(15000);
 
+
+function sourceImportCandidateCount(result) {
+  var counts = result && result.counts;
+  var values = [
+    result && result.candidate_count,
+    result && result.imported_count,
+    result && result.parsed_count,
+    counts && counts.candidates,
+    counts && counts.imported,
+    counts && counts.parsed
+  ];
+  for (var i = 0; i < values.length; i++) {
+    var value = Number(values[i]);
+    if (isFinite(value) && value >= 0) return Math.round(value);
+  }
+  return null;
+}
+
+function sourceImportRefreshSummary(result) {
+  var operation = result && (result.refresh || result.operation || result.refresh_operation);
+  if (!operation) return '刷新操作已提交。';
+  if (operation.coalesced) return '刷新请求已与现有任务合并。';
+  if (operation.status === 'running') return '刷新任务正在运行。';
+  if (operation.status === 'queued') return '刷新任务已排队。';
+  return '刷新操作已创建。';
+}
+
+document.getElementById('form-import-source').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var form = e.target;
+  var name = String(form.elements.name.value || '').trim();
+  var fileInput = form.elements.file;
+  var file = fileInput && fileInput.files ? fileInput.files[0] : null;
+  var status = document.getElementById('source-import-status');
+  var submit = document.getElementById('source-import-submit');
+  if (!name || !file) {
+    notify('请填写来源名称并选择代理列表文本文件', 'error');
+    return;
+  }
+  if (file.size > 16 * 1024 * 1024) {
+    notify('文件超过 16 MiB 上限，未发送到服务端', 'error', 7000);
+    return;
+  }
+  var originalLabel = submit.textContent;
+  submit.disabled = true;
+  submit.textContent = '导入中…';
+  if (status) status.textContent = '正在安全上传并创建本地来源…';
+  var formData = new FormData();
+  formData.append('name', name);
+  formData.append('file', file);
+  fetchJSON('/api/sources/import', {method:'POST', body:formData})
+    .then(function(result) {
+      var count = sourceImportCandidateCount(result);
+      var message = count === null
+        ? '本地来源已创建。'
+        : '本地来源已创建，识别 ' + formatCount(count) + ' 条候选。';
+      message += sourceImportRefreshSummary(result) + ' 页面即将更新来源列表。';
+      form.reset();
+      if (status) status.textContent = message;
+      notify(message, 'success', 7000);
+      setTimeout(function(){ location.hash = 'sources'; location.reload(); }, 1800);
+    })
+    .catch(function(err) {
+      var message = '导入失败：' + String(err);
+      if (status) status.textContent = message;
+      notify(message, 'error', 7000);
+    })
+    .finally(function() {
+      submit.disabled = false;
+      submit.textContent = originalLabel;
+    });
+});
 
 document.getElementById('form-add-source').addEventListener('submit', function(e) {
   e.preventDefault();

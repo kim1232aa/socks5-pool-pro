@@ -480,3 +480,33 @@ func TestDashboardManagementPagesMatchBackendDataContracts(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardImportsLocalSourceWithoutLeakingFileMetadata(t *testing.T) {
+	for _, want := range []string{
+		`id="form-import-source"`,
+		`id="source-import-name" name="name"`,
+		`id="source-import-file" name="file" type="file"`,
+		`最多 16 MiB`,
+		`固定按 text-regex`,
+		`不会保存或返回原始文件名和路径`,
+		`每轮只按 MaxCandidates 有界抽样检查`,
+		`var formData = new FormData();`,
+		`formData.append('name', name);`,
+		`formData.append('file', file);`,
+		`fetchJSON('/api/sources/import', {method:'POST', body:formData})`,
+		`id="source-import-status"`,
+		`{{if eq .Kind "upload"}}本地导入{{else if .Builtin}}内置{{else}}远程自定义{{end}}`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing local source import contract %q", want)
+		}
+	}
+	if strings.Contains(string(dashboardJS), `fetchJSON('/api/sources/import', {method:'POST', headers:`) {
+		t.Fatal("local source import must let the browser set the multipart Content-Type boundary")
+	}
+	for _, leakedField := range []string{"filename", "filepath", "path", "proxy_url", "username", "password"} {
+		if strings.Contains(string(dashboardJS), `result.`+leakedField) {
+			t.Fatalf("local source import result renders sensitive field %q", leakedField)
+		}
+	}
+}

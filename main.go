@@ -617,7 +617,7 @@ func refreshPoolContext(ctx context.Context, cfg *Config, store *ConfigStore, po
 		go func() {
 			defer wg.Done()
 			for src := range jobs {
-				proxies, err := FetchSourceContext(ctx, src)
+				proxies, err := store.LoadSourceContext(ctx, src)
 				if err != nil {
 					log.Printf("[error] scrape %s failed: %v", src.Name, err)
 					mu.Lock()
@@ -803,7 +803,7 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 	}
 	coordinator.sourceLifecycleMu.RUnlock()
 
-	proxies, err := FetchSourceContext(ctx, source)
+	proxies, err := store.LoadSourceContext(ctx, source)
 	if err != nil {
 		if ctx.Err() != nil {
 			return refreshRunResult{Status: "cancelled", Error: ctx.Err().Error()}

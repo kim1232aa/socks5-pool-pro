@@ -9,9 +9,9 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 ## 架构与数据边界
 
 ```text
-订阅来源
-   │ 抓取、格式校验、协议感知去重
-   ▼
+远程订阅 / 本地导入
+        │ 抓取或私有文件读取、格式校验、协议感知去重
+        ▼
 完整候选目录 ── 有界轮转抽样 ── 真实 HTTP 健康检查 ── 已知转发池
    │                                                   │
    │ ProxyIP 仅浏览/专用验证                           │ 规则 + 分组策略
@@ -27,7 +27,7 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 | 已知转发池 | 曾成功通过检查的 SOCKS5/HTTP/HTTPS 节点；失败节点保留为不可用 | 是，优先当前健康节点 | `pool_cache.json`（gzip） |
 | ProxyIP 资源 | Cloudflare Worker/VLESS/Trojan 类工具使用的外部反代地址 | 否 | 候选目录 |
 
-配置和抽样游标分别保存在 `pool_config.json` 与 `candidate_sampler.json`。`pool_cache.json` 和候选目录缓存均使用 gzip 压缩写入。数据目录和状态文件使用私有权限；转发池及候选目录缓存会原样保留上游用户名和密码，备份应按敏感数据处理。
+配置和抽样游标分别保存在 `pool_config.json` 与 `candidate_sampler.json`。本地导入文件按来源 ID 存放在数据目录的 `source_imports/` 子目录：目录权限为 `0700`，文件权限为 `0600`，不会使用或保留用户端原始文件名。`pool_cache.json` 和候选目录缓存均使用 gzip 压缩写入。数据目录、导入文件和状态文件都应视为私有数据；其中可能原样包含上游用户名和密码，备份也应按敏感数据处理。仓库已忽略默认 `data/`，用户导入文件不得加入 Git。
 
 ### 为什么界面里的数字不同
 
@@ -125,7 +125,7 @@ go build -o socks5-pool .
 
 - **转发代理池**：健康状态、实测出口、延迟、评分、测速、人工复检和节点切换；
 - **候选库存**：服务端分页浏览完整去重目录，区分待检、失败、策略排除、池内可用/不可用和 ProxyIP；
-- **来源订阅**：新增、启停、删除来源及 `allow_private`、`allow_empty` 高级选项；
+- **来源管理**：新增远程订阅，导入本地代理列表，并统一启停、刷新和删除来源；远程来源另有 `allow_private`、`allow_empty` 高级选项；
 - **分流规则**：按顺序维护域名、CIDR、GEOSITE 与兜底规则；
 - **分组策略**：按国家、协议、来源或指定节点建立策略组；
 - **监听端口**：热增删附加 SOCKS5 端口，每个端口可复用全局规则、按分组策略自动切换，或固定到一个协议感知节点 key。
@@ -180,7 +180,7 @@ https://www.google.com/generate_204
 
 初始配置包含 EDT-Pages、Proxifly、Monosans、Fyvri 和 socks5-proxy.github.io 等普通来源；内置 ProxyIP 来源默认关闭，可按需启用。
 
-新增来源示例：
+新增远程来源示例：
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/sources \
@@ -192,6 +192,25 @@ curl -X POST http://127.0.0.1:8080/api/sources \
     "protocol": "socks5"
   }'
 ```
+
+### 本地代理列表导入
+
+来源的 `kind` 为 `remote` 或 `upload`；旧配置中缺少或为空的 `kind` 按 `remote` 处理。本地导入可从来源页操作，也可以直接发送 multipart 请求：
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/sources/import \
+  -F 'name=local-socks-feed' \
+  -F 'file=@./proxies.txt;type=text/plain'
+```
+
+导入合同与安全边界：
+
+- multipart 只接受一个 `name` 字段和一个 `file` 字段；浏览器使用 `FormData` 时不要手工设置 `Content-Type`，让浏览器生成包含 boundary 的请求头；
+- 文件上限与远程来源响应一致，最多 16 MiB；本地来源固定使用 `text-regex`，文件中应提供完整的 `scheme://host:port`，可包含上游认证信息；
+- 服务端为来源生成 `src-*` ID，将内容原子写入 `data-dir/source_imports/` 下的私有文件；来源 URL 保持为空，管理 API 和界面不返回原始文件名、服务端路径、文件内容或代理凭据；
+- 成功导入会创建启用的本地来源并提交一次来源刷新。响应只包含安全计数和刷新操作元数据，不包含文件或代理明细；
+- 文件中的有效记录仍进入完整候选库存；即使文件较大，每轮也只按 `MaxCandidates`（CLI 为 `-max-candidates`）有界抽样执行健康检查，未抽到的候选不会因此从库存删除；
+- 删除本地来源时会协调删除对应私有导入文件。默认 `data/` 已被 `.gitignore` 忽略；若使用自定义数据目录，也必须确保用户导入文件不进入 Git 或公开制品。
 
 来源刷新采用 last-good 语义：
 
@@ -305,7 +324,8 @@ GET /api/v1/proxies/pick?protocol=socks5&country=JP
 | POST | `/api/nodes/speedtest` | 对一个节点执行按需测速 |
 | POST | `/api/proxyip/verify` | 单条 ProxyIP 专用验证 |
 | GET/POST | `/api/settings/check-url` | 读取或修改健康目标 |
-| GET/POST | `/api/sources` | 列出或新增来源 |
+| GET/POST | `/api/sources` | 列出来源或新增远程来源 |
+| POST | `/api/sources/import` | multipart 导入本地代理列表并提交刷新 |
 | GET/POST | `/api/rules` | 列出或新增规则 |
 | GET/POST | `/api/groups` | 列出或新增分组 |
 | GET/POST | `/api/listeners` | 列出运行状态或新增附加 SOCKS5 端口 |
@@ -494,7 +514,9 @@ candidatecache.go       候选目录压缩缓存
 server.go               本地 SOCKS5 入口与规则路由
 dial.go                 SOCKS5/HTTP CONNECT 上游拨号
 status.go               管理 API、安全中间件与响应模型
+status_source_import.go 本地来源 multipart 导入 API
 sourcestore.go          来源、规则、分组和检查目标配置
+sourceimport.go          本地来源私有文件存储
 speedtest.go            按需完整样本测速
 web/                    嵌入式 Proxy Atlas 前端
 compose.yaml            推荐的本地容器部署

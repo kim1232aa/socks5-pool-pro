@@ -57,11 +57,17 @@ const (
 	FormatJSONArray   = "json-array"   // JSON array of "ip:port" strings, protocol from Source.Protocol
 )
 
+const (
+	SourceKindRemote = "remote"
+	SourceKindUpload = "upload"
+)
+
 // Source is a single configurable node-list feed. Built-in sources ship
 // with the project; users can add/remove their own from the dashboard.
 type Source struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
+	Kind   string `json:"kind"`
 	URL    string `json:"url"`
 	Format string `json:"format"`
 	// Protocol tags every entry parsed from this source. Required for
@@ -295,9 +301,10 @@ func decodeBoundedJSONStringArray(decoder *json.Decoder) ([]string, error) {
 // ConfigStore persists PoolConfig to a JSON file on disk, guarding all
 // access with a mutex and writing atomically (temp file + rename).
 type ConfigStore struct {
-	mu   sync.RWMutex
-	path string
-	cfg  PoolConfig
+	mu        sync.RWMutex
+	path      string
+	importDir string
+	cfg       PoolConfig
 }
 
 // ConfigPersistenceOutcome reports whether a failed persistence attempt changed
@@ -348,7 +355,14 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 	if err := os.Chmod(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("secure data dir: %w", err)
 	}
-	cs := &ConfigStore{path: filepath.Join(dataDir, "pool_config.json")}
+	importDir := filepath.Join(dataDir, sourceImportDirectoryName)
+	if err := secureSourceImportDirectory(importDir); err != nil {
+		return nil, fmt.Errorf("secure source import dir: %w", err)
+	}
+	cs := &ConfigStore{
+		path:      filepath.Join(dataDir, "pool_config.json"),
+		importDir: importDir,
+	}
 
 	data, err := readPrivateRegularFile(cs.path, maxPoolConfigBytes)
 	if err != nil {
@@ -544,6 +558,7 @@ func defaultPoolConfig() PoolConfig {
 		Groups: []Group{},
 	}
 	for i := range cfg.Sources {
+		cfg.Sources[i].Kind = SourceKindRemote
 		cfg.Sources[i].AutoRefreshEnabled = true
 	}
 	return cfg
@@ -653,9 +668,15 @@ func (cs *ConfigStore) EnabledSources() []Source {
 }
 
 func (cs *ConfigStore) AddSource(s Source) (Source, error) {
+	if strings.TrimSpace(s.Kind) == "" {
+		s.Kind = SourceKindRemote
+	}
 	validated, err := validateSourceDefinition(s)
 	if err != nil {
 		return Source{}, err
+	}
+	if validated.Kind == SourceKindUpload {
+		return Source{}, fmt.Errorf("uploaded sources must be created through ImportSource")
 	}
 	s = validated
 	s.ID = generateID("src")
@@ -678,15 +699,23 @@ func (cs *ConfigStore) AddSource(s Source) (Source, error) {
 }
 
 func (cs *ConfigStore) DeleteSource(id string) error {
-	return cs.mutate(func(c *PoolConfig) error {
-		for i, s := range c.Sources {
-			if s.ID == id {
+	var deleted Source
+	if err := cs.mutate(func(c *PoolConfig) error {
+		for i, source := range c.Sources {
+			if source.ID == id {
+				deleted = source
 				c.Sources = append(c.Sources[:i], c.Sources[i+1:]...)
 				return nil
 			}
 		}
 		return fmt.Errorf("source not found: %s", id)
-	})
+	}); err != nil {
+		return err
+	}
+	if deleted.Kind == SourceKindUpload {
+		return cs.removeImportedSource(deleted)
+	}
+	return nil
 }
 
 func (cs *ConfigStore) ToggleSource(id string, enabled bool) error {
@@ -779,6 +808,9 @@ func validatePersistedPoolConfig(cfg *PoolConfig) error {
 		normalized, err := validateSourceDefinition(source)
 		if err != nil {
 			return fmt.Errorf("source %d: %w", i, err)
+		}
+		if normalized.Kind == SourceKindUpload && !validImportedSourceID(normalized.ID) {
+			return fmt.Errorf("source %d has an invalid uploaded source id", i)
 		}
 		cfg.Sources[i] = normalized
 		if len(source.Note) > maxConfigValueBytes || hasLogControlCharacters(source.Note) {
@@ -966,20 +998,43 @@ func groupReferencesChanged(beforeRules, afterRules []Rule, beforeListeners, aft
 
 func validateSourceDefinition(source Source) (Source, error) {
 	source.Name = strings.TrimSpace(source.Name)
+	source.Kind = strings.ToLower(strings.TrimSpace(source.Kind))
+	kind := source.Kind
+	if kind == "" {
+		kind = SourceKindRemote
+	}
 	source.URL = strings.TrimSpace(source.URL)
 	source.Format = strings.ToLower(strings.TrimSpace(source.Format))
 	source.Protocol = strings.ToLower(strings.TrimSpace(source.Protocol))
 	if source.RefreshIntervalSeconds != 0 && (source.RefreshIntervalSeconds < minSourceRefreshIntervalSeconds || source.RefreshIntervalSeconds > maxSourceRefreshIntervalSeconds) {
 		return Source{}, fmt.Errorf("refresh interval must be 0 or between %d and %d seconds", minSourceRefreshIntervalSeconds, maxSourceRefreshIntervalSeconds)
 	}
-	if source.Name == "" || source.URL == "" {
-		return Source{}, fmt.Errorf("name and url are required")
+	if source.Name == "" {
+		return Source{}, fmt.Errorf("name is required")
 	}
 	if len(source.Name) > maxSourceNameBytes || hasLogControlCharacters(source.Name) {
 		return Source{}, fmt.Errorf("source name must be at most %d bytes and contain no control characters", maxSourceNameBytes)
 	}
 	if len(source.URL) > maxSourceURLBytes {
 		return Source{}, fmt.Errorf("source url exceeds %d bytes", maxSourceURLBytes)
+	}
+	if kind == SourceKindUpload {
+		if source.URL != "" {
+			return Source{}, fmt.Errorf("uploaded source url must be empty")
+		}
+		if source.Format != FormatTextRegex || source.Protocol != "" {
+			return Source{}, fmt.Errorf("uploaded sources must use text-regex without a protocol override")
+		}
+		if source.AllowPrivate || source.Builtin {
+			return Source{}, fmt.Errorf("uploaded sources cannot be private-URL or built-in sources")
+		}
+		return source, nil
+	}
+	if kind != SourceKindRemote {
+		return Source{}, fmt.Errorf("unknown source kind: %q", source.Kind)
+	}
+	if source.URL == "" {
+		return Source{}, fmt.Errorf("url is required for remote sources")
 	}
 	if _, err := validateSourceURL(source.URL, source.AllowPrivate); err != nil {
 		return Source{}, err
