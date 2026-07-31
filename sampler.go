@@ -89,6 +89,13 @@ func newCandidateSampler(dataDir string) *candidateSampler {
 // smaller feeds and a limit smaller than the number of buckets remains fair
 // across refreshes.
 func (s *candidateSampler) selectCandidates(candidates []Proxy, known map[string]bool, limit int) []Proxy {
+	return s.selectCandidatesWhere(candidates, known, limit, nil)
+}
+
+// selectCandidatesWhere is selectCandidates with an optional eligibility
+// predicate. It builds only index buckets for matching records, so callers can
+// retain the original inventory without allocating a compacted Proxy slice.
+func (s *candidateSampler) selectCandidatesWhere(candidates []Proxy, known map[string]bool, limit int, include func(Proxy) bool) []Proxy {
 	if limit <= 0 || len(candidates) == 0 {
 		return nil
 	}
@@ -96,6 +103,9 @@ func (s *candidateSampler) selectCandidates(candidates []Proxy, known map[string
 	buckets := make(map[string][]int)
 	bucketKeyCache := make(map[string]map[string]string)
 	for i, px := range candidates {
+		if include != nil && !include(px) {
+			continue
+		}
 		name := px.SourceName
 		if name == "" {
 			name = "unknown"

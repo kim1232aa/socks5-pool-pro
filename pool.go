@@ -201,16 +201,30 @@ func (p *ProxyPool) EligibleForAutoRecheck(px Proxy) bool {
 	return p.eligibleForAutoRecheckLocked(px, time.Now().UTC())
 }
 
+// autoRecheckExcludedKeys returns one consistent snapshot of candidates that
+// must not consume an automatic health-check slot. Callers that need to retain
+// their input inventory can apply this map without compacting that inventory.
+func (p *ProxyPool) autoRecheckExcludedKeys() map[string]bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now().UTC()
+	excluded := make(map[string]bool)
+	for key, stats := range p.stats {
+		if !statsEligibleForAutoRecheck(stats, now) {
+			excluded[key] = true
+		}
+	}
+	return excluded
+}
+
 // FilterAutoRecheckCandidates removes known nodes still in their success
 // cooldown or terminally failed before refresh sampling. Unseen candidates are
 // retained and therefore cannot be crowded out by an ineligible known node.
 func (p *ProxyPool) FilterAutoRecheckCandidates(candidates []Proxy) []Proxy {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now().UTC()
+	excluded := p.autoRecheckExcludedKeys()
 	out := candidates[:0]
 	for _, px := range candidates {
-		if statsEligibleForAutoRecheck(p.stats[px.Key()], now) {
+		if !excluded[px.Key()] {
 			out = append(out, px)
 		}
 	}

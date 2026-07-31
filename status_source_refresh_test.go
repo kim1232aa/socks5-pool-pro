@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -420,5 +421,199 @@ func TestScheduledSourceRefreshAutoRefreshDisabledInFinalWindowSkipsPublication(
 	completed := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
 	if completed.CandidateTotal != 0 || len(completed.Candidates) != 0 {
 		t.Fatalf("auto-refresh-disabled source was published: %+v", completed)
+	}
+}
+
+func TestScheduledSourceRefreshRetainsCandidatesAndPersistsProxyIPCatalog(t *testing.T) {
+	newFeed := func(ip string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"data":[{"ip":%q,"port":[443]}]}`, ip)
+		}))
+	}
+	feedA := newFeed("1.1.1.1")
+	defer feedA.Close()
+	feedB := newFeed("8.8.8.8")
+	defer feedB.Close()
+
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, configured := range store.Sources() {
+		if configured.Enabled {
+			if err := store.ToggleSource(configured.ID, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	sourceA, err := store.AddSource(Source{
+		Name: "source-A", URL: feedA.URL, Format: FormatProxyIPJSON, AllowPrivate: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceB, err := store.AddSource(Source{
+		Name: "source-B", URL: feedB.URL, Format: FormatProxyIPJSON, AllowPrivate: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool := NewProxyPool()
+	cacheDir := t.TempDir()
+	pool.candidates.SetDiskCache(newCandidateCatalogCache(cacheDir))
+	cfg := &Config{DataDir: t.TempDir(), CheckTimeout: time.Second, MaxConcurrent: 1, MaxCandidates: 10}
+	coordinator := newRefreshCoordinator()
+	for _, source := range []Source{sourceA, sourceB} {
+		result := refreshSource(cfg, store, pool, coordinator, source.ID, "scheduled", newSourceRefreshRevision(source))
+		if result.Status != "complete" {
+			t.Fatalf("scheduled refresh for %q = %+v, want complete", source.Name, result)
+		}
+	}
+
+	want := map[string]bool{
+		"proxyip://1.1.1.1:443": true,
+		"proxyip://8.8.8.8:443": true,
+	}
+	assertCandidateCatalogKeys(t, pool.candidates, want)
+	page := NewStatusServer(pool, store).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
+	facets := make(map[string]int, len(page.Sources))
+	for _, facet := range page.Sources {
+		facets[facet.Value] = facet.Total
+	}
+	if facets[sourceA.Name] != 1 || facets[sourceB.Name] != 1 {
+		t.Fatalf("catalog source facets = %#v, want one record from each source", facets)
+	}
+
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(cacheDir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("LoadDiskCache() = (%v, %v), want (true, nil)", loaded, err)
+	}
+	assertCandidateCatalogKeys(t, restored, want)
+}
+
+func TestScheduledSourceRefreshFilteringDoesNotCorruptCandidateCache(t *testing.T) {
+	firstProxy, firstTunnels := newTestConnectProxy(t)
+	secondProxy, secondTunnels := newTestConnectProxy(t)
+	firstURL, err := url.Parse(firstProxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondURL, err := url.Parse(secondProxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knownURL, knownTunnels := firstURL, firstTunnels
+	freshURL, freshTunnels := secondURL, secondTunnels
+	// dedupeCandidates sorts the same-host entries lexically by port. Make the
+	// cooled entry first so an in-place filter would leave a duplicate tail.
+	if knownURL.Port() > freshURL.Port() {
+		knownURL, freshURL = freshURL, knownURL
+		knownTunnels, freshTunnels = freshTunnels, knownTunnels
+	}
+	asLocalhost := func(raw *url.URL) string {
+		copy := *raw
+		copy.Host = "localhost:" + raw.Port()
+		return copy.String()
+	}
+	knownProxyURL, freshProxyURL := asLocalhost(knownURL), asLocalhost(freshURL)
+	feedBody, err := json.Marshal([]map[string]any{
+		{"proxy": knownProxyURL, "country": "US"},
+		{"proxy": freshProxyURL, "country": "US"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(feedBody)
+	}))
+	defer feed.Close()
+
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, configured := range store.Sources() {
+		if configured.Enabled {
+			if err := store.ToggleSource(configured.ID, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	source, err := store.AddSource(Source{
+		Name: "scheduled-forwarding", URL: feed.URL, Format: FormatEDTJSON, AllowPrivate: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	known := Proxy{
+		IP: "localhost", Port: knownURL.Port(), Protocol: "http", Country: "US", Available: true,
+		SourceName: source.Name, SourceNames: []string{source.Name}, SourceIDs: []string{source.ID},
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{known}, nil)
+	pool.stats[known.Key()] = &nodeStats{LastHealthSuccessAt: time.Now().UTC()}
+	cacheDir := t.TempDir()
+	pool.candidates.SetDiskCache(newCandidateCatalogCache(cacheDir))
+	if err := store.SetCheckURL("http://health.test/check"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{DataDir: t.TempDir(), CheckTimeout: time.Second, MaxConcurrent: 1, MaxCandidates: 10, RequireIPChange: false}
+	result := refreshSource(cfg, store, pool, newRefreshCoordinator(), source.ID, "scheduled", newSourceRefreshRevision(source))
+	if result.Status != "complete" {
+		t.Fatalf("scheduled refresh = %+v, want complete", result)
+	}
+	if got := knownTunnels.Load(); got != 0 {
+		t.Fatalf("cooled candidate was health-checked %d time(s), want 0", got)
+	}
+	if got := freshTunnels.Load(); got == 0 {
+		t.Fatal("eligible candidate was not health-checked")
+	}
+
+	want := map[string]bool{
+		known.Key(): true,
+		(Proxy{IP: "localhost", Port: freshURL.Port(), Protocol: "http"}).Key(): true,
+	}
+	assertCandidateCatalogKeys(t, pool.candidates, want)
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(cacheDir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("LoadDiskCache() = (%v, %v), want (true, nil)", loaded, err)
+	}
+	assertCandidateCatalogKeys(t, restored, want)
+}
+
+func assertCandidateCatalogKeys(t *testing.T, catalog *CandidateCatalog, want map[string]bool) {
+	t.Helper()
+	snapshot := catalog.snapshot.Load()
+	if snapshot == nil {
+		t.Fatal("candidate catalog was not published")
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.records) != len(want) {
+		t.Fatalf("candidate records = %d, want %d", len(snapshot.records), len(want))
+	}
+	got := make(map[string]bool, len(snapshot.records))
+	for _, record := range snapshot.records {
+		protocol := snapshot.protocols[record.protocolID]
+		if protocol == "" {
+			t.Fatal("candidate catalog contains an empty protocol")
+		}
+		got[protocol+"://"+record.addr] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidate keys = %v, want %v", got, want)
+	}
+	for key := range want {
+		if !got[key] {
+			t.Fatalf("candidate keys = %v, missing %q", got, key)
+		}
 	}
 }

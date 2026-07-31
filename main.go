@@ -826,20 +826,44 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 			retained[configured.ID] = true
 		}
 	}
-	captureCandidateSourceIDs(deduped)
-	restoreCandidateSourceLabels(deduped, labels)
-	healthInventory, _ := splitHealthInventory(deduped)
+
+	// Keep deduped untouched until it is published to CandidateCatalog: it holds
+	// stable Source.ID values and the full source inventory. Build only a bounded
+	// health-check work set, because the scheduled eligibility filter used to
+	// compact the catalog's backing slice in place.
+	excluded := map[string]bool(nil)
 	if trigger == "scheduled" {
-		healthInventory = pool.FilterAutoRecheckCandidates(healthInventory)
+		excluded = pool.autoRecheckExcludedKeys()
 	}
-	candidates := healthInventory
-	if len(candidates) > cfg.MaxCandidates {
+	includeHealthCandidate := func(px Proxy) bool {
+		return isForwardingProtocol(px.Protocol) && !excluded[px.Key()]
+	}
+	healthCandidateTotal := 0
+	for _, px := range deduped {
+		if includeHealthCandidate(px) {
+			healthCandidateTotal++
+		}
+	}
+	candidates := make([]Proxy, 0, min(healthCandidateTotal, cfg.MaxCandidates))
+	if healthCandidateTotal <= cfg.MaxCandidates {
+		for _, px := range deduped {
+			if includeHealthCandidate(px) {
+				candidates = append(candidates, px)
+			}
+		}
+	} else {
 		known := make(map[string]bool, pool.Size())
 		for _, px := range pool.All() {
 			known[px.Key()] = true
 		}
-		candidates = newCandidateSampler(cfg.DataDir).selectCandidates(healthInventory, known, cfg.MaxCandidates)
+		candidates = newCandidateSampler(cfg.DataDir).selectCandidatesWhere(deduped, known, cfg.MaxCandidates, includeHealthCandidate)
 	}
+	// Only health-check candidates need user-facing source labels and copied
+	// provenance. Cloning this bounded work set prevents label conversion from
+	// mutating the stable-ID catalog input above.
+	candidates = cloneProxySlice(candidates)
+	captureCandidateSourceIDs(candidates)
+	restoreCandidateSourceLabels(candidates, labels)
 	coordinator.healthCycleMu.Lock()
 	defer coordinator.healthCycleMu.Unlock()
 	healthGeneration, testURL := currentHealthCriterion(pool, store)
