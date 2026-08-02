@@ -17,6 +17,70 @@ import (
 	"time"
 )
 
+func TestClassifyAnonymityRequiresIPChangeAndSameJudgeEvidence(t *testing.T) {
+	tests := []struct {
+		name                      string
+		baselineIP, exitIP        string
+		directOrigin, proxyOrigin string
+		headers                   map[string]string
+		want                      string
+	}{
+		{name: "same measured exit is transparent", baselineIP: "198.51.100.1", exitIP: "198.51.100.1", want: "transparent"},
+		{name: "missing exit is unknown", baselineIP: "198.51.100.1", want: ""},
+		{name: "judge unavailable is unknown", baselineIP: "198.51.100.1", exitIP: "203.0.113.2", want: ""},
+		{name: "same judge origin leaks direct IP", baselineIP: "198.51.100.1", exitIP: "203.0.113.2", directOrigin: "198.51.100.9", proxyOrigin: "198.51.100.9", want: "transparent"},
+		{name: "changed judge origin with proxy header is anonymous", baselineIP: "198.51.100.1", exitIP: "203.0.113.2", directOrigin: "198.51.100.9", proxyOrigin: "203.0.113.2", headers: map[string]string{"Via": "1.1 relay"}, want: "anonymous"},
+		{name: "changed judge origin without proxy evidence is elite", baselineIP: "198.51.100.1", exitIP: "203.0.113.2", directOrigin: "198.51.100.9", proxyOrigin: "203.0.113.2", headers: map[string]string{"Accept": "*/*"}, want: "elite"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyAnonymity(test.baselineIP, test.exitIP, test.directOrigin, test.proxyOrigin, test.headers); got != test.want {
+				t.Fatalf("classifyAnonymity() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDirectAnonymityJudgeFailureIsTemporarilyCached(t *testing.T) {
+	anonymityJudgeBaseline.Lock()
+	oldOrigin, oldExpiresAt := anonymityJudgeBaseline.origin, anonymityJudgeBaseline.expiresAt
+	anonymityJudgeBaseline.origin = ""
+	anonymityJudgeBaseline.expiresAt = time.Time{}
+	anonymityJudgeBaseline.Unlock()
+	t.Cleanup(func() {
+		anonymityJudgeBaseline.Lock()
+		anonymityJudgeBaseline.origin = oldOrigin
+		anonymityJudgeBaseline.expiresAt = oldExpiresAt
+		anonymityJudgeBaseline.Unlock()
+	})
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	for range 2 {
+		if got := directAnonymityJudgeOriginWithURL(context.Background(), time.Second, server.URL); got != "" {
+			t.Fatalf("failed judge origin = %q, want unknown", got)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("judge requests during failure backoff = %d, want 1", got)
+	}
+
+	anonymityJudgeBaseline.Lock()
+	anonymityJudgeBaseline.expiresAt = time.Now().Add(-time.Second)
+	anonymityJudgeBaseline.Unlock()
+	if got := directAnonymityJudgeOriginWithURL(context.Background(), time.Second, server.URL); got != "" {
+		t.Fatalf("expired failed judge origin = %q, want unknown", got)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("judge requests after failure backoff expired = %d, want 2", got)
+	}
+}
+
 func TestHealthResponseStatusRules(t *testing.T) {
 	tests := []struct {
 		name     string

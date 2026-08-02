@@ -1102,9 +1102,11 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 // mergeFreshProxy combines a successful health-check result with durable
 // observations collected independently of that check. A refresh never performs
 // a speed test, so it must not erase the last sample. Exit/geo probes can fail
-// even when basic connectivity succeeds; empty fields therefore mean "no new
-// observation", not "clear the trusted old value". IPChanged is meaningful
-// only alongside a newly observed ExitIP.
+// even when basic connectivity succeeds, so their empty fields preserve the
+// last trusted values. Anonymity is different: every successful health check
+// attempts it, and an empty result means the judge was unavailable; retaining
+// an old elite/anonymous label would misrepresent current evidence. IPChanged
+// is meaningful only alongside a newly observed ExitIP.
 func mergeFreshProxy(existing, fresh Proxy) Proxy {
 	fresh.SpeedKbps = existing.SpeedKbps
 	fresh.SpeedTestedAt = existing.SpeedTestedAt
@@ -1119,9 +1121,6 @@ func mergeFreshProxy(existing, fresh Proxy) Proxy {
 		fresh.ExitIP = existing.ExitIP
 		fresh.IPChanged = existing.IPChanged
 		fresh.IPChangeKnown = existing.IPChangeKnown
-	}
-	if fresh.Anonymity == "" {
-		fresh.Anonymity = existing.Anonymity
 	}
 	if fresh.Country == "" {
 		fresh.Country = existing.Country

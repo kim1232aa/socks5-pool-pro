@@ -58,6 +58,32 @@ func TestPoolCacheDropsNonPublicLiteralsPerNodeOnUpgrade(t *testing.T) {
 	}
 }
 
+func TestPoolCacheClearsLegacyAnonymityButPreservesCurrentResults(t *testing.T) {
+	legacyCache := newPoolCache(t.TempDir())
+	legacyProxy := testProxy("http", "8.8.8.57", "8080", true)
+	legacyProxy.Anonymity = "elite"
+	legacyData, err := json.Marshal(poolCacheFile{Proxies: []Proxy{legacyProxy}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyCache.path, legacyData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyLoaded, _, _ := legacyCache.load()
+	if len(legacyLoaded) != 1 || legacyLoaded[0].Anonymity != "" {
+		t.Fatalf("legacy anonymity survived migration: %#v", legacyLoaded)
+	}
+
+	currentCache := newPoolCache(t.TempDir())
+	currentProxy := testProxy("http", "8.8.8.56", "8080", true)
+	currentProxy.Anonymity = "anonymous"
+	currentCache.save(1, []Proxy{currentProxy}, nil, nil)
+	currentLoaded, _, _ := currentCache.load()
+	if len(currentLoaded) != 1 || currentLoaded[0].Anonymity != "anonymous" {
+		t.Fatalf("current anonymity was cleared: %#v", currentLoaded)
+	}
+}
+
 func TestPoolCachePersistsHealthCriterionAndTreatsLegacyAsUnknown(t *testing.T) {
 	dir := t.TempDir()
 	cache := newPoolCache(dir)

@@ -480,6 +480,12 @@ func BaselineExitIP() string {
 	return baselineExitIP
 }
 
+const (
+	anonymityJudgeURL        = "https://httpbin.org/get"
+	anonymityJudgeCacheTTL   = 5 * time.Minute
+	anonymityJudgeFailureTTL = 30 * time.Second
+)
+
 // proxyLeakHeaders are request headers a proxy may inject that reveal it's
 // a proxy (and sometimes the client's real IP).
 var proxyLeakHeaders = []string{
@@ -487,11 +493,92 @@ var proxyLeakHeaders = []string{
 	"Client-Ip", "Proxy-Connection", "X-Proxy-Id", "X-Forwarded",
 }
 
-// probeAnonymity classifies a proxy as elite/anonymous/transparent by
-// fetching an endpoint that echoes the request headers it received, through
-// the tunnel. Best-effort: returns "" (unknown) if the judge is
-// unreachable. "transparent" = your real IP leaks; "anonymous" = it's
-// detectable as a proxy but hides your IP; "elite" = neither.
+var anonymityJudgeBaseline struct {
+	sync.Mutex
+	origin    string
+	expiresAt time.Time
+}
+
+type anonymityJudgeResponse struct {
+	Origin  string            `json:"origin"`
+	Headers map[string]string `json:"headers"`
+}
+
+// classifyAnonymity requires both the exit-IP probe and same-service judge
+// evidence. This prevents target-specific host routing from making a direct
+// egress look like an elite proxy merely because two unrelated IP services see
+// different paths.
+func classifyAnonymity(baselineIP, exitIP, directOrigin, proxyOrigin string, headers map[string]string) string {
+	baselineIP = strings.TrimSpace(baselineIP)
+	exitIP = strings.TrimSpace(exitIP)
+	if baselineIP == "" || exitIP == "" {
+		return ""
+	}
+	if exitIP == baselineIP {
+		return "transparent"
+	}
+	if strings.TrimSpace(directOrigin) == "" || strings.TrimSpace(proxyOrigin) == "" {
+		return ""
+	}
+
+	leak := sameJudgeOrigin(directOrigin, proxyOrigin) || originContainsIP(proxyOrigin, baselineIP)
+	proxyHeader := false
+	for rawName, value := range headers {
+		for _, header := range proxyLeakHeaders {
+			if !strings.EqualFold(rawName, header) {
+				continue
+			}
+			proxyHeader = true
+			if originContainsIP(value, baselineIP) || sameJudgeOrigin(directOrigin, value) {
+				leak = true
+			}
+			break
+		}
+	}
+	switch {
+	case leak:
+		return "transparent"
+	case proxyHeader:
+		return "anonymous"
+	default:
+		return "elite"
+	}
+}
+
+func sameJudgeOrigin(a, b string) bool {
+	aIPs, bIPs := originIPs(a), originIPs(b)
+	for ip := range aIPs {
+		if bIPs[ip] {
+			return true
+		}
+	}
+	return false
+}
+
+func originContainsIP(origin, ip string) bool {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil {
+		return false
+	}
+	return originIPs(origin)[parsed.String()]
+}
+
+func originIPs(origin string) map[string]bool {
+	out := make(map[string]bool)
+	for _, field := range strings.FieldsFunc(origin, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	}) {
+		if ip := net.ParseIP(strings.TrimSpace(field)); ip != nil {
+			out[ip.String()] = true
+		}
+	}
+	return out
+}
+
+// probeAnonymity classifies a proxy as elite/anonymous/transparent. Base
+// connectivity is still decided solely by the configured Google health target.
+// This best-effort probe returns "" (unknown) whenever either exit-IP evidence
+// or the same-service anonymity judge is unavailable.
 func probeAnonymity(px Proxy, timeout time.Duration) string {
 	return probeAnonymityContext(context.Background(), px, timeout)
 }
@@ -503,9 +590,21 @@ func probeAnonymityContext(parent context.Context, px Proxy, timeout time.Durati
 	if timeout <= 0 {
 		return ""
 	}
+	baselineIP, exitIP := BaselineExitIP(), strings.TrimSpace(px.ExitIP)
+	if baselineIP == "" || exitIP == "" {
+		return ""
+	}
+	if exitIP == baselineIP {
+		return "transparent"
+	}
+
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	baseline := BaselineExitIP()
+	directOrigin := directAnonymityJudgeOrigin(ctx, timeout)
+	if directOrigin == "" {
+		return ""
+	}
+
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			return DialUpstreamContext(ctx, px, addr, timeout)
@@ -513,51 +612,63 @@ func probeAnonymityContext(parent context.Context, px Proxy, timeout time.Durati
 		DisableKeepAlives: true,
 	}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://httpbin.org/get", nil)
-	if err != nil {
+	judged, ok := fetchAnonymityJudge(ctx, &http.Client{Transport: transport})
+	if !ok {
 		return ""
+	}
+	return classifyAnonymity(baselineIP, exitIP, directOrigin, judged.Origin, judged.Headers)
+}
+
+func directAnonymityJudgeOrigin(ctx context.Context, timeout time.Duration) string {
+	return directAnonymityJudgeOriginWithURL(ctx, timeout, anonymityJudgeURL)
+}
+
+// directAnonymityJudgeOriginWithURL serializes cache misses so a concurrent
+// health pass performs at most one direct judge request. Failures are cached
+// briefly as unknown to avoid repeating the same timeout once per proxy.
+func directAnonymityJudgeOriginWithURL(ctx context.Context, timeout time.Duration, judgeURL string) string {
+	anonymityJudgeBaseline.Lock()
+	defer anonymityJudgeBaseline.Unlock()
+	if time.Now().Before(anonymityJudgeBaseline.expiresAt) {
+		return anonymityJudgeBaseline.origin
+	}
+	client := newDirectHTTPClient(timeout)
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		defer transport.CloseIdleConnections()
+	}
+	judged, ok := fetchAnonymityJudgeURL(ctx, client, judgeURL)
+	if !ok {
+		anonymityJudgeBaseline.origin = ""
+		anonymityJudgeBaseline.expiresAt = time.Now().Add(anonymityJudgeFailureTTL)
+		return ""
+	}
+	anonymityJudgeBaseline.origin = judged.Origin
+	anonymityJudgeBaseline.expiresAt = time.Now().Add(anonymityJudgeCacheTTL)
+	return judged.Origin
+}
+
+func fetchAnonymityJudge(ctx context.Context, client *http.Client) (anonymityJudgeResponse, bool) {
+	return fetchAnonymityJudgeURL(ctx, client, anonymityJudgeURL)
+}
+
+func fetchAnonymityJudgeURL(ctx context.Context, client *http.Client, judgeURL string) (anonymityJudgeResponse, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, judgeURL, nil)
+	if err != nil {
+		return anonymityJudgeResponse{}, false
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return ""
+		return anonymityJudgeResponse{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return anonymityJudgeResponse{}, false
 	}
-	var r struct {
-		Origin  string            `json:"origin"`
-		Headers map[string]string `json:"headers"`
+	var judged anonymityJudgeResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&judged); err != nil || len(originIPs(judged.Origin)) == 0 {
+		return anonymityJudgeResponse{}, false
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&r); err != nil {
-		return ""
-	}
-
-	leak := baseline != "" && strings.Contains(r.Origin, baseline)
-	proxyHdr := false
-	for rawName, v := range r.Headers {
-		for _, h := range proxyLeakHeaders {
-			if !strings.EqualFold(rawName, h) {
-				continue
-			}
-			proxyHdr = true
-			if baseline != "" && strings.Contains(v, baseline) {
-				leak = true
-			}
-			break
-		}
-	}
-	switch {
-	case leak:
-		return "transparent"
-	case proxyHdr:
-		return "anonymous"
-	case baseline == "":
-		return ""
-	default:
-		return "elite"
-	}
+	return judged, true
 }
 
 // LookupGeo queries an HTTPS geolocation endpoint, returning the ISO country

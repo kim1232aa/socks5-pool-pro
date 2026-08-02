@@ -266,9 +266,9 @@ func TestUpdatePreservesDurableMeasurementsOnPartialProbe(t *testing.T) {
 		t.Fatalf("speed sample was erased or replaced: %+v", got)
 	}
 	if got.ExitIP != old.ExitIP || got.IPChanged != old.IPChanged ||
-		got.Anonymity != old.Anonymity || got.Country != old.Country ||
+		got.Anonymity != "" || got.Country != old.Country ||
 		got.City != old.City || got.Continent != old.Continent {
-		t.Fatalf("partial exit probe erased trusted metadata: %+v", got)
+		t.Fatalf("successful health check did not clear stale unknown anonymity: %+v", got)
 	}
 
 	observed := fresh

@@ -17,11 +17,12 @@ import (
 )
 
 const (
-	maxPoolCacheBytes        = 128 << 20
-	maxPoolCacheDecodedBytes = 256 << 20
-	maxPoolCacheNodes        = 500_000
-	maxPoolCacheStats        = 500_000
-	maxCachedProxyJSONBytes  = 1 << 20
+	maxPoolCacheBytes              = 128 << 20
+	maxPoolCacheDecodedBytes       = 256 << 20
+	maxPoolCacheNodes              = 500_000
+	maxPoolCacheStats              = 500_000
+	maxCachedProxyJSONBytes        = 1 << 20
+	anonymityClassificationVersion = 2
 )
 
 // poolCache persists the last known-good node lists so a restart is usable
@@ -47,12 +48,13 @@ type poolCache struct {
 }
 
 type poolCacheFile struct {
-	Proxies              []Proxy              `json:"proxies"`
-	ProxyIPNodes         []Proxy              `json:"proxyip_nodes"`
-	Stats                map[string]nodeStats `json:"stats,omitempty"`
-	HealthCheckURL       string               `json:"health_check_url,omitempty"`
-	HealthPolicy         string               `json:"health_policy,omitempty"`
-	HealthRecheckPending bool                 `json:"health_recheck_pending,omitempty"`
+	Proxies                        []Proxy              `json:"proxies"`
+	ProxyIPNodes                   []Proxy              `json:"proxyip_nodes"`
+	Stats                          map[string]nodeStats `json:"stats,omitempty"`
+	HealthCheckURL                 string               `json:"health_check_url,omitempty"`
+	HealthPolicy                   string               `json:"health_policy,omitempty"`
+	HealthRecheckPending           bool                 `json:"health_recheck_pending,omitempty"`
+	AnonymityClassificationVersion int                  `json:"anonymity_classification_version,omitempty"`
 }
 
 func newPoolCache(dataDir string) *poolCache {
@@ -94,6 +96,13 @@ func (c *poolCache) loadWithHealthState() (forwarding, proxyip []Proxy, stats ma
 	if reset := normalizeCompletedCachedHealthState(&f); reset > 0 {
 		log.Printf("[cache] normalized %d completed health-recheck state(s)", reset)
 	}
+	if f.AnonymityClassificationVersion < anonymityClassificationVersion {
+		cleared := clearCachedAnonymity(&f)
+		f.AnonymityClassificationVersion = anonymityClassificationVersion
+		if cleared > 0 {
+			log.Printf("[cache] cleared %d legacy anonymity classification(s)", cleared)
+		}
+	}
 	if err := validatePoolCacheFile(&f); err != nil {
 		log.Printf("[cache] validation failed: %v", err)
 		return nil, nil, nil, "", "", false
@@ -105,6 +114,21 @@ func (c *poolCache) loadWithHealthState() (forwarding, proxyip []Proxy, stats ma
 // HealthInvalidated marker from the terminal state now persisted in nodeStats.
 // Old caches decode the new terminal field as false and retain their historical
 // normalization; terminal failures keep the hard-routing mirror across restart.
+func clearCachedAnonymity(f *poolCacheFile) int {
+	if f == nil {
+		return 0
+	}
+	cleared := 0
+	for i := range f.Proxies {
+		if f.Proxies[i].Anonymity == "" {
+			continue
+		}
+		f.Proxies[i].Anonymity = ""
+		cleared++
+	}
+	return cleared
+}
+
 func normalizeCompletedCachedHealthState(f *poolCacheFile) int {
 	if f == nil {
 		return 0
@@ -176,7 +200,8 @@ func (c *poolCache) saveWithHealthState(generation uint64, forwarding, proxyip [
 	f := poolCacheFile{
 		Proxies: forwarding, ProxyIPNodes: proxyip, Stats: stats,
 		HealthCheckURL: strings.TrimSpace(healthCheckURL), HealthPolicy: healthPolicy,
-		HealthRecheckPending: healthRecheckPending,
+		HealthRecheckPending:           healthRecheckPending,
+		AnonymityClassificationVersion: anonymityClassificationVersion,
 	}
 	if err := validatePoolCacheFile(&f); err != nil {
 		return fmt.Errorf("validate pool cache: %w", err)
@@ -331,6 +356,14 @@ func encodePoolCacheJSON(output io.Writer, f *poolCacheFile) error {
 			return err
 		}
 	}
+	if f.AnonymityClassificationVersion > 0 {
+		if err := stream.writeString(`,"anonymity_classification_version":`); err != nil {
+			return err
+		}
+		if err := stream.encodeValue(f.AnonymityClassificationVersion); err != nil {
+			return err
+		}
+	}
 	return stream.writeString("}")
 }
 
@@ -467,6 +500,8 @@ func (f *poolCacheFile) UnmarshalJSON(data []byte) error {
 			err = decoder.Decode(&f.HealthPolicy)
 		case "health_recheck_pending":
 			err = decoder.Decode(&f.HealthRecheckPending)
+		case "anonymity_classification_version":
+			err = decoder.Decode(&f.AnonymityClassificationVersion)
 		default:
 			err = skipJSONValue(decoder)
 		}
