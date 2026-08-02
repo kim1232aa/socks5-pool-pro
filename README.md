@@ -123,7 +123,7 @@ go build -o socks5-pool .
 
 内置 Proxy Atlas 管理界面由 `web/dashboard.html`、`web/dashboard.css` 和 `web/dashboard.js` 组成，构建时嵌入二进制。主要页面包括：
 
-- **转发代理池**：健康状态、实测出口、延迟、评分、测速、人工复检和节点切换；
+- **转发代理池**：健康状态、实测出口、延迟、评分、测速、人工复检、节点统计、按匿名级别筛选和节点切换；
 - **候选库存**：服务端分页浏览完整去重目录，区分待检、失败、策略排除、池内可用/不可用和 ProxyIP；
 - **来源管理**：新增远程订阅，导入本地代理列表，并统一启停、刷新和删除来源；远程来源另有 `allow_private`、`allow_empty` 高级选项；
 - **分流规则**：按顺序维护域名、CIDR、GEOSITE 与兜底规则；
@@ -150,6 +150,8 @@ https://www.google.com/generate_204
 - 重定向和非 `2xx` 都失败；
 - 出口 IP、地理信息和匿名性探测是尽力而为，附加探测失败不会抹掉已经通过的基础健康结果；
 - `-require-ip-change=true` 时，只有在本机出口与代理出口都已测得且相同的节点才会被策略排除，未知状态不会被误删。
+
+管理界面可覆盖每轮检测并发、单节点超时、每轮抽样规模和 `-require-ip-change`。这些覆盖持久化在 `pool_config.json`，数值选项从下一轮检测生效；要求改 IP 策略变化会刷新基线出口、立即使旧健康结果失效并触发全池复检，选择“跟随命令行默认”则恢复 CLI 值。基线出口也可手动刷新；当它真实变化且策略启用时，同样会失效旧结果并全池复检。
 启动时会在第一次网络抓取之前校验并恢复该文件，因此管理页面可以先显示上次完整目录。缓存保留来源归属、候选状态、地区、时间、`has_auth` 标记以及上游用户名和密码，使来源级的“本轮失败则沿用上次成功目录”语义和完整连接信息跨进程重启继续成立。只有显式停用/删除来源、成功抓取到不同内容，或删除数据卷/缓存文件，目录才会按新事实变化。
 
 候选目录 API、代理池 API、管理页面和导出会原样提供上游用户名、密码与带认证的 `proxy_url`。候选缓存也会写入这些凭据，缓存文件权限为 `0600`，并有压缩大小、解压大小、记录数和字符串长度限制；损坏或不兼容的文件会被拒绝，不会发布部分解码结果。启用管理接口认证后再将该接口暴露到非可信网络。
@@ -320,10 +322,14 @@ GET /api/v1/proxies/pick?protocol=socks5&country=JP
 | GET | `/api/nodes/page` | 已知转发池分页、筛选、排序 |
 | GET | `/api/candidates/page` | 完整候选目录分页 |
 | GET | `/api/nodes` | 旧版完整节点数组，已标记弃用 |
+| GET | `/api/nodes/stats` | 单节点累计转发、连续健康失败与恢复状态 |
+| POST | `/api/nodes/rotate` | 轮换到下一个节点，保留手动锁定 |
 | POST | `/api/nodes/verify` | 人工复检一个转发节点 |
 | POST | `/api/nodes/speedtest` | 对一个节点执行按需测速 |
 | POST | `/api/proxyip/verify` | 单条 ProxyIP 专用验证 |
 | GET/POST | `/api/settings/check-url` | 读取或修改健康目标 |
+| GET/POST | `/api/settings/check-options` | 读取或修改每轮检测选项和要求改 IP 覆盖 |
+| GET/POST | `/api/settings/baseline-exit` | 读取或刷新基线出口 IP |
 | GET/POST | `/api/sources` | 列出来源或新增远程来源 |
 | POST | `/api/sources/import` | multipart 导入本地代理列表并提交刷新 |
 | GET/POST | `/api/rules` | 列出或新增规则 |

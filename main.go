@@ -207,15 +207,16 @@ func main() {
 	// Establish the policy baseline before deciding whether a persisted pool was
 	// validated under the same require-ip-change criterion. When the policy is
 	// disabled its fingerprint is baseline-independent, so avoid delaying both
-	// listeners on an unnecessary external request.
-	if cfg.RequireIPChange {
-		_, _ = RefreshBaselineExitWithChangeContext(signalContext, cfg.CheckTimeout)
+	// listeners on an unnecessary external request. The dashboard override
+	// (when set) wins over the CLI flag here and everywhere below.
+	if store.RequireIPChange(cfg.RequireIPChange) {
+		_, _ = RefreshBaselineExitWithChangeContext(signalContext, store.CheckTimeout(cfg.CheckTimeout))
 	}
 
 	coordinator := newRefreshCoordinator()
 	pool := NewProxyPool()
 	pool.SetHealthCriterion(store.CheckURL())
-	pool.SetRequireIPChangePolicy(cfg.RequireIPChange)
+	pool.SetRequireIPChangePolicy(store.RequireIPChange(cfg.RequireIPChange))
 	candidateCache := newCandidateCatalogCache(cfg.DataDir)
 	pool.candidates.SetDiskCache(candidateCache)
 	if loaded, loadErr := pool.candidates.LoadDiskCache(); loadErr != nil {
@@ -361,8 +362,8 @@ func main() {
 				default:
 				}
 			}
-			if cfg.RequireIPChange {
-				_, baselineChanged := RefreshBaselineExitWithChangeContext(ctx, cfg.CheckTimeout)
+			if store.RequireIPChange(cfg.RequireIPChange) {
+				_, baselineChanged := RefreshBaselineExitWithChangeContext(ctx, store.CheckTimeout(cfg.CheckTimeout))
 				if ctx.Err() != nil {
 					return
 				}
@@ -393,6 +394,7 @@ func main() {
 	})
 
 	status := NewStatusServerWithAdminCredentialsAndCoordinator(pool, store, coordinator, cfg.AdminUser, cfg.AdminPass)
+	status.SetCheckDefaults(cfg.CheckTimeout, cfg.MaxConcurrent, cfg.MaxCandidates, cfg.RequireIPChange)
 	listenerManager := NewListenerManager(
 		cfg.ListenAddr, pool, store, cfg.SOCKSUser, cfg.SOCKSPass, cfg.MaxClientConnections,
 	)
@@ -451,7 +453,7 @@ func reCheckAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator 
 }
 
 func reCheckAliveContext(ctx context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
-	_, _ = reCheckNodesContext(ctx, cfg, store, pool, coordinator, pool.RecheckCandidates(cfg.MaxCandidates), pool.Size(), "recheck", "")
+	_, _ = reCheckNodesContext(ctx, cfg, store, pool, coordinator, pool.RecheckCandidates(store.MaxCandidates(cfg.MaxCandidates)), pool.Size(), "recheck", "")
 }
 
 func reCheckAllAlive(cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator) {
@@ -505,7 +507,12 @@ func reCheckNodesContext(parent context.Context, cfg *Config, store *ConfigStore
 		cancelWork()
 	}()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, cfg.MaxConcurrent)
+	// Read the effective check options once per cycle: dashboard overrides win
+	// over the CLI flags, and a mid-cycle change applies to the next cycle.
+	maxConcurrent := store.MaxConcurrent(cfg.MaxConcurrent)
+	checkTimeout := store.CheckTimeout(cfg.CheckTimeout)
+	requireIPChange := store.RequireIPChange(cfg.RequireIPChange)
+	sem := make(chan struct{}, maxConcurrent)
 	baseline := BaselineExitIP()
 	var outcomeMu sync.Mutex
 	checked := make([]Proxy, 0, len(nodes))
@@ -525,9 +532,9 @@ checkLoop:
 		go func(px Proxy) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			nodeContext, cancelNode := context.WithTimeout(workContext, cfg.CheckTimeout)
+			nodeContext, cancelNode := context.WithTimeout(workContext, checkTimeout)
 			defer cancelNode()
-			verified, reachable, latency := checkCredentialCandidates(nodeContext, px, testURL, cfg.CheckTimeout)
+			verified, reachable, latency := checkCredentialCandidates(nodeContext, px, testURL, checkTimeout)
 			if workContext.Err() != nil {
 				return
 			}
@@ -535,12 +542,12 @@ checkLoop:
 			exitIP := ""
 			ipChangeKnown := false
 			ipChanged := false
-			if reachable && cfg.RequireIPChange {
-				exitIP = recheckProbeExitIP(nodeContext, verified, cfg.CheckTimeout)
+			if reachable && requireIPChange {
+				exitIP = recheckProbeExitIP(nodeContext, verified, checkTimeout)
 				if workContext.Err() != nil {
 					return
 				}
-				policy := evaluateIPChangePolicy(exitIP, baseline, cfg.RequireIPChange)
+				policy := evaluateIPChangePolicy(exitIP, baseline, requireIPChange)
 				ipChangeKnown = policy.IPChangeKnown
 				ipChanged = policy.IPChanged
 				policyAllowed = policy.PolicyAllowed
@@ -699,14 +706,15 @@ sendJobs:
 	// deterministically through the entire source inventory instead of
 	// retrying the same failing prefix forever.
 	candidates := healthInventory
-	if len(candidates) > cfg.MaxCandidates {
+	maxCandidates := store.MaxCandidates(cfg.MaxCandidates)
+	if len(candidates) > maxCandidates {
 		known := make(map[string]bool, pool.Size())
 		for _, px := range pool.All() {
 			known[px.Key()] = true
 		}
-		candidates = newCandidateSampler(cfg.DataDir).selectCandidates(healthInventory, known, cfg.MaxCandidates)
+		candidates = newCandidateSampler(cfg.DataDir).selectCandidates(healthInventory, known, maxCandidates)
 		log.Printf("[main] %d candidates exceed max-candidates=%d, selecting an unseen-first source/protocol-balanced rotating subset (rest deferred)",
-			len(healthInventory), cfg.MaxCandidates)
+			len(healthInventory), maxCandidates)
 	}
 	healthInventory = nil
 
@@ -725,7 +733,7 @@ sendJobs:
 	}
 	workContext, cancelWork := context.WithCancel(ctx)
 	stopHealthCancel := context.AfterFunc(healthContext, cancelWork)
-	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, store.CheckTimeout(cfg.CheckTimeout), store.MaxConcurrent(cfg.MaxConcurrent), store.RequireIPChange(cfg.RequireIPChange), testURL)
 	stopHealthCancel()
 	cancelWork()
 	finishHealthWork()
@@ -844,8 +852,9 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 			healthCandidateTotal++
 		}
 	}
-	candidates := make([]Proxy, 0, min(healthCandidateTotal, cfg.MaxCandidates))
-	if healthCandidateTotal <= cfg.MaxCandidates {
+	maxCandidates := store.MaxCandidates(cfg.MaxCandidates)
+	candidates := make([]Proxy, 0, min(healthCandidateTotal, maxCandidates))
+	if healthCandidateTotal <= maxCandidates {
 		for _, px := range deduped {
 			if includeHealthCandidate(px) {
 				candidates = append(candidates, px)
@@ -856,7 +865,7 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 		for _, px := range pool.All() {
 			known[px.Key()] = true
 		}
-		candidates = newCandidateSampler(cfg.DataDir).selectCandidatesWhere(deduped, known, cfg.MaxCandidates, includeHealthCandidate)
+		candidates = newCandidateSampler(cfg.DataDir).selectCandidatesWhere(deduped, known, maxCandidates, includeHealthCandidate)
 	}
 	// Only health-check candidates need user-facing source labels and copied
 	// provenance. Cloning this bounded work set prevents label conversion from
@@ -873,7 +882,7 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 	}
 	workContext, cancelWork := context.WithCancel(ctx)
 	stopHealthCancel := context.AfterFunc(healthContext, cancelWork)
-	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, cfg.CheckTimeout, cfg.MaxConcurrent, cfg.RequireIPChange, testURL)
+	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, store.CheckTimeout(cfg.CheckTimeout), store.MaxConcurrent(cfg.MaxConcurrent), store.RequireIPChange(cfg.RequireIPChange), testURL)
 	stopHealthCancel()
 	cancelWork()
 	finishHealthWork()

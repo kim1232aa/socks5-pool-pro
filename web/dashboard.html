@@ -69,6 +69,24 @@
       <span class="checkurl-hint">默认 HTTPS 探针必须返回 204；自定义目标必须返回 2xx，重定向不会被当作成功。更改后旧结果立即失效并全池复检。</span>
       <span id="check-url-status" class="small" role="status" aria-live="polite"></span>
     </div>
+    <div class="checkurl-bar check-options-bar">
+      <div class="field-copy"><span class="step-number">检测选项</span><label class="checkurl-label" for="opt-maxconcurrent">每轮检测的并发/超时/抽样规模</label></div>
+      <label class="small" for="opt-maxconcurrent">并发</label><input id="opt-maxconcurrent" type="number" min="1" max="512" step="1" inputmode="numeric">
+      <label class="small" for="opt-checktimeout">超时(秒)</label><input id="opt-checktimeout" type="number" min="2" max="120" step="1" inputmode="numeric">
+      <label class="small" for="opt-maxcandidates">每轮抽样</label><input id="opt-maxcandidates" type="number" min="100" max="100000" step="100" inputmode="numeric">
+      <label class="chk"><input type="checkbox" id="opt-require-ip-change"> 要求改IP（出口IP必须不同于入口）</label>
+      <label class="chk"><input type="checkbox" id="opt-require-ip-change-default" onchange="syncRequireIPChangeDefault()" checked> 跟随命令行默认</label>
+      <button id="check-options-save" type="button" class="btn-sm" data-action="save-check-options">保存检测选项</button>
+      <span class="checkurl-hint">留空/0 表示跟随命令行默认值；保存后下一轮检测生效，要求改IP 变更会立即失效旧健康结果并全池复检。</span>
+      <span id="check-options-status" class="small" role="status" aria-live="polite"></span>
+    </div>
+    <div class="checkurl-bar baseline-bar">
+      <div class="field-copy"><span class="step-number">基线出口</span><label class="checkurl-label" for="baseline-exit-ip">改IP 判定参照的基线出口 IP</label></div>
+      <span id="baseline-exit-ip" class="mono">加载中…</span>
+      <button id="baseline-refresh" type="button" class="btn-sm" data-action="refresh-baseline">刷新基线</button>
+      <span class="checkurl-hint">基线是当前节点的实测出口 IP，用于判断轮换后是否真的换了 IP。</span>
+      <span id="baseline-exit-status" class="small" role="status" aria-live="polite"></span>
+    </div>
     <div class="refresh-timeline" aria-label="刷新时间">
       <div class="timeline-item">最近完成<strong id="timeline-last">{{if .LastScrape}}{{.LastScrape}}{{else}}尚未刷新{{end}}</strong></div>
       <div class="timeline-item">下次计划<strong id="timeline-next">{{if .NextScrape}}{{.NextScrape}}{{else}}等待调度{{end}}</strong></div>
@@ -97,6 +115,8 @@
     <input id="f-country" type="hidden" value="">
     <label class="sr-only" for="f-proto">按协议筛选</label>
     <select id="f-proto" onchange="onFilterChange()"><option value="">全部协议</option><option>socks5</option><option>http</option><option value="https">https（HTTP CONNECT）</option></select>
+    <label class="sr-only" for="f-anonymity">按匿名级别筛选</label>
+    <select id="f-anonymity" onchange="onFilterChange()"><option value="">全部匿名级别</option><option value="elite">高匿 elite</option><option value="anonymous">普通匿名 anonymous</option><option value="transparent">透明 transparent</option><option value="unknown">未知（未检出）</option></select>
     <label class="sr-only" for="f-sort">节点排序方式</label>
     <select id="f-sort" onchange="onFilterChange()">
       <option value="score">按评分↓</option>

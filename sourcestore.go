@@ -126,6 +126,15 @@ type PoolConfig struct {
 	// User-settable from the dashboard so "alive" can mean whatever the user
 	// actually cares about reaching, not just Google.
 	CheckURL string `json:"check_url,omitempty"`
+	// Runtime check options. Zero means "follow the CLI startup flags"
+	// (config.go defaults); positive values override them for every later
+	// health-check cycle without a restart.
+	MaxConcurrent       int `json:"max_concurrent,omitempty"`
+	CheckTimeoutSeconds int `json:"check_timeout_seconds,omitempty"`
+	MaxCandidates       int `json:"max_candidates,omitempty"`
+	// RequireIPChange overrides the CLI -require-ip-change flag when set.
+	// nil means "follow the CLI startup flag".
+	RequireIPChange *bool `json:"require_ip_change,omitempty"`
 }
 
 // UnmarshalJSON bounds the top-level collections while they are decoded. A
@@ -166,6 +175,14 @@ func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
 			out.Listeners, err = decodeBoundedJSONArray[ListenerBinding](decoder, maxConfigListeners)
 		case "check_url":
 			err = decoder.Decode(&out.CheckURL)
+		case "max_concurrent":
+			err = decoder.Decode(&out.MaxConcurrent)
+		case "check_timeout_seconds":
+			err = decoder.Decode(&out.CheckTimeoutSeconds)
+		case "max_candidates":
+			err = decoder.Decode(&out.MaxCandidates)
+		case "require_ip_change":
+			err = decoder.Decode(&out.RequireIPChange)
 		default:
 			err = skipJSONValue(decoder)
 		}
@@ -758,6 +775,100 @@ func (cs *ConfigStore) SetCheckURL(raw string) error {
 	})
 }
 
+// Bounds for the dashboard-tunable check options. The CLI flags have no such
+// validation (a deliberate operator choice is accepted there), but the web UI
+// gets guard rails so a typo cannot stall the whole health pipeline.
+const (
+	minCheckConcurrent    = 1
+	maxCheckConcurrent    = 512
+	minCheckTimeout       = 2 * time.Second
+	maxCheckTimeout       = 120 * time.Second
+	minCheckMaxCandidates = 100
+	maxCheckMaxCandidates = 100000
+)
+
+// MaxConcurrent returns the dashboard override or fallback (the CLI flag).
+func (cs *ConfigStore) MaxConcurrent(fallback int) int {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.MaxConcurrent > 0 {
+		return cs.cfg.MaxConcurrent
+	}
+	return fallback
+}
+
+// CheckTimeout returns the dashboard override or fallback (the CLI flag).
+func (cs *ConfigStore) CheckTimeout(fallback time.Duration) time.Duration {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.CheckTimeoutSeconds > 0 {
+		return time.Duration(cs.cfg.CheckTimeoutSeconds) * time.Second
+	}
+	return fallback
+}
+
+// MaxCandidates returns the dashboard override or fallback (the CLI flag).
+func (cs *ConfigStore) MaxCandidates(fallback int) int {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.MaxCandidates > 0 {
+		return cs.cfg.MaxCandidates
+	}
+	return fallback
+}
+
+// RequireIPChange returns the dashboard override or fallback (the CLI flag).
+func (cs *ConfigStore) RequireIPChange(fallback bool) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.RequireIPChange != nil {
+		return *cs.cfg.RequireIPChange
+	}
+	return fallback
+}
+
+// CheckOptionsOverride reports which check options the dashboard explicitly
+// set (vs following the CLI flags).
+func (cs *ConfigStore) CheckOptionsOverride() (maxConcurrent, checkTimeoutSeconds, maxCandidates int, requireIPChange *bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.RequireIPChange != nil {
+		v := *cs.cfg.RequireIPChange
+		requireIPChange = &v
+	}
+	return cs.cfg.MaxConcurrent, cs.cfg.CheckTimeoutSeconds, cs.cfg.MaxCandidates, requireIPChange
+}
+
+// SetCheckOptions persists the dashboard check-option overrides atomically. A
+// zero numeric value clears that override back to the CLI flag. A nil boolean
+// leaves the require-IP-change override unchanged unless clearRequireIPChange
+// is true, which clears it back to the CLI flag. In-flight checks keep their
+// already-computed parameters.
+func (cs *ConfigStore) SetCheckOptions(maxConcurrent int, checkTimeout time.Duration, maxCandidates int, requireIPChange *bool, clearRequireIPChange bool) error {
+	if maxConcurrent < 0 || maxConcurrent > maxCheckConcurrent || maxConcurrent > 0 && maxConcurrent < minCheckConcurrent {
+		return fmt.Errorf("max_concurrent must be 0 (follow CLI) or between %d and %d", minCheckConcurrent, maxCheckConcurrent)
+	}
+	timeoutSeconds := int(checkTimeout / time.Second)
+	if checkTimeout != 0 && (checkTimeout < minCheckTimeout || checkTimeout > maxCheckTimeout) {
+		return fmt.Errorf("check_timeout must be 0 (follow CLI) or between %s and %s", minCheckTimeout, maxCheckTimeout)
+	}
+	if maxCandidates < 0 || maxCandidates > maxCheckMaxCandidates || maxCandidates > 0 && maxCandidates < minCheckMaxCandidates {
+		return fmt.Errorf("max_candidates must be 0 (follow CLI) or between %d and %d", minCheckMaxCandidates, maxCheckMaxCandidates)
+	}
+	return cs.mutate(func(c *PoolConfig) error {
+		c.MaxConcurrent = maxConcurrent
+		c.CheckTimeoutSeconds = timeoutSeconds
+		c.MaxCandidates = maxCandidates
+		if clearRequireIPChange {
+			c.RequireIPChange = nil
+		} else if requireIPChange != nil {
+			v := *requireIPChange
+			c.RequireIPChange = &v
+		}
+		return nil
+	})
+}
+
 func hasLogControlCharacters(value string) bool {
 	for _, r := range value {
 		if r < 0x20 || r == 0x7f {
@@ -774,6 +885,13 @@ func clonePoolConfig(cfg PoolConfig) PoolConfig {
 		Groups:    make([]Group, len(cfg.Groups)),
 		Listeners: append([]ListenerBinding(nil), cfg.Listeners...),
 		CheckURL:  cfg.CheckURL,
+	}
+	out.MaxConcurrent = cfg.MaxConcurrent
+	out.CheckTimeoutSeconds = cfg.CheckTimeoutSeconds
+	out.MaxCandidates = cfg.MaxCandidates
+	if cfg.RequireIPChange != nil {
+		v := *cfg.RequireIPChange
+		out.RequireIPChange = &v
 	}
 	for i, group := range cfg.Groups {
 		out.Groups[i] = cloneGroup(group)

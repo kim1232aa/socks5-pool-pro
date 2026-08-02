@@ -364,6 +364,22 @@ func (p *ProxyPool) HealthStateOf(key string) (available bool, consecutiveFailur
 	return p.proxies[index].Available, consecutiveFailures, true
 }
 
+// StatsDetailOf returns a copy of the full per-node stats record plus the
+// current routing eligibility, for the dashboard's per-node diagnostics view.
+// ok=false means the key is not in the pool.
+func (p *ProxyPool) StatsDetailOf(key string) (stats nodeStats, available bool, ok bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	index, ok := p.proxyIndexLookupLocked(key)
+	if !ok {
+		return nodeStats{}, false, false
+	}
+	if st := p.stats[key]; st != nil {
+		stats = *st
+	}
+	return stats, p.proxies[index].Available, true
+}
+
 // rebuildProxyIndexLocked rebuilds the protocol-aware key -> slice-index map.
 // Caller must hold p.mu for writing whenever p.proxies may be replaced. Keep
 // the first occurrence for defensive compatibility with legacy/corrupt cache
@@ -2076,6 +2092,18 @@ func (p *ProxyPool) IsPinned(groupName string) bool {
 // no-ops (returns ok=false) when the group is manually locked, so a user's
 // explicit node choice is never rotated away underneath them.
 func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
+	return p.rotateSticky(groupName, false)
+}
+
+// RotateStickyForced is the dashboard-triggered variant: it advances even
+// when the group is manually locked, keeping the pin so the periodic timer
+// still leaves the group alone afterwards. This is the operator's "switch
+// to the next node in this group" action.
+func (p *ProxyPool) RotateStickyForced(groupName string) (Proxy, bool) {
+	return p.rotateSticky(groupName, true)
+}
+
+func (p *ProxyPool) rotateSticky(groupName string, force bool) (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.proxies) == 0 {
@@ -2086,7 +2114,7 @@ func (p *ProxyPool) RotateSticky(groupName string) (Proxy, bool) {
 		gc = &groupCursor{}
 		p.groupState[groupName] = gc
 	}
-	if gc.pinned {
+	if gc.pinned && !force {
 		return Proxy{}, false
 	}
 

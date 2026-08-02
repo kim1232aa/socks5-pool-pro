@@ -59,41 +59,26 @@ func nodePageLightLess(a, b nodePageLight, sortBy string) bool {
 	return a.key < b.key
 }
 
-// lightMatchesFilters is the pre-materialization filter. It mirrors the
-// historical NodeView filter predicates against the light entry so rows that
-// would be discarded never become full NodeViews.
-func lightMatchesFilters(e nodePageLight, searchAddr, searchExitIP, country, protocol string, unknownCountry, onlyChanged, ipChangedKnown, ipChanged, onlyAvailable, onlyUnavailable bool, proto string) bool {
-	if searchAddr != "" || searchExitIP != "" {
-		addrField := ""
-		exitField := ""
-		// Address / ExitIP are only needed when a search term exists. We defer
-		// fetching them: caller must pass pre-lowered substrings via a closure
-		// only when search is set; for simplicity here we require the caller
-		// to have already decided search match from raw Proxy fields before
-		// invoking the collector. This function skips address search: the
-		// caller applies it before adding the entry.
-		_ = addrField
-		_ = exitField
+// validNodeAnonymity reports whether the anonymity filter value is supported.
+// Empty means "no filter"; "unknown" matches nodes with no detected anonymity.
+func validNodeAnonymity(anonymity string) bool {
+	switch anonymity {
+	case "", "elite", "anonymous", "transparent", "unknown":
+		return true
 	}
-	if country != "" && e.country != country {
-		return false
+	return false
+}
+
+// nodeAnonymityMatches applies the anonymity filter. "unknown" matches nodes
+// whose anonymity was never detected (empty); other values match exactly.
+func nodeAnonymityMatches(filter, detected string) bool {
+	if filter == "" {
+		return true
 	}
-	if unknownCountry && !e.unknownCountry {
-		return false
+	if filter == "unknown" {
+		return detected == ""
 	}
-	if protocol != "" && strings.ToLower(proto) != protocol {
-		return false
-	}
-	if onlyChanged && !(ipChangedKnown && ipChanged) {
-		return false
-	}
-	if onlyAvailable && !e.available {
-		return false
-	}
-	if onlyUnavailable && e.available {
-		return false
-	}
-	return true
+	return detected == filter
 }
 
 func (s *StatusServer) handleNodesPage(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +88,10 @@ func (s *StatusServer) handleNodesPage(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateCountryQuery(r); err != nil {
 		writeErrCode(w, http.StatusBadRequest, "invalid_country", err)
+		return
+	}
+	if anonymity := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("anonymity"))); !validNodeAnonymity(anonymity) {
+		writeErrCode(w, http.StatusBadRequest, "invalid_anonymity", fmt.Errorf("anonymity must be one of elite, anonymous, transparent, unknown"))
 		return
 	}
 	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" {
@@ -144,6 +133,7 @@ func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
 		country = normalizedNodeCountry(countryRaw)
 	}
 	protocol := strings.ToLower(strings.TrimSpace(query.Get("protocol")))
+	anonymity := strings.ToLower(strings.TrimSpace(query.Get("anonymity")))
 	onlyChanged := nodeQueryEnabled(query.Get("only_changed"))
 	onlyAvailable := nodeQueryEnabled(query.Get("available")) || nodeQueryEnabled(query.Get("hide_unavailable"))
 	onlyUnavailable := !onlyAvailable && nodeQueryEnabled(query.Get("unavailable"))
@@ -159,6 +149,9 @@ func (s *StatusServer) buildNodePage(r *http.Request) NodePageResponse {
 			return false
 		}
 		if protocol != "" && strings.ToLower(px.Protocol) != protocol {
+			return false
+		}
+		if !nodeAnonymityMatches(anonymity, strings.ToLower(px.Anonymity)) {
 			return false
 		}
 		if onlyChanged && !(px.IPChangeKnown && px.IPChanged) {

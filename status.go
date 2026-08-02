@@ -44,6 +44,39 @@ type StatusServer struct {
 	// reverse proxy or container bridge. It never accepts CIDRs and is consulted
 	// only when admin authentication is disabled.
 	trustedManagementProxies map[string]struct{}
+	// CLI fallbacks for the dashboard check options; set once from main via
+	// SetCheckDefaults. Zero values mean the config.go flag defaults.
+	checkTimeoutFallback    time.Duration
+	checkConcurrentFallback int
+	checkCandidatesFallback int
+	requireIPChangeFallback bool
+}
+
+// SetCheckDefaults records the CLI flag values the dashboard check options
+// fall back to when no override is stored. Call once at startup.
+func (s *StatusServer) SetCheckDefaults(timeout time.Duration, maxConcurrent, maxCandidates int, requireIPChange bool) {
+	s.checkTimeoutFallback = timeout
+	s.checkConcurrentFallback = maxConcurrent
+	s.checkCandidatesFallback = maxCandidates
+	s.requireIPChangeFallback = requireIPChange
+}
+
+// effectiveCheckOptions resolves store overrides over the CLI fallbacks.
+func (s *StatusServer) effectiveCheckOptions() (timeout time.Duration, maxConcurrent, maxCandidates int, requireIPChange bool) {
+	timeout, maxConcurrent, maxCandidates, requireIPChange = s.checkTimeoutFallback, s.checkConcurrentFallback, s.checkCandidatesFallback, s.requireIPChangeFallback
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	if maxConcurrent == 0 {
+		maxConcurrent = 20
+	}
+	if maxCandidates == 0 {
+		maxCandidates = 3000
+	}
+	if s.store == nil {
+		return timeout, maxConcurrent, maxCandidates, requireIPChange
+	}
+	return s.store.CheckTimeout(timeout), s.store.MaxConcurrent(maxConcurrent), s.store.MaxCandidates(maxCandidates), s.store.RequireIPChange(requireIPChange)
 }
 
 // apiBootNonce prevents generation counters that restart at zero from making a
@@ -169,6 +202,8 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/refresh/status", requireGet(s.handleRefreshStatus))
 	mux.HandleFunc("/api/health-recheck/status", requireGet(s.handleHealthRecheckStatus))
 	mux.HandleFunc("/api/settings/check-url", s.handleCheckURL)
+	mux.HandleFunc("/api/settings/check-options", s.handleCheckOptions)
+	mux.HandleFunc("/api/settings/baseline-exit", s.handleBaselineExit)
 
 	mux.HandleFunc("/api/nodes", requireGet(s.handleNodes))
 	mux.HandleFunc("/api/nodes/page", s.handleNodesPage)
@@ -178,6 +213,8 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/proxyip/verify", requirePost(s.handleProxyIPVerify))
 	mux.HandleFunc("/api/nodes/switch", requirePost(s.handleNodeSwitch))
 	mux.HandleFunc("/api/nodes/auto", requirePost(s.handleNodeAuto))
+	mux.HandleFunc("/api/nodes/rotate", s.handleNodeRotate)
+	mux.HandleFunc("/api/nodes/stats", s.handleNodeStats)
 	mux.HandleFunc("/api/nodes/verify", requirePost(s.handleNodeVerify))
 	mux.HandleFunc("/api/nodes/clear-unavailable", requirePost(s.handleNodesClearUnavailable))
 	mux.HandleFunc("/api/nodes/delete", requirePost(s.handleNodesDelete))

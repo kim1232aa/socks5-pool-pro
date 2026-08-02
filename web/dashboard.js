@@ -1516,6 +1516,7 @@ function applyNodeView() {
         (ops.verify
           ? '<button type="button" class="btn-sm" data-action="verify" aria-disabled="true">验证中...</button>'
           : '<button type="button" class="btn-sm" data-action="verify" title="立即重新拨号,查看真实出口IP/国家是否和标签一致" aria-label="验证节点 ' + escapeHtml(n.addr) + '">验证</button>') +
+        '<button type="button" class="btn-sm" data-action="node-stats" data-key="' + escapeHtml(n.key) + '" title="查看累计转发成功/失败、连续健康失败和恢复条件" aria-label="查看节点 ' + escapeHtml(n.addr) + ' 统计">统计</button>' +
         '<button type="button" class="btn-sm danger" data-action="delete-node" aria-label="删除节点 ' + escapeHtml(n.addr) + '">删除</button>' +
         '<button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (rowExpanded ? 'true' : 'false') + '">' + (rowExpanded ? '收起' : '详情') + '</button></div>';
       var selected = !!selectedNodeURLs[String(n.key || '')];
@@ -1548,8 +1549,8 @@ function applyNodeView() {
 
   if (banner) {
     var lockUI = anyPinned
-      ? '<span class="lock-badge">🔒 手动锁定</span><button type="button" class="btn-sm" data-action="set-auto">恢复自动轮换</button>'
-      : '<span class="auto-badge">🔄 自动轮换中</span>';
+      ? '<span class="lock-badge">🔒 手动锁定</span><button type="button" class="btn-sm" data-action="rotate-node">轮换下一个</button><button type="button" class="btn-sm" data-action="set-auto">恢复自动轮换</button>'
+      : '<span class="auto-badge">🔄 自动轮换中</span><button type="button" class="btn-sm" data-action="rotate-node">轮换下一个</button>';
     var body = active
       ? escapeHtml(active.addr) + '<span class="cn-meta">' + protoBadge(active.protocol) + ' 出口 ' + escapeHtml(active.exit_ip || '?') + ' ' + escapeHtml(active.country || '') + '</span>'
       : '无可用节点';
@@ -1788,10 +1789,12 @@ function nodePageURL() {
   var text = (requiredControl('f-text').value || '').trim();
   var country = requiredControl('f-country').value;
   var protocol = requiredControl('f-proto').value;
+  var anonymity = requiredControl('f-anonymity').value;
   var sort = requiredControl('f-sort').value;
   if (text) q.push('search=' + encodeURIComponent(text));
   if (country) q.push('country=' + encodeURIComponent(country));
   if (protocol) q.push('protocol=' + encodeURIComponent(protocol));
+  if (anonymity) q.push('anonymity=' + encodeURIComponent(anonymity));
   if (sort) q.push('sort=' + encodeURIComponent(sort));
   if (requiredControl('f-ipchanged').checked) q.push('only_changed=1');
   if (nodeAvailabilityFilter === 'available') q.push('available=1');
@@ -2095,6 +2098,132 @@ function saveCheckURL(button) {
     .finally(function() {
       if (button) { button.disabled = false; button.textContent = original; }
     });
+}
+
+function syncRequireIPChangeDefault() {
+  var followDefault = document.getElementById('opt-require-ip-change-default');
+  var requireIPChange = document.getElementById('opt-require-ip-change');
+  if (followDefault && requireIPChange) requireIPChange.disabled = followDefault.checked;
+}
+
+function loadCheckOptions() {
+  fetchJSON('/api/settings/check-options').then(function(result) {
+    if (!result) return;
+    var overrides = result.overrides || {};
+    var mc = document.getElementById('opt-maxconcurrent');
+    var ct = document.getElementById('opt-checktimeout');
+    var cand = document.getElementById('opt-maxcandidates');
+    var ric = document.getElementById('opt-require-ip-change');
+    var ricDefault = document.getElementById('opt-require-ip-change-default');
+    if (mc) { mc.value = Number(overrides.max_concurrent || 0) || ''; mc.placeholder = String(result.max_concurrent || ''); }
+    if (ct) { ct.value = Number(overrides.check_timeout_seconds || 0) || ''; ct.placeholder = String(result.check_timeout_seconds || ''); }
+    if (cand) { cand.value = Number(overrides.max_candidates || 0) || ''; cand.placeholder = String(result.max_candidates || ''); }
+    if (ric) ric.checked = !!result.require_ip_change;
+    if (ricDefault) ricDefault.checked = overrides.require_ip_change === 'default' || overrides.require_ip_change == null;
+    syncRequireIPChangeDefault();
+  }).catch(function() {});
+}
+
+function saveCheckOptions(button) {
+  var statusEl = document.getElementById('check-options-status');
+  function intOf(id) {
+    var raw = (document.getElementById(id).value || '').trim();
+    if (!raw) return 0;
+    var n = Number(raw);
+    return isFinite(n) ? Math.floor(n) : -1;
+  }
+  var maxConcurrent = intOf('opt-maxconcurrent');
+  var checkTimeout = intOf('opt-checktimeout');
+  var maxCandidates = intOf('opt-maxcandidates');
+  if (maxConcurrent < 0 || checkTimeout < 0 || maxCandidates < 0) { notify('检测选项必须是数字', 'error'); return; }
+  var followDefault = !!(document.getElementById('opt-require-ip-change-default') || {}).checked;
+  var payload = {
+    max_concurrent: maxConcurrent,
+    check_timeout_seconds: checkTimeout,
+    max_candidates: maxCandidates,
+    require_ip_change: followDefault ? 'default' : !!(document.getElementById('opt-require-ip-change') || {}).checked
+  };
+  var original = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = '保存中…'; }
+  fetchJSON('/api/settings/check-options', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+    .then(function(result) {
+      var recheck = result && result.health_recheck && result.health_recheck.id;
+      var message = result && result.policy_changed
+        ? '已保存；要求改IP 策略已变更，旧健康结果失效，正在全池复检。'
+        : '已保存；并发/超时/抽样从下一轮检测开始生效。';
+      if (result && result.baseline_refresh_attempted && !result.baseline_refreshed) {
+        message += ' 基线刷新失败，暂保留旧基线；可稍后手动刷新。';
+      }
+      if (statusEl) statusEl.textContent = message;
+      notify(message, result && result.baseline_refresh_attempted && !result.baseline_refreshed ? 'error' : 'success', 7000);
+      loadCheckOptions();
+      loadBaselineExit();
+      pollStatus(true);
+      if (recheck) pollHealthRecheck(result.health_recheck.id);
+    })
+    .catch(function(err) { notify(err, 'error', 7000); })
+    .finally(function() {
+      if (button) { button.disabled = false; button.textContent = original; }
+    });
+}
+
+function loadBaselineExit() {
+  fetchJSON('/api/settings/baseline-exit').then(function(result) {
+    var ip = result && result.baseline_ip;
+    setText('baseline-exit-ip', ip || '（尚未建立基线）');
+  }).catch(function() { setText('baseline-exit-ip', '获取失败'); });
+}
+
+function refreshBaselineExit(button) {
+  var statusEl = document.getElementById('baseline-exit-status');
+  var original = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = '刷新中…'; }
+  fetchJSON('/api/settings/baseline-exit', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(result) {
+      var ip = result && result.baseline_ip;
+      setText('baseline-exit-ip', ip || '（刷新后仍无基线）');
+      var succeeded = !!(result && result.success);
+      var message = succeeded
+        ? '基线出口已刷新为 ' + (ip || '未知') + (result.policy_changed ? '；旧健康结果已失效，正在全池复检。' : '。')
+        : '基线刷新失败' + (ip ? '，当前仍使用旧基线 ' + ip : '，当前没有可用基线') + '。';
+      if (statusEl) statusEl.textContent = message;
+      notify(message, succeeded ? 'success' : 'error', 7000);
+      var recheck = result && result.health_recheck && result.health_recheck.id;
+      if (recheck) pollHealthRecheck(recheck);
+    })
+    .catch(function(err) { notify(err, 'error', 7000); })
+    .finally(function() {
+      if (button) { button.disabled = false; button.textContent = original; }
+    });
+}
+
+function rotateNode(button) {
+  var original = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = '轮换中…'; }
+  fetchJSON('/api/nodes/rotate', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(result) {
+      var node = result && result.node;
+      notify(node && node.addr ? '已轮换到 ' + node.addr : '已轮换到下一个节点', 'success');
+      pollStatus(true);
+    })
+    .catch(function(err) { notify(err, 'error', 7000); })
+    .finally(function() {
+      if (button) { button.disabled = false; button.textContent = original; }
+    });
+}
+
+function showNodeStats(key) {
+  if (!key) return;
+  fetchJSON('/api/nodes/stats?key=' + encodeURIComponent(key)).then(function(stats) {
+    var lines = [
+      '累计转发成功/失败: ' + (stats.successes || 0) + ' / ' + (stats.failures || 0),
+      '连续健康失败: ' + (stats.consecutive_health_failures || 0) + (stats.health_failure_terminal ? '（已达终态，需人工验证恢复）' : ''),
+      '最近健康成功: ' + (stats.last_health_success_at || '从未'),
+      '最近延迟: ' + (stats.last_latency_ms ? stats.last_latency_ms + 'ms' : '-'),
+      '当前可用: ' + (stats.available ? '是' : '否')
+    ];
+    showResultDialog('节点统计', lines.join('\n'));
+  }).catch(function(err) { notify(err, 'error', 7000); });
 }
 
 function pollHealthRecheck(jobID) {
@@ -2454,6 +2583,11 @@ document.addEventListener('click', function(event) {
     case 'refresh': doRefresh(actionElement); break;
     case 'show-candidate-protocol': showCandidateProtocol(actionElement.getAttribute('data-protocol')); break;
     case 'save-check-url': saveCheckURL(actionElement); break;
+    case 'save-check-options': saveCheckOptions(actionElement); break;
+    case 'refresh-baseline': refreshBaselineExit(actionElement); break;
+    case 'rotate-node': rotateNode(actionElement); break;
+    case 'node-stats': showNodeStats(actionElement.getAttribute('data-key') || ''); break;
+    case 'set-auto': setAuto(); break;
     case 'open-node-country-picker': openNodeCountryPicker(); break;
     case 'open-candidate-country-picker': openCandidateCountryPicker(); break;
     case 'export-nodes': exportNodes(actionElement.getAttribute('data-format')); break;
@@ -2524,6 +2658,8 @@ document.addEventListener('click', function(event) {
 syncNodePageSizeSelect();
 syncCandidatePageSizeSelect();
 syncTabFromHash();
+loadCheckOptions();
+loadBaselineExit();
 pollStatus(false);
 schedulePoll(15000);
 

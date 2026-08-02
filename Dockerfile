@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26.5-alpine3.24@sha256:39c3b17beedd6642dcd418279a3a24d1b76b355302921a35952320bd2d9b15ba AS builder
+FROM golang:1.26.5-alpine3.24@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
 WORKDIR /app
 COPY go.mod ./
 COPY *.go ./
@@ -7,7 +7,7 @@ COPY web ./web
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o socks5-pool .
 
 # Run stage
-FROM alpine:3.24.1@sha256:23405d96454ccc13b5e1a1ba2bab66e3659b703eb6d8df98befca4c93248ff0e
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 RUN apk --no-cache add ca-certificates=20260611-r0 su-exec=0.3-r0 \
     && addgroup -S -g 10001 socks5 \
     && adduser -S -D -H -u 10001 -G socks5 socks5 \
