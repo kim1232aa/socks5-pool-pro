@@ -180,7 +180,7 @@ https://www.google.com/generate_204
 | `plain-list` | 每行一个 `host:port` | 必须指定 `socks5`、`http` 或 `https` |
 | `json-array` | `host:port` 字符串数组 | 必须指定 `socks5`、`http` 或 `https` |
 
-初始配置包含 EDT-Pages、Proxifly、Monosans、Fyvri 和 socks5-proxy.github.io 等普通来源；内置 ProxyIP 来源默认关闭，可按需启用。
+初始配置包含 EDT-Pages、Proxifly、Monosans、Fyvri、Databay、ProxyScrape、TheSpeedX、VPSLab、gproxynet、ProxyGenerator 和 socks5-proxy.github.io 等普通来源；内置 ProxyIP 来源默认关闭，可按需启用。同一来源内及跨来源的重复地址会按协议感知 key（`protocol://host:port`）合并；同一 `host:port` 的 HTTP 与 SOCKS5 仍作为不同候选保留。
 
 新增远程来源示例：
 

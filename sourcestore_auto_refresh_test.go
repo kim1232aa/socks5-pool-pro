@@ -128,3 +128,69 @@ func TestDefaultSourcesEnableAutoRefresh(t *testing.T) {
 		}
 	}
 }
+
+func TestAdditionalDefaultProxySourcesContract(t *testing.T) {
+	type expectedSource struct {
+		url, format, protocol string
+	}
+	expected := map[string]expectedSource{
+		"builtin-databay-http":          {"https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt", FormatPlainList, "http"},
+		"builtin-databay-socks5":        {"https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt", FormatPlainList, "socks5"},
+		"builtin-proxyscrape-http":      {"https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt", FormatTextRegex, ""},
+		"builtin-proxyscrape-socks5":    {"https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt", FormatTextRegex, ""},
+		"builtin-thespeedx-http":        {"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt", FormatPlainList, "http"},
+		"builtin-thespeedx-socks5":      {"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt", FormatPlainList, "socks5"},
+		"builtin-vpslab-http":           {"https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_all.txt", FormatPlainList, "http"},
+		"builtin-vpslab-socks5":         {"https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5_all.txt", FormatPlainList, "socks5"},
+		"builtin-gproxynet-http":        {"https://raw.githubusercontent.com/gproxynet/free-proxy-list/main/http.txt", FormatPlainList, "http"},
+		"builtin-gproxynet-socks5":      {"https://raw.githubusercontent.com/gproxynet/free-proxy-list/main/socks5.txt", FormatPlainList, "socks5"},
+		"builtin-proxygenerator-http":   {"https://raw.githubusercontent.com/proxygenerator1/ProxyGenerator/main/Stable/http.txt", FormatPlainList, "http"},
+		"builtin-proxygenerator-socks5": {"https://raw.githubusercontent.com/proxygenerator1/ProxyGenerator/main/MostStable/socks5.txt", FormatPlainList, "socks5"},
+	}
+
+	sources := defaultPoolConfig().Sources
+	if len(sources) > maxConfiguredSources {
+		t.Fatalf("default source count = %d, max = %d", len(sources), maxConfiguredSources)
+	}
+	seenIDs := make(map[string]bool, len(sources))
+	seenURLs := make(map[string]string, len(sources))
+	for _, source := range sources {
+		if seenIDs[source.ID] {
+			t.Fatalf("duplicate default source ID %q", source.ID)
+		}
+		seenIDs[source.ID] = true
+		if other := seenURLs[source.URL]; other != "" {
+			t.Fatalf("duplicate default source URL %q on %q and %q", source.URL, other, source.ID)
+		}
+		seenURLs[source.URL] = source.ID
+		want, ok := expected[source.ID]
+		if !ok {
+			continue
+		}
+		if source.URL != want.url || source.Format != want.format || source.Protocol != want.protocol || !source.Builtin || !source.Enabled || !source.AutoRefreshEnabled {
+			t.Fatalf("default source %q = %#v, want URL=%q format=%q protocol=%q enabled builtin auto-refresh", source.ID, source, want.url, want.format, want.protocol)
+		}
+		delete(expected, source.ID)
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing additional default sources: %#v", expected)
+	}
+}
+
+func TestAdditionalSourceFormatsRecognizeRepresentativeRows(t *testing.T) {
+	plain, err := parsePlainList([]byte("# generated\n51.159.28.39:80\n\n[2001:4860:4860::8888]:1080\n"), "http")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain) != 2 || plain[0].Protocol != "http" || plain[0].Addr() != "51.159.28.39:80" || plain[1].Addr() != "[2001:4860:4860::8888]:1080" {
+		t.Fatalf("plain-list parsed = %#v", plain)
+	}
+
+	withScheme, err := parseTextRegex([]byte("http://95.211.64.139:8888\nsocks5://46.146.216.44:1080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withScheme) != 2 || withScheme[0].Protocol != "http" || withScheme[1].Protocol != "socks5" {
+		t.Fatalf("text-regex parsed = %#v", withScheme)
+	}
+}
