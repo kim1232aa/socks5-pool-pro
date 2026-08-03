@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,12 +61,13 @@ func TestCandidateCatalogCacheRoundTripRetainsCredentialsAndRestoresReadiness(t 
 	}
 	snapshot.mu.RLock()
 	wantGeneration := snapshot.generation
-	if snapshot.phase != "complete" || snapshot.revision != 2 || len(snapshot.records) != 1 {
-		t.Fatalf("restored snapshot phase=%q revision=%d records=%d", snapshot.phase, snapshot.revision, len(snapshot.records))
+	if snapshot.phase != "complete" || snapshot.revision != 2 || len(snapshot.records) != 0 || len(snapshot.failedRecords) != 1 {
+		t.Fatalf("restored snapshot phase=%q revision=%d records=%d failures=%d", snapshot.phase, snapshot.revision, len(snapshot.records), len(snapshot.failedRecords))
 	}
-	record := snapshot.records[0]
-	if !record.hasAuth || record.username != secretUser || record.password != secretPass || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
-		t.Fatalf("restored compact record = %#v", record)
+	failure := snapshot.failedRecords[0]
+	record := failure.candidateRecord
+	if failure.kind != candidateFailureUnreachable || !record.hasAuth || record.username != secretUser || record.password != secretPass || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
+		t.Fatalf("restored failed compact record = %#v", failure)
 	}
 	snapshot.mu.RUnlock()
 
@@ -77,12 +79,25 @@ func TestCandidateCatalogCacheRoundTripRetainsCredentialsAndRestoresReadiness(t 
 	if ready.Code != http.StatusOK {
 		t.Fatalf("readiness after cache restore = %d body=%q", ready.Code, ready.Body.String())
 	}
-	page, raw := getCandidatePage(t, handler, "/api/candidates/page?page_size=100")
-	if page.CandidateTotal != 1 || !page.Candidates[0].HasAuth || page.Candidates[0].Country != "JP" || page.Candidates[0].City != "Tokyo" {
-		t.Fatalf("restored API page = %#v", page)
+	candidatePage, _ := getCandidatePage(t, handler, "/api/candidates/page?page_size=100")
+	if candidatePage.CandidateTotal != 0 || len(candidatePage.Candidates) != 0 {
+		t.Fatalf("restored failure returned to pending API page = %#v", candidatePage)
 	}
-	if !strings.Contains(raw, secretUser) || !strings.Contains(raw, secretPass) || page.Candidates[0].Username != secretUser || page.Candidates[0].Password != secretPass || page.Candidates[0].ProxyURL != proxy.ConsumerURL() {
-		t.Fatalf("restored candidate API omitted credentials: %#v raw=%s", page.Candidates[0], raw)
+	failedRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(failedRecorder, localTestRequest(http.MethodGet, "/api/failed-candidates?page_size=100", nil))
+	if failedRecorder.Code != http.StatusOK {
+		t.Fatalf("restored failure API = %d %s", failedRecorder.Code, failedRecorder.Body.String())
+	}
+	var failedPage FailedCandidatePageResponse
+	if err := json.Unmarshal(failedRecorder.Body.Bytes(), &failedPage); err != nil {
+		t.Fatal(err)
+	}
+	if failedPage.FailedTotal != 1 || len(failedPage.FailedCandidates) != 1 {
+		t.Fatalf("restored failure API page = %#v", failedPage)
+	}
+	got := failedPage.FailedCandidates[0]
+	if got.FailureType != "unreachable" || !got.HasAuth || got.Country != "JP" || got.City != "Tokyo" || got.Username != secretUser || got.Password != secretPass || got.ProxyURL != proxy.ConsumerURL() || !strings.Contains(failedRecorder.Body.String(), secretUser) || !strings.Contains(failedRecorder.Body.String(), secretPass) {
+		t.Fatalf("restored failure API omitted metadata or credentials: %#v raw=%s", got, failedRecorder.Body.String())
 	}
 
 	next := restored.begin([]Proxy{proxy}, labels, nil, 0)
@@ -339,16 +354,16 @@ const (
 	candidateCacheV2Golden = "H4sIAAAAAAAC/wsOcHb0czEwZGJgYNBkgAB2KM0BxMn5uQU5qSWpEBEts39zposzvFhQJzoXSF8QP64DpBmBMtxAXJxfWpScqpuom5nCCNUeDBZScATxWYA4o6SkgAlqPIj2CoDxWIE4JD+7Mp8RKgCieYDYQg8MrSwMLAxAtuSkpicmV+qWFqcWIXELEouLYboYofoZGRkZPgaDnZ4CpQE16EdV7wAAAA=="
 )
 
-func TestCandidateCacheLegacyGoldenMigrationToV3(t *testing.T) {
+func TestCandidateCacheLegacyGoldenMigrationToV4(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		golden   string
-		username string
-		password string
-		status   CandidateStatus
+		name        string
+		golden      string
+		username    string
+		password    string
+		failureKind CandidateFailureKind
 	}{
-		{name: "v1 historical layout", golden: candidateCacheV1Golden, status: candidateDeferred},
-		{name: "v2 credential layout", golden: candidateCacheV2Golden, username: "legacy-user", password: "legacy-pass", status: candidateCheckedFailed},
+		{name: "v1 historical layout", golden: candidateCacheV1Golden},
+		{name: "v2 failed credential layout", golden: candidateCacheV2Golden, username: "legacy-user", password: "legacy-pass", failureKind: candidateFailureUnreachable},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -368,11 +383,19 @@ func TestCandidateCacheLegacyGoldenMigrationToV3(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load legacy golden: %v", err)
 			}
-			if len(snapshot.records) != 1 {
-				t.Fatalf("legacy records = %d, want 1", len(snapshot.records))
+			var record candidateRecord
+			if test.failureKind == 0 {
+				if len(snapshot.records) != 1 || len(snapshot.failedRecords) != 0 {
+					t.Fatalf("legacy pending/failure records = %d/%d, want 1/0", len(snapshot.records), len(snapshot.failedRecords))
+				}
+				record = snapshot.records[0]
+			} else {
+				if len(snapshot.records) != 0 || len(snapshot.failedRecords) != 1 || snapshot.failedRecords[0].kind != test.failureKind {
+					t.Fatalf("legacy pending/failure records = %d/%#v, want migrated failure", len(snapshot.records), snapshot.failedRecords)
+				}
+				record = snapshot.failedRecords[0].candidateRecord
 			}
-			record := snapshot.records[0]
-			if snapshot.generation != 41 || snapshot.revision != 7 || snapshot.phase != "complete" || snapshot.sourceErrors != 0 || len(snapshot.sourceRefs) != 1 || snapshot.sourceRefs[0] != 0 || snapshot.protocols[record.protocolID] != "http" || record.addr != "8.8.8.8:8080" || record.username != test.username || record.password != test.password || !record.hasAuth || record.status != test.status || record.continent != encodeContinent("AS") || snapshot.sourceKeys[0] != "source-a-id" || snapshot.sources[0] != "Source A" || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
+			if snapshot.generation != 41 || snapshot.revision != 7 || snapshot.phase != "complete" || snapshot.sourceErrors != 0 || len(snapshot.sourceRefs) != 1 || snapshot.sourceRefs[0] != 0 || snapshot.protocols[record.protocolID] != "http" || record.addr != "8.8.8.8:8080" || record.username != test.username || record.password != test.password || !record.hasAuth || record.status != candidateDeferred || record.continent != encodeContinent("AS") || snapshot.sourceKeys[0] != "source-a-id" || snapshot.sources[0] != "Source A" || snapshot.countries[record.countryID] != "JP" || snapshot.cities[record.cityID] != "Tokyo" {
 				t.Fatalf("legacy record was not fully decoded: record=%#v snapshot=%#v", record, snapshot)
 			}
 			if info, err := os.Stat(cache.path); err != nil || info.Mode().Perm() != 0o600 {
@@ -380,7 +403,7 @@ func TestCandidateCacheLegacyGoldenMigrationToV3(t *testing.T) {
 			}
 
 			if err := cache.save(snapshot); err != nil {
-				t.Fatalf("save migrated v3 cache: %v", err)
+				t.Fatalf("save migrated v4 cache: %v", err)
 			}
 			decoded := readCandidateCacheDecoded(t, cache.path)
 			if got := binary.LittleEndian.Uint16(decoded[len(candidateCacheMagic):]); got != candidateCacheVersion {
@@ -388,17 +411,20 @@ func TestCandidateCacheLegacyGoldenMigrationToV3(t *testing.T) {
 			}
 			reloaded, err := cache.load()
 			if err != nil {
-				t.Fatalf("reload migrated v3 cache: %v", err)
+				t.Fatalf("reload migrated v4 cache: %v", err)
 			}
-			reloadedRecord := reloaded.records[0]
-			if reloaded.generation != snapshot.generation || reloaded.revision != snapshot.revision || reloaded.phase != snapshot.phase || reloadedRecord.addr != record.addr || reloadedRecord.username != record.username || reloadedRecord.password != record.password || reloadedRecord.hasAuth != record.hasAuth || reloadedRecord.status != record.status || reloadedRecord.seenUnix != record.seenUnix || reloadedRecord.checkedUnix != record.checkedUnix || reloaded.sourceKeys[0] != snapshot.sourceKeys[0] || reloaded.sources[0] != snapshot.sources[0] || reloaded.countries[reloadedRecord.countryID] != "JP" || reloaded.cities[reloadedRecord.cityID] != "Tokyo" {
-				t.Fatalf("v3 migration lost data: before=%#v after=%#v", record, reloadedRecord)
+			if test.failureKind == 0 {
+				if len(reloaded.records) != 1 || len(reloaded.failedRecords) != 0 || reloaded.records[0].addr != record.addr || reloaded.records[0].username != record.username || reloaded.records[0].password != record.password {
+					t.Fatalf("v4 pending migration lost data: before=%#v after=%#v", record, reloaded)
+				}
+			} else if len(reloaded.records) != 0 || len(reloaded.failedRecords) != 1 || reloaded.failedRecords[0].kind != test.failureKind || reloaded.failedRecords[0].addr != record.addr || reloaded.failedRecords[0].username != record.username || reloaded.failedRecords[0].password != record.password {
+				t.Fatalf("v4 failure migration lost data: before=%#v after=%#v", record, reloaded)
 			}
 		})
 	}
 }
 
-func TestCandidateCacheV3RoundTripRetainsBoundedCredentialAlternates(t *testing.T) {
+func TestCandidateCacheV4RoundTripRetainsBoundedCredentialAlternates(t *testing.T) {
 	dir := t.TempDir()
 	cache := newCandidateCatalogCache(dir)
 	catalog := &CandidateCatalog{}
@@ -440,7 +466,49 @@ func TestCandidateCacheV3RoundTripRetainsBoundedCredentialAlternates(t *testing.
 	}
 }
 
-func TestCandidateCacheV3RejectsInvalidAlternateRanges(t *testing.T) {
+func TestCandidateCacheV4RoundTripRetainsFailureKindErrorAndAlternates(t *testing.T) {
+	dir := t.TempDir()
+	catalog := &CandidateCatalog{}
+	catalog.SetDiskCache(newCandidateCatalogCache(dir))
+	failed := Proxy{
+		IP: "8.8.8.82", Port: "1080", Protocol: "socks5", Username: "primary", Password: "secret",
+		SourceName: "failure-source", Country: "US", City: "Ashburn", Continent: "NA",
+		CredentialAlternates: []ProxyCredential{{Username: "alternate", Password: "other"}},
+	}
+	catalog.begin([]Proxy{failed}, nil, nil, 0)
+	leases := catalog.LeasePending(1, nil)
+	if len(leases) != 1 {
+		t.Fatalf("pending lease = %#v", leases)
+	}
+	if err := catalog.CommitLeaseOutcomes(leases, map[string]candidateCheckOutcome{
+		failed.Key(): {Key: failed.Key(), Proxy: failed, Kind: candidateCheckPolicyFiltered, Error: "exit IP did not change"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := &CandidateCatalog{}
+	restored.SetDiskCache(newCandidateCatalogCache(dir))
+	loaded, err := restored.LoadDiskCache()
+	if err != nil || !loaded {
+		t.Fatalf("LoadDiskCache() = (%v, %v)", loaded, err)
+	}
+	snapshot := restored.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.records) != 0 || len(snapshot.failedRecords) != 1 {
+		t.Fatalf("restored pending/failures = %d/%d", len(snapshot.records), len(snapshot.failedRecords))
+	}
+	failure := snapshot.failedRecords[0]
+	if failure.kind != candidateFailurePolicyFiltered || failure.lastError != "exit IP did not change" {
+		t.Fatalf("restored failure metadata = %#v", failure)
+	}
+	got, ok := candidateProxyFromRecordLocked(snapshot, failure.candidateRecord)
+	if !ok || got.Username != failed.Username || got.Password != failed.Password || !reflect.DeepEqual(got.CredentialAlternates, failed.CredentialAlternates) {
+		t.Fatalf("restored failure proxy = %#v, want %#v", got, failed)
+	}
+}
+
+func TestCandidateCacheV4RejectsInvalidAlternateRanges(t *testing.T) {
 	proxy := candidateFromSource("8.8.8.80", "source-a-id", "Source A")
 	proxy.CredentialAlternates = []ProxyCredential{{Username: "alternate", Password: "secret"}}
 	for _, test := range []struct {
@@ -465,7 +533,37 @@ func TestCandidateCacheV3RejectsInvalidAlternateRanges(t *testing.T) {
 	}
 }
 
-func TestCandidateCacheV3RejectsTruncatedAndTrailingWireData(t *testing.T) {
+func TestCandidateCacheV4RejectsInvalidFailureMetadata(t *testing.T) {
+	base := buildCandidateSnapshot([]Proxy{candidateFromSource("8.8.8.83", "source-a-id", "Source A")}, map[string]string{"source-a-id": "Source A"})
+	failedRecord := base.records[0]
+	base.records = nil
+	base.failedRecords = []candidateFailureRecord{{candidateRecord: failedRecord, kind: candidateFailureUnreachable}}
+	base.generation, base.revision, base.phase = 1, 1, "complete"
+	for _, test := range []struct {
+		name   string
+		mutate func(*candidateSnapshot)
+	}{
+		{name: "invalid kind", mutate: func(snapshot *candidateSnapshot) { snapshot.failedRecords[0].kind = 99 }},
+		{name: "oversized error", mutate: func(snapshot *candidateSnapshot) {
+			snapshot.failedRecords[0].lastError = strings.Repeat("x", maxCandidateFailureErrorLength+1)
+		}},
+		{name: "failure status in pending", mutate: func(snapshot *candidateSnapshot) {
+			snapshot.records = []candidateRecord{snapshot.failedRecords[0].candidateRecord}
+			snapshot.records[0].status = candidateCheckedFailed
+			snapshot.failedRecords = nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := cloneCandidateSnapshot(base)
+			test.mutate(snapshot)
+			if err := validateCandidateSnapshot(snapshot); err == nil {
+				t.Fatal("validateCandidateSnapshot() accepted invalid v4 failure metadata")
+			}
+		})
+	}
+}
+
+func TestCandidateCacheV4RejectsTruncatedAndTrailingWireData(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func([]byte) []byte
@@ -483,7 +581,7 @@ func TestCandidateCacheV3RejectsTruncatedAndTrailingWireData(t *testing.T) {
 			}
 			writeCandidateCacheDecoded(t, cache.path, test.mutate(readCandidateCacheDecoded(t, cache.path)))
 			if _, err := cache.load(); err == nil {
-				t.Fatal("cache.load() accepted malformed v3 wire data")
+				t.Fatal("cache.load() accepted malformed v4 wire data")
 			}
 		})
 	}

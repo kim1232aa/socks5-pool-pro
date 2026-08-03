@@ -456,9 +456,9 @@ func TestFullRefreshDisableInFinalWindowWithdrawsCandidateCatalog(t *testing.T) 
 	case <-time.After(2 * time.Second):
 		t.Fatal("full refresh did not reach the final validation window")
 	}
-	checking := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
-	if checking.CandidateTotal != 1 || len(checking.Candidates) != 1 {
-		t.Fatalf("checking catalog = %+v, want one published candidate", checking)
+	checking := server.buildProxyIPPage(localTestRequest(http.MethodGet, "/api/proxyip/page?page_size=100", nil))
+	if checking.ProxyIPTotal != 1 || len(checking.ProxyIPs) != 1 {
+		t.Fatalf("checking ProxyIP catalog = %+v, want one published resource", checking)
 	}
 	recorder := httptest.NewRecorder()
 	server.handleSourceToggle(recorder, httptest.NewRequest(http.MethodPost, "/api/sources/toggle", strings.NewReader(fmt.Sprintf(`{"id":%q,"enabled":false}`, source.ID))))
@@ -474,9 +474,9 @@ func TestFullRefreshDisableInFinalWindowWithdrawsCandidateCatalog(t *testing.T) 
 	case <-time.After(2 * time.Second):
 		t.Fatal("full refresh did not finish")
 	}
-	completed := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
-	if completed.CandidateTotal != 0 || len(completed.Candidates) != 0 {
-		t.Fatalf("disabled source remained in candidate catalog: %+v", completed)
+	completed := server.buildProxyIPPage(localTestRequest(http.MethodGet, "/api/proxyip/page?page_size=100", nil))
+	if completed.ProxyIPTotal != 0 || len(completed.ProxyIPs) != 0 {
+		t.Fatalf("disabled source remained in ProxyIP catalog: %+v", completed)
 	}
 }
 
@@ -590,7 +590,7 @@ func TestScheduledSourceRefreshRetainsCandidatesAndPersistsProxyIPCatalog(t *tes
 		"proxyip://8.8.8.8:443": true,
 	}
 	assertCandidateCatalogKeys(t, pool.candidates, want)
-	page := NewStatusServer(pool, store).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
+	page := NewStatusServer(pool, store).buildProxyIPPage(localTestRequest(http.MethodGet, "/api/proxyip/page?page_size=100", nil))
 	facets := make(map[string]int, len(page.Sources))
 	for _, facet := range page.Sources {
 		facets[facet.Value] = facet.Total

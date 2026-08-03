@@ -122,10 +122,10 @@ func TestCandidateCatalogRemoveConcurrentWithCompleteDoesNotRevive(t *testing.T)
 			close(done)
 		}()
 		close(start)
-		removed, _, err := catalog.RemoveKeys([]string{remove.Key()})
+		removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
 		<-done
-		if err != nil || len(removed) != 1 {
-			t.Fatalf("attempt %d removal = %v err=%v", attempt, removed, err)
+		if err != nil || len(removed)+len(notFound) != 1 || len(removed) == 0 && len(notFound) == 0 {
+			t.Fatalf("attempt %d removal = %v notFound=%v err=%v", attempt, removed, notFound, err)
 		}
 		if _, ok := catalog.FindByKey(remove.Key()); ok {
 			t.Fatalf("attempt %d removed candidate revived", attempt)

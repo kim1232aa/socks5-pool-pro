@@ -39,6 +39,23 @@ func TestAPIRoutesMethodsErrorsAndSecurityHeaders(t *testing.T) {
 		}
 	}
 
+	for _, route := range []struct {
+		method string
+		path   string
+		allow  string
+	}{
+		{http.MethodGet, "/api/candidates/batch-check", http.MethodPost},
+		{http.MethodPost, "/api/candidates/batch-check/status", "GET, HEAD"},
+		{http.MethodGet, "/api/failed-candidates/retry", http.MethodPost},
+		{http.MethodPost, "/api/failed-candidates/retry/status", "GET, HEAD"},
+	} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, localTestRequest(route.method, route.path, nil))
+		if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != route.allow || !strings.HasPrefix(recorder.Header().Get("Content-Type"), "application/json") {
+			t.Fatalf("%s %s = %d Allow=%q type=%q body=%s", route.method, route.path, recorder.Code, recorder.Header().Get("Allow"), recorder.Header().Get("Content-Type"), recorder.Body.String())
+		}
+	}
+
 	for _, path := range []string{"/api", "/api/does-not-exist"} {
 		missing := httptest.NewRecorder()
 		handler.ServeHTTP(missing, localTestRequest(http.MethodGet, path, nil))
@@ -210,6 +227,79 @@ func TestCandidatePaginationSnapshotMetadata(t *testing.T) {
 	handler.ServeHTTP(stale, localTestRequest(http.MethodGet, "/api/candidates/page?snapshot_id=candidate-stale", nil))
 	if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), `"code":"snapshot_changed"`) {
 		t.Fatalf("stale candidate snapshot = %d %s", stale.Code, stale.Body.String())
+	}
+}
+
+func TestFailedAndProxyIPPaginationSnapshotMetadata(t *testing.T) {
+	failed := Proxy{IP: "192.0.2.14", Port: "1080", Protocol: "socks5", SourceName: "failure-feed"}
+	resource := Proxy{IP: "198.51.100.14", Port: "443", Protocol: "proxyip", SourceName: "resource-feed", Country: "US"}
+	pool := NewProxyPool()
+	refresh := pool.candidates.begin([]Proxy{failed, resource}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{failed}, nil, nil)
+	handler := NewStatusServer(pool, &ConfigStore{}).handler()
+
+	failedRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(failedRecorder, localTestRequest(http.MethodGet, "/api/failed-candidates?page_size=1", nil))
+	if failedRecorder.Code != http.StatusOK {
+		t.Fatalf("failed candidate page = %d: %s", failedRecorder.Code, failedRecorder.Body.String())
+	}
+	var failedPage FailedCandidatePageResponse
+	if err := json.Unmarshal(failedRecorder.Body.Bytes(), &failedPage); err != nil {
+		t.Fatal(err)
+	}
+	if failedPage.SnapshotID == "" || failedRecorder.Header().Get("X-Snapshot-ID") != failedPage.SnapshotID || failedPage.FailedTotal != 1 || len(failedPage.FailedCandidates) != 1 {
+		t.Fatalf("failed candidate page metadata = %#v headers=%v", failedPage, failedRecorder.Header())
+	}
+	if failedPage.FailedCandidates[0].FailureType != "unreachable" {
+		t.Fatalf("failed candidate kind = %#v", failedPage.FailedCandidates[0])
+	}
+
+	proxyIPRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(proxyIPRecorder, localTestRequest(http.MethodGet, "/api/proxyip/page?page_size=1", nil))
+	if proxyIPRecorder.Code != http.StatusOK {
+		t.Fatalf("ProxyIP page = %d: %s", proxyIPRecorder.Code, proxyIPRecorder.Body.String())
+	}
+	var proxyIPPage ProxyIPPageResponse
+	if err := json.Unmarshal(proxyIPRecorder.Body.Bytes(), &proxyIPPage); err != nil {
+		t.Fatal(err)
+	}
+	if proxyIPPage.SnapshotID == "" || proxyIPRecorder.Header().Get("X-Snapshot-ID") != proxyIPPage.SnapshotID || proxyIPPage.ProxyIPTotal != 1 || len(proxyIPPage.ProxyIPs) != 1 {
+		t.Fatalf("ProxyIP page metadata = %#v headers=%v", proxyIPPage, proxyIPRecorder.Header())
+	}
+	if proxyIPPage.ProxyIPs[0].Protocol != "proxyip" || proxyIPPage.ProxyIPs[0].Routable {
+		t.Fatalf("ProxyIP page record = %#v", proxyIPPage.ProxyIPs[0])
+	}
+
+	for _, path := range []string{
+		"/api/failed-candidates?snapshot_id=failed-stale",
+		"/api/proxyip/page?snapshot_id=proxyip-stale",
+	} {
+		stale := httptest.NewRecorder()
+		handler.ServeHTTP(stale, localTestRequest(http.MethodGet, path, nil))
+		if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), `"code":"snapshot_changed"`) {
+			t.Fatalf("stale catalog snapshot %s = %d %s", path, stale.Code, stale.Body.String())
+		}
+	}
+}
+
+func TestCompactStatusSeparatesPendingAndFailedCandidateTotals(t *testing.T) {
+	pending := Proxy{IP: "192.0.2.29", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	failed := Proxy{IP: "192.0.2.30", Port: "8080", Protocol: "http", SourceName: "feed"}
+	pool := NewProxyPool()
+	refresh := pool.candidates.begin([]Proxy{pending, failed}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{failed}, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	NewStatusServer(pool, &ConfigStore{}).handler().ServeHTTP(recorder, localTestRequest(http.MethodGet, "/api/status?compact=1", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("compact status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body compactStatusSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.CandidateTotal != 1 || body.FailedCandidateTotal != 1 {
+		t.Fatalf("compact pending/failed totals = %d/%d, want 1/1", body.CandidateTotal, body.FailedCandidateTotal)
 	}
 }
 
@@ -747,9 +837,14 @@ func TestCheckURLDurabilityUncertainConvergesRuntimeBeforeReturningError(t *test
 	if len(cached) != 1 || cached[0].Available || !cached[0].HealthInvalidated || cachedCriterion != updatedURL || !cachedPending {
 		t.Fatalf("flushed pool state did not converge: nodes=%#v criterion=%q pending=%v", cached, cachedCriterion, cachedPending)
 	}
-	candidatePage := NewStatusServer(pool, store).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
-	if len(candidatePage.Candidates) != 1 || candidatePage.Candidates[0].Status != "deferred" || candidatePage.Phase != "restored" {
-		t.Fatalf("candidate outcomes did not reset: %#v", candidatePage)
+	statusServer := NewStatusServer(pool, store)
+	candidatePage := statusServer.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
+	if candidatePage.CandidateTotal != 0 || len(candidatePage.Candidates) != 0 || candidatePage.Phase != "restored" {
+		t.Fatalf("failed candidate returned to pending after criterion change: %#v", candidatePage)
+	}
+	failedPage := statusServer.buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates?page_size=100", nil))
+	if failedPage.FailedTotal != 1 || len(failedPage.FailedCandidates) != 1 || failedPage.FailedCandidates[0].Key != candidate.Key() {
+		t.Fatalf("criterion change did not retain failed candidate: %#v", failedPage)
 	}
 	if !coordinator.drainFullRecheckSignalForTest() {
 		t.Fatal("uncertain criterion change did not queue a full recheck")

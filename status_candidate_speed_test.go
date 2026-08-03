@@ -297,9 +297,10 @@ func TestCandidateSpeedtestRechecksCandidateAndSourceBeforePromotion(t *testing.
 		seedCandidateSpeedCatalog(pool, []Proxy{candidate})
 		server := NewStatusServer(pool, &ConfigStore{})
 		installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
-			if changed := pool.candidates.ApplyHealthOutcomes([]Proxy{candidate}, nil, nil); changed != 1 {
-				t.Fatalf("ApplyHealthOutcomes during speedtest changed %d candidates", changed)
-			}
+			snapshot := pool.candidates.snapshot.Load()
+			snapshot.mu.Lock()
+			snapshot.revision++
+			snapshot.mu.Unlock()
 			return SpeedTestResult{Kbps: 1024, Bytes: speedTestMaxBytes, DurationMs: 8000}, px, nil
 		})
 
@@ -506,17 +507,20 @@ func installCandidateSpeedTest(t *testing.T, fn func(context.Context, Proxy, tim
 	t.Helper()
 	previousHealth := candidateHealthCheckContext
 	previousSpeed := candidateSpeedTestContext
+	previousProbe := candidateSpeedProbeExitIP
 	candidateHealthCheckContext = func(_ context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, error) {
 		return px, true, nil
 	}
 	candidateSpeedTestContext = fn
+	candidateSpeedProbeExitIP = func(context.Context, Proxy, time.Duration) string { return "" }
 	t.Cleanup(func() {
 		candidateHealthCheckContext = previousHealth
 		candidateSpeedTestContext = previousSpeed
+		candidateSpeedProbeExitIP = previousProbe
 	})
 }
 
-func TestCandidateSpeedtestHealthCheckFailure(t *testing.T) {
+func TestCandidateSpeedtestHealthCheckFailureMovesPendingToFailed(t *testing.T) {
 	pool := NewProxyPool()
 	candidate := Proxy{IP: "127.0.0.1", Port: "8080", Protocol: "socks5", Username: "user", Password: "pwd"}
 	seedCandidateSpeedCatalog(pool, []Proxy{candidate})
@@ -532,20 +536,74 @@ func TestCandidateSpeedtestHealthCheckFailure(t *testing.T) {
 	}
 
 	result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
-	if result.status != http.StatusOK {
-		t.Fatalf("expected 200, got %d", result.status)
-	}
-	if len(result.body.Results) != 1 {
-		t.Fatalf("expected 1 result")
+	if result.status != http.StatusOK || len(result.body.Results) != 1 {
+		t.Fatalf("healthcheck failure = %d %#v raw=%s", result.status, result.body, result.raw)
 	}
 	item := result.body.Results[0]
-	if item.OK {
-		t.Errorf("expected healthcheck failure to prevent OK")
-	}
-	if item.Error == nil || !strings.Contains(item.Error.Code, "candidate_healthcheck_failed") {
-		t.Errorf("expected candidate_healthcheck_failed, got %v", item.Error)
+	if item.OK || item.Error == nil || item.Error.Code != "candidate_healthcheck_failed" {
+		t.Fatalf("healthcheck failure item = %#v", item)
 	}
 	if called {
-		t.Errorf("speedtest should not be called if healthcheck failed")
+		t.Fatal("speedtest was called after formal healthcheck failure")
+	}
+	pending := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates", nil))
+	failed := server.buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
+	if pending.CandidateTotal != 0 || len(pending.Candidates) != 0 {
+		t.Fatalf("failed candidate remained pending: %#v", pending)
+	}
+	if failed.FailedTotal != 1 || len(failed.FailedCandidates) != 1 || failed.FailedCandidates[0].Key != candidate.Key() || failed.FailedCandidates[0].FailureType != "unreachable" || !strings.Contains(failed.FailedCandidates[0].LastError, "health criterion rejected candidate") {
+		t.Fatalf("failed candidate page = %#v", failed)
+	}
+}
+
+func TestCandidateSpeedtestDownloadFailureRemainsPending(t *testing.T) {
+	candidate := Proxy{IP: "198.51.100.61", Port: "8080", Protocol: "http"}
+	pool := NewProxyPool()
+	seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+	server := NewStatusServer(pool, &ConfigStore{})
+	installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+		return SpeedTestResult{}, px, errors.New("download endpoint unavailable")
+	})
+
+	result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+	if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "speedtest_failed" {
+		t.Fatalf("download failure = %d %#v raw=%s", result.status, result.body, result.raw)
+	}
+	pending := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates", nil))
+	failed := server.buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
+	if pending.CandidateTotal != 1 || len(pending.Candidates) != 1 || pending.Candidates[0].Key != candidate.Key() || failed.FailedTotal != 0 {
+		t.Fatalf("download failure changed catalog ownership: pending=%#v failed=%#v", pending, failed)
+	}
+}
+
+func TestCandidateSpeedtestIPChangeFailureMovesPendingToPolicyFailed(t *testing.T) {
+	candidate := Proxy{IP: "198.51.100.62", Port: "8080", Protocol: "http"}
+	pool := NewProxyPool()
+	pool.SetRequireIPChangePolicy(true)
+	seedCandidateSpeedCatalog(pool, []Proxy{candidate})
+	server := NewStatusServer(pool, &ConfigStore{})
+	installCandidateSpeedTest(t, func(_ context.Context, px Proxy, _ time.Duration) (SpeedTestResult, Proxy, error) {
+		return SpeedTestResult{Kbps: 1024}, px, nil
+	})
+
+	baselineExitMu.Lock()
+	previousBaseline := baselineExitIP
+	baselineExitIP = "203.0.113.62"
+	baselineExitMu.Unlock()
+	candidateSpeedProbeExitIP = func(context.Context, Proxy, time.Duration) string { return "203.0.113.62" }
+	t.Cleanup(func() {
+		baselineExitMu.Lock()
+		baselineExitIP = previousBaseline
+		baselineExitMu.Unlock()
+	})
+
+	result := invokeCandidateSpeedtest(t, server, []string{candidate.Key()}, context.Background())
+	if result.status != http.StatusOK || len(result.body.Results) != 1 || result.body.Results[0].Error == nil || result.body.Results[0].Error.Code != "candidate_healthcheck_failed" {
+		t.Fatalf("policy failure = %d %#v raw=%s", result.status, result.body, result.raw)
+	}
+	pending := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates", nil))
+	failed := server.buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
+	if pending.CandidateTotal != 0 || failed.FailedTotal != 1 || len(failed.FailedCandidates) != 1 || failed.FailedCandidates[0].Key != candidate.Key() || failed.FailedCandidates[0].FailureType != "policy_filtered" {
+		t.Fatalf("policy failure catalog pages: pending=%#v failed=%#v", pending, failed)
 	}
 }

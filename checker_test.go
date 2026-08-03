@@ -93,7 +93,8 @@ func TestHealthResponseStatusRules(t *testing.T) {
 		{name: "custom accepts 200", url: "https://health.example/check", status: http.StatusOK, accepted: true},
 		{name: "custom accepts other 2xx", url: "https://health.example/check", status: http.StatusPartialContent, accepted: true},
 		{name: "custom rejects redirect", url: "https://health.example/check", status: http.StatusFound},
-		{name: "custom rejects error", url: "https://health.example/check", status: http.StatusServiceUnavailable},
+		{name: "custom accepts target forbidden", url: "https://chatgpt.com/", status: http.StatusForbidden, accepted: true},
+		{name: "custom rejects server error", url: "https://health.example/check", status: http.StatusServiceUnavailable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -223,7 +224,7 @@ func TestCheckCredentialCandidatesRetriesOnlyExplicitProxyAuthenticationRejectio
 	}{
 		{name: "proxy auth rejection", rejectPrimaryAuth: true, healthStatus: http.StatusOK, wantAttempts: 2, wantOK: true},
 		{name: "endpoint redirect", healthStatus: http.StatusFound, wantAttempts: 1},
-		{name: "endpoint forbidden", healthStatus: http.StatusForbidden, wantAttempts: 1},
+		{name: "endpoint forbidden proves target reachability", healthStatus: http.StatusForbidden, wantAttempts: 1, wantOK: true},
 		{name: "endpoint unavailable", healthStatus: http.StatusServiceUnavailable, wantAttempts: 1},
 		{name: "endpoint timeout", healthStatus: http.StatusOK, healthDelay: 250 * time.Millisecond, wantAttempts: 1},
 	}
@@ -272,7 +273,7 @@ func TestCheckCredentialCandidatesRetriesOnlyExplicitProxyAuthenticationRejectio
 			if ok != test.wantOK {
 				t.Fatalf("credential check ok = %v, want %v", ok, test.wantOK)
 			}
-			if test.wantOK && (checked.Username != "good" || checked.Password != "pass") {
+			if test.wantOK && test.rejectPrimaryAuth && (checked.Username != "good" || checked.Password != "pass") {
 				t.Fatalf("promoted credential = %q/%q, want alternate", checked.Username, checked.Password)
 			}
 			if got := attempts.Load(); got != test.wantAttempts {

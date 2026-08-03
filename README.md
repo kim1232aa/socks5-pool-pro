@@ -23,7 +23,7 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 
 | 层次 | 包含内容 | 是否可路由 | 持久化 |
 |---|---|---:|---:|
-| 候选目录 | 来源声明的全部去重记录，以及待检、失败、策略排除等状态 | 否 | `candidate_catalog.v1.bin.gz`（内部 v3 格式，兼容迁移 v1/v2，并保留多个备用凭据） |
+| 候选目录 | 来源声明的全部去重记录，分为“待检测”与“失败隔离”两个集合 | 否 | `candidate_catalog.v1.bin.gz`（内部 v4 格式，兼容迁移 v1/v2/v3，并保留多个备用凭据） |
 | 已知转发池 | 曾成功通过检查的 SOCKS5/HTTP/HTTPS 节点；失败节点保留为不可用 | 是，优先当前健康节点 | `pool_cache.json`（gzip） |
 | ProxyIP 资源 | Cloudflare Worker/VLESS/Trojan 类工具使用的外部反代地址 | 否 | 候选目录 |
 
@@ -35,7 +35,8 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 |---|---|
 | `scrape.raw` | 本轮成功下载的原始记录数 |
 | `scrape.candidates` | 本轮成功来源去重后的候选数 |
-| `candidate_total` | 当前完整候选目录总数；失败来源可沿用上次成功目录 |
+| `candidate_total` | 当前待检测候选数；失败来源可沿用上次成功目录 |
+| `failed_candidate_total` | 正式检查失败或被策略排除、隔离等待人工处置的候选数 |
 | `scrape.checked` | 本轮实际执行健康检查的有界子集 |
 | `scrape.fresh_alive` | 本轮子集中通过健康检查的节点 |
 | `total` | 跨刷新保留的已知转发节点数 |
@@ -43,6 +44,8 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 | `proxyip_total` | 非路由 ProxyIP 资源数 |
 
 大型来源可能有数十万条记录。`-max-candidates` 只限制每轮检测量，不会把未抽到的候选从目录删除。抽样会优先未见节点，并在来源与协议之间轮转；轻量自动检查最终失败的节点进入 terminal 状态，不再参与有冷却限制的轻量检查，但仍会进入按独立周期执行的完整全池复检，也可由显式人工验证恢复。
+
+候选的正式检查（来源刷新后的有界抽样，或管理界面手动提交的批量检测）失败，或被 `-require-ip-change` 策略排除后，会进入独立的失败集合：来源刷新、定时任务、启动恢复和健康检查都不会自动领取它们，只能在管理界面的失败节点页勾选后手动提交重新检测；通过的直接进入转发池，仍失败的留在失败集合。手动批量检测与失败重测共用一个无队列的人工任务槽，复用有效的 `MaxCandidates`、并发与超时设置，重复提交会得到 `409 candidate_check_busy`。
 
 ## Cloudflare ProxyIP：只取纯 IP，固定 443
 
@@ -53,7 +56,7 @@ SOCKS5 Pool Pro 是一个本地优先的多来源代理池：后台抓取公开�
 - 实际配置 ProxyIP 时只取纯 IP；
 - 不对它执行通用 SOCKS5、HTTP CONNECT 健康检查；
 - 不加入本地转发池，也不出现在 `/api/status.proxies`；
-- 可在候选页调用固定的 ProxyIP 专用验证服务做单条参考检查，该结果不会改变普通代理状态。
+- 可在 ProxyIP 页调用固定的 ProxyIP 专用验证服务做单条参考检查，该结果不会改变普通代理状态。
 
 下面两种数据表达的是不同概念：
 
@@ -124,7 +127,9 @@ go build -o socks5-pool .
 内置 Proxy Atlas 管理界面由 `web/dashboard.html`、`web/dashboard.css` 和 `web/dashboard.js` 组成，构建时嵌入二进制。主要页面包括：
 
 - **转发代理池**：健康状态、实测出口、延迟、评分、测速、人工复检、节点统计、按匿名级别筛选和节点切换；
-- **候选库存**：服务端分页浏览完整去重目录，区分待检、失败、策略排除、池内可用/不可用和 ProxyIP；
+- **候选待检**：服务端分页浏览等待正式检测、且未被转发池占用的候选；可提交后台批量正式检测（带进度轮询，复用有效 `MaxCandidates`），也可逐条/批量测速或删除；
+- **失败节点**：正式检查失败或被出口策略排除的隔离候选，按失败类型、来源、协议筛选；只能勾选后手动重新检测，任何自动流程都不会触碰；
+- **ProxyIP**：独立的 Cloudflare 资源分页浏览，支持来源地区筛选与逐条专用验证；
 - **来源管理**：新增远程订阅，导入本地代理列表，并统一启停、刷新和删除来源；远程来源另有 `allow_private`、`allow_empty` 高级选项；
 - **分流规则**：按顺序维护域名、CIDR、GEOSITE 与兜底规则；
 - **分组策略**：按国家、协议、来源或指定节点建立策略组；
@@ -146,8 +151,8 @@ https://www.google.com/generate_204
 
 - 必须通过候选代理完成真实 HTTP 请求；仅能建立 TCP 连接不算健康；
 - 默认目标必须直接返回 `204`；
-- 自定义目标接受直接返回的任意 `2xx`；
-- 重定向和非 `2xx` 都失败；
+- 自定义目标接受直接返回的任意 `2xx`，也接受目标站明确应答的 `4xx`（如 `403`，说明代理已把请求送达目标，只是目标拒绝匿名访问；`407` 代理认证失败除外）；
+- 重定向（`3xx`）和 `5xx` 都失败；
 - 出口 IP、地理信息和匿名性探测是尽力而为，附加探测失败不会抹掉已经通过的基础健康结果；
 - `-require-ip-change=true` 时，只有在本机出口与代理出口都已测得且相同的节点才会被策略排除，未知状态不会被误删。
 
@@ -291,7 +296,7 @@ GET /api/status?compact=1
 - `proxies` 只包含健康的 SOCKS5/HTTP/HTTPS 转发节点；
 - 每项始终有带认证的 `proxy_url`、原始 `username`、`password`；SOCKS5 额外有 `socks_url`；
 - 不返回 `telegram_url`；
-- `compact=1` 省略大代理数组，增加候选总量、阶段、来源错误、更新时间，以及来源刷新与完整全检各自的最近/下次时间，适合界面轮询；
+- `compact=1` 省略大代理数组，增加待检测候选总量、失败隔离候选总量、候选阶段、来源错误、更新时间，以及来源刷新与完整全检各自的最近/下次时间，适合界面轮询；
 - `last_scrape_at` / `next_scrape_at` 保留为来源刷新时间的兼容别名，新客户端可使用 `last_source_refresh_at` / `next_source_refresh_at` 和 `last_full_recheck_at` / `next_full_recheck_at`。
 
 代理 URL 可能带上游凭据。不要把完整 `/api/status` 暴露到公共缓存、日志或第三方页面。
@@ -323,7 +328,13 @@ GET /api/v1/proxies/pick?protocol=socks5&country=JP
 | GET | `/api/refresh/status` | 查看运行中、待执行和最近刷新任务 |
 | GET | `/api/health-recheck/status` | 查看健康标准全量复检进度 |
 | GET | `/api/nodes/page` | 已知转发池分页、筛选、排序 |
-| GET | `/api/candidates/page` | 完整候选目录分页 |
+| GET | `/api/candidates/page` | 待检测候选分页 |
+| POST | `/api/candidates/batch-check` | 提交后台批量正式检测（`202`，busy 时 `409`） |
+| GET | `/api/candidates/batch-check/status` | 查看人工检测任务进度 |
+| GET | `/api/failed-candidates` | 失败隔离候选分页 |
+| POST | `/api/failed-candidates/retry` | 手动重新检测选中的失败候选（`202`） |
+| GET | `/api/failed-candidates/retry/status` | 查看失败重测任务进度 |
+| GET | `/api/proxyip/page` | ProxyIP 资源分页 |
 | GET | `/api/nodes` | 旧版完整节点数组，已标记弃用 |
 | GET | `/api/nodes/stats` | 单节点累计转发、连续健康失败与恢复状态 |
 | POST | `/api/nodes/rotate` | 轮换到下一个节点，保留手动锁定 |

@@ -237,6 +237,31 @@ var candidatesAbortController = null;
 var candidateFilterTimer = null;
 var candidateQueryGeneration = 0;
 var lastCandidatesFetchAt = 0;
+var failedPageData = null;
+var failedPage = 1;
+var failedPageSize = defaultCandidatePageSize();
+var failedPageSizeTouched = false;
+var failedSnapshotID = '';
+var failedLoaded = false;
+var failedRequest = null;
+var failedAbortController = null;
+var failedFilterTimer = null;
+var failedQueryGeneration = 0;
+var lastFailedFetchAt = 0;
+var proxyipPageData = null;
+var proxyipPage = 1;
+var proxyipPageSize = defaultCandidatePageSize();
+var proxyipPageSizeTouched = false;
+var proxyipSnapshotID = '';
+var proxyipLoaded = false;
+var proxyipRequest = null;
+var proxyipAbortController = null;
+var proxyipFilterTimer = null;
+var proxyipQueryGeneration = 0;
+var lastProxyipFetchAt = 0;
+var candidateCheckPollTimer = null;
+var candidateCheckOperationID = '';
+var candidateCheckActive = false;
 var proxyIPVerifyCache = Object.create(null);
 var expandedNodeRows = Object.create(null);
 var expandedCandidateRows = Object.create(null);
@@ -244,6 +269,7 @@ var candidateContinentFilter = '';
 var candidateCountryTrigger = null;
 var countryPickerScope = 'candidates';
 var selectedCandidateKeys = Object.create(null);
+var selectedFailedKeys = Object.create(null);
 var selectedNodeURLs = Object.create(null);
 var nodeSpeedResults = Object.create(null);
 var nodeSpeedtestPending = false;
@@ -276,6 +302,16 @@ function syncCandidatePageSizeSelect() {
   if (select) select.value = String(candidatePageSize);
 }
 
+function syncFailedPageSizeSelect() {
+  var select = document.getElementById('fc-pagesize');
+  if (select) select.value = String(failedPageSize);
+}
+
+function syncProxyIPPageSizeSelect() {
+  var select = document.getElementById('px-pagesize');
+  if (select) select.value = String(proxyipPageSize);
+}
+
 function applyResponsiveCatalogPageSizes() {
   var compact = compactViewport();
   if (compact === lastCompactViewport) return;
@@ -295,6 +331,22 @@ function applyResponsiveCatalogPageSizes() {
     candidateQueryGeneration++;
     syncCandidatePageSizeSelect();
     if (currentTab === 'candidates') requestCandidates(true);
+  }
+  if (!failedPageSizeTouched) {
+    failedPageSize = defaultCandidatePageSize();
+    failedPage = 1;
+    failedSnapshotID = '';
+    failedQueryGeneration++;
+    syncFailedPageSizeSelect();
+    if (currentTab === 'failed-candidates') requestFailedCandidates(true);
+  }
+  if (!proxyipPageSizeTouched) {
+    proxyipPageSize = defaultCandidatePageSize();
+    proxyipPage = 1;
+    proxyipSnapshotID = '';
+    proxyipQueryGeneration++;
+    syncProxyIPPageSizeSelect();
+    if (currentTab === 'proxyip') requestProxyIPs(true);
   }
 }
 
@@ -464,50 +516,6 @@ function chooseCandidateProtocol(protocol) {
   onCandidateFilterChange();
 }
 
-function updateCandidateSummaryButtons() {
-  var status = String((document.getElementById('cf-status') || {}).value || '');
-  var country = String((document.getElementById('cf-country') || {}).value || '');
-  var hasAny = ['cf-text','cf-source','cf-proto','cf-country','cf-status'].some(function(id){ return String((document.getElementById(id) || {}).value || '') !== ''; });
-  Array.prototype.forEach.call(document.querySelectorAll('[data-action="choose-candidate-summary"]'), function(button) {
-    var summary = button.getAttribute('data-summary') || '';
-    var active = summary === 'total' ? !hasAny :
-      summary === 'matching' ? !status && !country :
-      summary === 'known' ? status === 'known' :
-      summary === 'deferred' ? status === 'deferred' :
-      summary === 'unknown-country' ? country === '__unknown__' : false;
-    button.setAttribute('aria-pressed', active ? 'true' : 'false');
-  });
-}
-
-function chooseCandidateSummary(summary) {
-  var text = document.getElementById('cf-text');
-  var source = document.getElementById('cf-source');
-  var protocol = document.getElementById('cf-proto');
-  var country = document.getElementById('cf-country');
-  var status = document.getElementById('cf-status');
-  if (!text || !source || !protocol || !country || !status) return;
-  if (summary === 'total') {
-    text.value = '';
-    source.value = '';
-    protocol.value = '';
-    country.value = '';
-    status.value = '';
-  } else if (summary === 'matching') {
-    country.value = '';
-    status.value = '';
-  } else if (summary === 'known') {
-    status.value = status.value === 'known' ? '' : 'known';
-  } else if (summary === 'deferred') {
-    status.value = status.value === 'deferred' ? '' : 'deferred';
-  } else if (summary === 'unknown-country') {
-    country.value = country.value === '__unknown__' ? '' : '__unknown__';
-  } else {
-    return;
-  }
-  updateCandidateSummaryButtons();
-  onCandidateFilterChange();
-}
-
 function renderCandidateProtocolCards() {
   var container = document.getElementById('candidate-protocol-cards');
   if (!container) return;
@@ -515,8 +523,7 @@ function renderCandidateProtocolCards() {
   var cards = [
     {value:'socks5', label:'SOCKS5', note:'可进入本地转发池'},
     {value:'http', label:'HTTP', note:'可进入本地转发池'},
-    {value:'https', label:'HTTP CONNECT', note:'来源标签 https · 复制为可连接的 http://'},
-    {value:'proxyip', label:'ProxyIP', note:'Cloudflare 资源 · 仅 443 / 纯 IP'}
+    {value:'https', label:'HTTP CONNECT', note:'来源标签 https · 复制为可连接的 http://'}
   ];
   container.innerHTML = cards.map(function(card) {
     var count = candidateProtocolCount(card.value);
@@ -537,6 +544,28 @@ function candidateCountrySummaries() {
 
 function candidateUnknownCountryTotal() {
   return Math.max(0, Number((candidatePageData && candidatePageData.country_unknown_total) || 0));
+}
+
+function proxyipFacetList(name) {
+  return proxyipPageData && Array.isArray(proxyipPageData[name]) ? proxyipPageData[name] : [];
+}
+
+function failedFacetList(name) {
+  return failedPageData && Array.isArray(failedPageData[name]) ? failedPageData[name] : [];
+}
+
+function proxyipCountrySummaries() {
+  return proxyipFacetList('countries').map(function(item) {
+    return {
+      country: normalizedCountry(item && item.country),
+      continent: String((item && item.continent) || '').toUpperCase(),
+      total: Math.max(0, Number((item && item.total) || 0))
+    };
+  }).filter(function(item){ return !!item.country; });
+}
+
+function proxyipUnknownCountryTotal() {
+  return Math.max(0, Number((proxyipPageData && proxyipPageData.country_unknown_total) || 0));
 }
 
 function nodeCountryPickerSummaries() {
@@ -562,11 +591,15 @@ function nodeUnknownCountryCounts() {
 }
 
 function pickerCountrySummaries() {
-  return countryPickerScope === 'nodes' ? nodeCountryPickerSummaries() : candidateCountrySummaries();
+  if (countryPickerScope === 'nodes') return nodeCountryPickerSummaries();
+  if (countryPickerScope === 'proxyip') return proxyipCountrySummaries();
+  return candidateCountrySummaries();
 }
 
 function pickerUnknownCountryCounts() {
-  return countryPickerScope === 'nodes' ? nodeUnknownCountryCounts() : {total:candidateUnknownCountryTotal(), available:0};
+  if (countryPickerScope === 'nodes') return nodeUnknownCountryCounts();
+  if (countryPickerScope === 'proxyip') return {total:proxyipUnknownCountryTotal(), available:0};
+  return {total:candidateUnknownCountryTotal(), available:0};
 }
 
 function pickerCountLabel(counts) {
@@ -609,7 +642,7 @@ function renderCandidateCountryPicker() {
   }).join('');
 
   var query = String((document.getElementById('candidate-country-search') || {}).value || '').trim().toUpperCase();
-  var inputId = countryPickerScope === 'nodes' ? 'f-country' : 'cf-country';
+  var inputId = countryPickerScope === 'nodes' ? 'f-country' : (countryPickerScope === 'proxyip' ? 'px-country' : 'cf-country');
   var selected = String((document.getElementById(inputId) || {}).value || '');
   var groups = {};
   pickerCountrySummaries().forEach(function(item) {
@@ -653,9 +686,14 @@ function updateCandidateCountryButton() {
   var value = String((document.getElementById('cf-country') || {}).value || '');
   var button = document.getElementById('cf-country-button');
   if (!button) return;
-  var proxyIPMode = String((document.getElementById('cf-proto') || {}).value || '').toLowerCase() === 'proxyip';
-  var prefix = proxyIPMode ? 'Cloudflare ProxyIP · ' : '';
-  button.textContent = prefix + (value === '__unknown__' ? '来源地区未知' : (value ? countryLabel(value) : '全部来源地区'));
+  button.textContent = value === '__unknown__' ? '来源地区未知' : (value ? countryLabel(value) : '全部来源地区');
+}
+
+function updateProxyIPCountryButton() {
+  var value = String((document.getElementById('px-country') || {}).value || '');
+  var button = document.getElementById('px-country-button');
+  if (!button) return;
+  button.textContent = 'Cloudflare ProxyIP · ' + (value === '__unknown__' ? '来源地区未知' : (value ? countryLabel(value) : '全部来源地区'));
 }
 
 function updateNodeCountryButton() {
@@ -672,6 +710,11 @@ function openNodeCountryPicker() {
 
 function openCandidateCountryPicker() {
   countryPickerScope = 'candidates';
+  openCountryPicker();
+}
+
+function openProxyIPCountryPicker() {
+  countryPickerScope = 'proxyip';
   openCountryPicker();
 }
 
@@ -692,13 +735,15 @@ function openCountryPicker() {
     if (mapTitle) mapTitle.textContent = '每个数量均为“当前可用 / 池内总数”';
     if (note) note.textContent = '这里使用节点通过代理拨号后实测到的出口地区；它可能与节点服务器地址所属地区不同。';
     if (allButton) allButton.textContent = '全部实测出口';
-  } else {
-    var proxyIPMode = String((document.getElementById('cf-proto') || {}).value || '').toLowerCase() === 'proxyip';
-    if (title) title.textContent = proxyIPMode ? '选择 Cloudflare ProxyIP 来源地区' : '选择候选来源地区';
+  } else if (countryPickerScope === 'proxyip') {
+    if (title) title.textContent = '选择 Cloudflare ProxyIP 来源地区';
     if (mapTitle) mapTitle.textContent = '先选大洲，再选国家或地区';
-    if (note) note.textContent = proxyIPMode
-      ? '只浏览端口集合含 443 的纯 IP 资源；它不接受 SOCKS/HTTP 的端口与认证参数。'
-      : '地区来自来源元数据，不等于经过代理拨号实测的出口地区。';
+    if (note) note.textContent = '只浏览端口集合含 443 的纯 IP 资源；它不接受 SOCKS/HTTP 的端口与认证参数。';
+    if (allButton) allButton.textContent = '全部来源地区';
+  } else {
+    if (title) title.textContent = '选择候选来源地区';
+    if (mapTitle) mapTitle.textContent = '先选大洲，再选国家或地区';
+    if (note) note.textContent = '地区来自来源元数据，不等于经过代理拨号实测的出口地区。';
     if (allButton) allButton.textContent = '全部来源地区';
   }
   renderCandidateCountryPicker();
@@ -720,43 +765,17 @@ function candidateCountryBackdrop(event) {
 }
 
 function chooseCandidateCountry(country) {
-  var input = document.getElementById(countryPickerScope === 'nodes' ? 'f-country' : 'cf-country');
+  var scope = countryPickerScope;
+  var input = document.getElementById(scope === 'nodes' ? 'f-country' : (scope === 'proxyip' ? 'px-country' : 'cf-country'));
   if (!input) return;
   input.value = country;
-  if (countryPickerScope === 'nodes') updateNodeCountryButton();
+  if (scope === 'nodes') updateNodeCountryButton();
+  else if (scope === 'proxyip') updateProxyIPCountryButton();
   else updateCandidateCountryButton();
   closeCandidateCountryPicker();
-  if (countryPickerScope === 'nodes') onFilterChange();
+  if (scope === 'nodes') onFilterChange();
+  else if (scope === 'proxyip') onProxyIPFilterChange();
   else onCandidateFilterChange();
-}
-
-function candidateStatusTotal(status) {
-  var total = 0;
-  candidateFacetList('statuses').forEach(function(item) {
-    if (String((item && item.status) || '') === status) total = Number(item.total || 0);
-  });
-  return Math.max(0, total);
-}
-
-function candidateStatusBadge(status) {
-  var labels = {
-    known_available:'池内可用',
-    known_unavailable:'池内不可用',
-    checked_failed:'最近检测失败',
-    policy_filtered:'连通但被策略排除',
-    resource:'Cloudflare 资源（不路由）',
-    deferred:'排队待检测'
-  };
-  var classes = {
-    known_available:'available',
-    known_unavailable:'unavailable',
-    checked_failed:'failed',
-    policy_filtered:'policy',
-    resource:'resource',
-    deferred:'deferred'
-  };
-  var key = String(status || 'deferred');
-  return '<span class="candidate-state candidate-state-' + (classes[key] || 'unknown') + '">' + escapeHtml(labels[key] || '状态未知') + '</span>';
 }
 
 function formatCandidateUpdatedAt(value) {
@@ -807,7 +826,7 @@ function proxyIPVerifyCellHTML(key, protocol) {
 }
 
 function renderProxyIPVerifyCell(key) {
-  var rows = document.querySelectorAll('#candidate-tbody tr[data-key]');
+  var rows = document.querySelectorAll('#proxyip-tbody tr[data-key]');
   for (var i = 0; i < rows.length; i++) {
     if (rows[i].getAttribute('data-key') !== key) continue;
     var cell = rows[i].querySelector('.candidate-verify-cell');
@@ -823,7 +842,7 @@ function renderProxyIPVerifyCell(key) {
 }
 
 function runProxyIPVerify(button) {
-  var row = button && button.closest ? button.closest('#candidate-tbody tr[data-key]') : null;
+  var row = button && button.closest ? button.closest('#proxyip-tbody tr[data-key]') : null;
   var key = row ? String(row.getAttribute('data-key') || '') : '';
   if (key.indexOf('proxyip://') !== 0) return;
   if (proxyIPVerifyCache[key] && proxyIPVerifyCache[key].state === 'loading') return;
@@ -859,7 +878,7 @@ function onCandidatePageFetched(pageData) {
   var previousSnapshotID = candidateSnapshotID;
   candidatePageData = pageData && typeof pageData === 'object' ? pageData : {};
   if (!Array.isArray(candidatePageData.candidates)) candidatePageData.candidates = [];
-  ['statuses','sources','protocols','countries'].forEach(function(name) {
+  ['sources','protocols','countries'].forEach(function(name) {
     if (!Array.isArray(candidatePageData[name])) candidatePageData[name] = [];
   });
   candidatePage = Number(candidatePageData.page) > 0 ? Number(candidatePageData.page) : 1;
@@ -892,7 +911,7 @@ function onCandidatePageFetched(pageData) {
   candidatesLoaded = true;
   populateCandidateFacetSelect('cf-source', candidateFacetList('sources'), '全部来源');
   var protocols = candidateFacetList('protocols').slice();
-  ['socks5','http','https','proxyip'].forEach(function(value) {
+  ['socks5','http','https'].forEach(function(value) {
     if (!protocols.some(function(item){ return String(item.value || '').toLowerCase() === value; })) protocols.push({value:value,total:0});
   });
   populateCandidateFacetSelect('cf-proto', protocols, '全部协议');
@@ -941,15 +960,6 @@ function toggleCandidateDetails(button) {
   else delete expandedCandidateRows[key];
   button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
   button.textContent = expanded ? '收起' : '详情';
-}
-
-function showCandidateProtocol(protocol) {
-  var sel = document.getElementById('cf-proto');
-  if (sel) sel.value = protocol || '';
-  candidatePage = 1;
-  candidateQueryGeneration++;
-  if (location.hash !== '#candidates') location.hash = 'candidates';
-  else requestCandidates(true);
 }
 
 function captureCandidateFocus() {
@@ -1132,35 +1142,27 @@ function applyCandidateView() {
   candidatePage = page;
   candidatePageSize = pageSize;
   var start = total ? (page - 1) * pageSize : 0;
-  var known = candidateStatusTotal('known_available') + candidateStatusTotal('known_unavailable');
-  var deferred = candidateStatusTotal('deferred');
-  var failed = candidateStatusTotal('checked_failed');
-  var policyFiltered = candidateStatusTotal('policy_filtered');
 
   setText('candidate-total', formatCount(catalogTotal));
-  setText('tab-link-candidates', '候选库 (' + formatCount(catalogTotal) + ')');
+  setText('tab-link-candidates', '候选待检 (' + formatCount(catalogTotal) + ')');
   setText('candidate-matching', formatCount(total));
   setText('stat-matching', formatCount(total));
-  setText('candidate-known', formatCount(known));
-  setText('candidate-deferred', formatCount(deferred));
-  setText('candidate-country-unknown', formatCount(candidateUnknownCountryTotal()));
-  updateCandidateSummaryButtons();
   var updated = formatCandidateUpdatedAt(data.updated_at);
   var phaseLabels = {checking:'检查中', complete:'已完成', partial:'部分来源失败（已保留旧目录）', loading:'生成中', restored:'已恢复目录，等待按当前标准复检'};
   var phase = data.phase ? (' · 快照' + (phaseLabels[data.phase] || data.phase)) : '';
-  setText('candidate-count', (total ? ('显示 ' + formatCount(start + 1) + '-' + formatCount(start + rows.length) + ' · 匹配 ' + formatCount(total)) : '匹配 0') + ' · 完整目录 ' + formatCount(catalogTotal) + ' · 最近失败 ' + formatCount(failed) + (policyFiltered ? ' · 策略排除 ' + formatCount(policyFiltered) : '') + phase + (updated ? ' · 更新于 ' + updated : ''));
+  setText('candidate-count', (total ? ('显示 ' + formatCount(start + 1) + '-' + formatCount(start + rows.length) + ' · 匹配 ' + formatCount(total)) : '匹配 0') + ' · 待检测 ' + formatCount(catalogTotal) + phase + (updated ? ' · 更新于 ' + updated : ''));
 
   if (!catalogTotal) {
     var emptyMessage = data.phase === 'loading' || data.phase === 'checking'
       ? '候选快照正在生成，完成后会自动显示。'
-      : '完整候选快照尚未生成，请确认已启用来源后刷新。';
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">' + emptyMessage + '</td></tr>';
+      : '候选快照尚未生成，请确认已启用来源后刷新。';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">' + emptyMessage + '</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
   }
   if (!total) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合当前筛选条件的候选</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">没有符合当前筛选条件的候选</td></tr>';
     renderCandidatePagers('');
     restoreCandidateFocus(savedFocus);
     return;
@@ -1171,19 +1173,17 @@ function applyCandidateView() {
     var location = country ? countryLabel(country) : '🏳️ 国家未知';
     if (candidate.city) location += ' · ' + String(candidate.city);
     var sources = Array.isArray(candidate.source_names) && candidate.source_names.length ? candidate.source_names.join(', ') : (candidate.source || '');
-    var status = candidate.status || (candidate.routable === false ? 'resource' : 'deferred');
     var candidateKey = String(candidate.key || '');
     var candidateExpanded = !!expandedCandidateRows[candidateKey];
     var selected = !!selectedCandidateKeys[candidateKey];
     return '<tr class="' + (candidateExpanded ? 'mobile-expanded' : '') + '" data-key="' + escapeHtml(candidateKey) + '">' +
       '<td data-label="选择"><input type="checkbox" data-action="candidate-select" aria-label="选择候选 ' + escapeHtml(candidateKey) + '" ' + (selected ? 'checked' : '') + '></td>' +
-      '<td data-label="状态">' + candidateStatusBadge(status) + '</td>' +
       '<td data-label="协议">' + protoBadge(candidate.protocol || '') + (candidate.has_auth ? '<span class="auth-badge" title="该上游候选使用下列用户名和密码">需认证</span>' : '') + '</td>' +
       '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.proxy_url || candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(String(candidate.proxy_url || candidate.addr || '')) + '" aria-label="复制候选代理URL">复制</button><button type="button" class="mobile-detail-toggle" data-action="details" aria-expanded="' + (candidateExpanded ? 'true' : 'false') + '">' + (candidateExpanded ? '收起' : '详情') + '</button></td>' +
       '<td data-label="来源标注地区" class="loc-cell" title="' + escapeHtml(location) + '">' + escapeHtml(location) + '</td>' +
       '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '</td>' +
       '<td data-label="测速结果" class="candidate-speed-cell mobile-secondary">' + candidateResultText(candidateKey) + '</td>' +
-      '<td data-label="操作" class="candidate-action-cell"><div class="candidate-row-actions"><button type="button" class="btn-sm" data-action="candidate-speedtest" aria-label="测速候选 ' + escapeHtml(candidateKey) + '">测速</button>' + (String(candidate.protocol || '').toLowerCase() === 'proxyip' ? proxyIPVerifyCellHTML(candidate.key, candidate.protocol) : '') + '<button type="button" class="btn-sm danger" data-action="candidate-delete" aria-label="删除候选 ' + escapeHtml(candidateKey) + '">删除</button></div></td></tr>';
+      '<td data-label="操作" class="candidate-action-cell"><div class="candidate-row-actions"><button type="button" class="btn-sm" data-action="candidate-speedtest" aria-label="测速候选 ' + escapeHtml(candidateKey) + '">测速</button><button type="button" class="btn-sm danger" data-action="candidate-delete" aria-label="删除候选 ' + escapeHtml(candidateKey) + '">删除</button></div></td></tr>';
   }).join('');
 
   if (total <= pageSize) {
@@ -1196,6 +1196,423 @@ function applyCandidateView() {
   }
   updateCandidateSelectionUI();
   restoreCandidateFocus(savedFocus);
+}
+
+function selectedFailedList() { return Object.keys(selectedFailedKeys); }
+
+function updateFailedSelectionUI() {
+  var keys = selectedFailedList();
+  setText('failed-selected-count', '已选 ' + keys.length);
+  var retryButton = document.getElementById('failed-retry-button');
+  if (retryButton) retryButton.disabled = candidateCheckActive || !keys.length;
+  var pageToggle = document.getElementById('failed-select-page');
+  var rows = failedPageData && Array.isArray(failedPageData.failed_candidates) ? failedPageData.failed_candidates : [];
+  if (pageToggle) {
+    var selectedOnPage = rows.filter(function(item){ return !!selectedFailedKeys[String(item.key || '')]; }).length;
+    pageToggle.checked = !!rows.length && selectedOnPage === rows.length;
+    pageToggle.indeterminate = selectedOnPage > 0 && selectedOnPage < rows.length;
+  }
+}
+
+function toggleFailedSelection(button) {
+  var key = rowKey(button);
+  if (!key) return;
+  if (button.checked) selectedFailedKeys[key] = true;
+  else delete selectedFailedKeys[key];
+  updateFailedSelectionUI();
+}
+
+function toggleFailedPageSelection(button) {
+  var rows = failedPageData && Array.isArray(failedPageData.failed_candidates) ? failedPageData.failed_candidates : [];
+  rows.forEach(function(item) {
+    var key = String(item.key || '');
+    if (!key) return;
+    if (button.checked) selectedFailedKeys[key] = true;
+    else delete selectedFailedKeys[key];
+  });
+  applyFailedView();
+}
+
+function onFailedFilterChange() {
+  failedPage = 1;
+  failedQueryGeneration++;
+  if (failedFilterTimer) clearTimeout(failedFilterTimer);
+  setText('failed-count', '正在应用筛选…');
+  failedFilterTimer = setTimeout(function() {
+    failedFilterTimer = null;
+    requestFailedCandidates(true);
+  }, 250);
+}
+
+function onFailedPageSizeChange() {
+  failedPageSize = parseInt(document.getElementById('fc-pagesize').value, 10) || defaultCandidatePageSize();
+  failedPageSize = Math.max(1, Math.min(100, failedPageSize));
+  failedPageSizeTouched = true;
+  failedPage = 1;
+  failedQueryGeneration++;
+  requestFailedCandidates(true);
+}
+
+function gotoFailedPage(page) {
+  failedPage = Math.max(1, Number(page) || 1);
+  failedQueryGeneration++;
+  requestFailedCandidates(true);
+}
+
+function failedFailureTypeBadge(kind) {
+  var key = String(kind || 'unreachable');
+  var label = key === 'policy_filtered' ? '策略排除' : '连通失败';
+  var cls = key === 'policy_filtered' ? 'policy' : 'failed';
+  return '<span class="candidate-state candidate-state-' + cls + '">' + escapeHtml(label) + '</span>';
+}
+
+function onFailedPageFetched(pageData) {
+  var previousSnapshotID = failedSnapshotID;
+  failedPageData = pageData && typeof pageData === 'object' ? pageData : {};
+  if (!Array.isArray(failedPageData.failed_candidates)) failedPageData.failed_candidates = [];
+  ['sources','protocols','failure_types'].forEach(function(name) {
+    if (!Array.isArray(failedPageData[name])) failedPageData[name] = [];
+  });
+  failedPage = Number(failedPageData.page) > 0 ? Number(failedPageData.page) : 1;
+  failedSnapshotID = String(failedPageData.snapshot_id || '');
+  if (previousSnapshotID && failedSnapshotID && previousSnapshotID !== failedSnapshotID) {
+    selectedFailedKeys = Object.create(null);
+  }
+  var returnedPageSize = Number(failedPageData.page_size) > 0 ? Number(failedPageData.page_size) : failedPageSize;
+  var responsivePageSize = defaultCandidatePageSize();
+  if (!failedPageSizeTouched && returnedPageSize !== responsivePageSize) {
+    failedPage = 1;
+    failedPageSize = responsivePageSize;
+    failedSnapshotID = '';
+    failedQueryGeneration++;
+    queuedFailedRefresh = true;
+    syncFailedPageSizeSelect();
+    setListNotice('failed-notice', 'loading', '正在按当前屏幕尺寸调整每页数量…');
+    return;
+  }
+  failedPageSize = returnedPageSize;
+  syncFailedPageSizeSelect();
+  setListNotice('failed-notice', '', '');
+  failedLoaded = true;
+  populateCandidateFacetSelect('fc-source', failedFacetList('sources'), '全部来源');
+  var protocols = failedFacetList('protocols').slice();
+  ['socks5','http','https'].forEach(function(value) {
+    if (!protocols.some(function(item){ return String(item.value || '').toLowerCase() === value; })) protocols.push({value:value,total:0});
+  });
+  populateCandidateFacetSelect('fc-proto', protocols, '全部协议');
+  populateCandidateFacetSelect('fc-failure-type', failedFacetList('failure_types'), '全部失败类型');
+  applyFailedView();
+}
+
+function applyFailedView() {
+  var tbody = document.getElementById('failed-tbody');
+  var pager = document.getElementById('failed-pager');
+  var topPager = document.getElementById('failed-pager-top');
+  if (!tbody) return;
+  function renderFailedPagers(html) {
+    if (pager) pager.innerHTML = html;
+    if (topPager) topPager.innerHTML = html;
+  }
+  var data = failedPageData || {};
+  var rows = Array.isArray(data.failed_candidates) ? data.failed_candidates : [];
+  var total = Math.max(0, Number(data.filtered_total || 0));
+  var failedTotal = Math.max(0, Number(data.failed_total || 0));
+  var pageSize = Math.max(1, Number(data.page_size || failedPageSize || 50));
+  var pageCount = Math.max(1, Math.ceil(total / pageSize));
+  var page = Math.max(1, Number(data.page || failedPage || 1));
+  if (page > pageCount) page = pageCount;
+  failedPage = page;
+  failedPageSize = pageSize;
+  var start = total ? (page - 1) * pageSize : 0;
+
+  setText('failed-total', formatCount(failedTotal));
+  setText('tab-link-failed-candidates', '失败节点 (' + formatCount(failedTotal) + ')');
+  setText('failed-matching', formatCount(total));
+  setText('failed-count', (total ? ('显示 ' + formatCount(start + 1) + '-' + formatCount(start + rows.length) + ' · 匹配 ' + formatCount(total)) : '匹配 0') + ' · 失败节点 ' + formatCount(failedTotal));
+
+  if (!failedTotal) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">当前没有失败节点；正式检查失败的候选会出现在这里。</td></tr>';
+    renderFailedPagers('');
+    updateFailedSelectionUI();
+    return;
+  }
+  if (!total) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">没有符合当前筛选条件的失败节点</td></tr>';
+    renderFailedPagers('');
+    updateFailedSelectionUI();
+    return;
+  }
+
+  tbody.innerHTML = rows.map(function(candidate) {
+    var sources = Array.isArray(candidate.source_names) && candidate.source_names.length ? candidate.source_names.join(', ') : (candidate.source || '');
+    var candidateKey = String(candidate.key || '');
+    var selected = !!selectedFailedKeys[candidateKey];
+    var lastError = String(candidate.last_error || '（无错误详情）');
+    return '<tr data-key="' + escapeHtml(candidateKey) + '">' +
+      '<td data-label="选择"><input type="checkbox" data-action="failed-select" aria-label="选择失败节点 ' + escapeHtml(candidateKey) + '" ' + (selected ? 'checked' : '') + '></td>' +
+      '<td data-label="失败类型">' + failedFailureTypeBadge(candidate.failure_type) + '</td>' +
+      '<td data-label="协议">' + protoBadge(candidate.protocol || '') + '</td>' +
+      '<td data-label="候选地址" class="mono">' + escapeHtml(candidate.proxy_url || candidate.addr || '') + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(String(candidate.proxy_url || candidate.addr || '')) + '" aria-label="复制候选代理URL">复制</button></td>' +
+      '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '</td>' +
+      '<td data-label="错误摘要" class="small mobile-secondary" title="' + escapeHtml(lastError) + '">' + escapeHtml(lastError) + '</td></tr>';
+  }).join('');
+
+  if (total <= pageSize) {
+    renderFailedPagers('');
+  } else {
+    renderFailedPagers(
+      '<button type="button" class="btn-sm" data-action="goto-failed-page" data-page="' + (page - 1) + '" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
+      '<span class="small">第 ' + page + ' / ' + pageCount + ' 页</span>' +
+      '<button type="button" class="btn-sm" data-action="goto-failed-page" data-page="' + (page + 1) + '" ' + (page >= pageCount ? 'disabled' : '') + '>下一页</button>');
+  }
+  updateFailedSelectionUI();
+}
+
+function onProxyIPFilterChange() {
+  proxyipPage = 1;
+  proxyipQueryGeneration++;
+  updateProxyIPCountryButton();
+  if (proxyipFilterTimer) clearTimeout(proxyipFilterTimer);
+  setText('proxyip-count', '正在应用筛选…');
+  proxyipFilterTimer = setTimeout(function() {
+    proxyipFilterTimer = null;
+    requestProxyIPs(true);
+  }, 250);
+}
+
+function onProxyIPPageSizeChange() {
+  proxyipPageSize = parseInt(document.getElementById('px-pagesize').value, 10) || defaultCandidatePageSize();
+  proxyipPageSize = Math.max(1, Math.min(100, proxyipPageSize));
+  proxyipPageSizeTouched = true;
+  proxyipPage = 1;
+  proxyipQueryGeneration++;
+  requestProxyIPs(true);
+}
+
+function gotoProxyIPPage(page) {
+  proxyipPage = Math.max(1, Number(page) || 1);
+  proxyipQueryGeneration++;
+  requestProxyIPs(true);
+}
+
+function onProxyIPPageFetched(pageData) {
+  proxyipPageData = pageData && typeof pageData === 'object' ? pageData : {};
+  if (!Array.isArray(proxyipPageData.proxyips)) proxyipPageData.proxyips = [];
+  ['sources','countries'].forEach(function(name) {
+    if (!Array.isArray(proxyipPageData[name])) proxyipPageData[name] = [];
+  });
+  proxyipPage = Number(proxyipPageData.page) > 0 ? Number(proxyipPageData.page) : 1;
+  proxyipSnapshotID = String(proxyipPageData.snapshot_id || '');
+  var returnedPageSize = Number(proxyipPageData.page_size) > 0 ? Number(proxyipPageData.page_size) : proxyipPageSize;
+  var responsivePageSize = defaultCandidatePageSize();
+  if (!proxyipPageSizeTouched && returnedPageSize !== responsivePageSize) {
+    proxyipPage = 1;
+    proxyipPageSize = responsivePageSize;
+    proxyipSnapshotID = '';
+    proxyipQueryGeneration++;
+    queuedProxyipRefresh = true;
+    syncProxyIPPageSizeSelect();
+    setListNotice('proxyip-notice', 'loading', '正在按当前屏幕尺寸调整每页数量…');
+    return;
+  }
+  proxyipPageSize = returnedPageSize;
+  syncProxyIPPageSizeSelect();
+  setListNotice('proxyip-notice', '', '');
+  proxyipLoaded = true;
+  populateCandidateFacetSelect('px-source', proxyipFacetList('sources'), '全部来源');
+  updateProxyIPCountryButton();
+  applyProxyIPView();
+  var countryModal = document.getElementById('candidate-country-modal');
+  if (countryPickerScope === 'proxyip' && countryModal && !countryModal.hidden) renderCandidateCountryPicker();
+}
+
+function applyProxyIPView() {
+  var tbody = document.getElementById('proxyip-tbody');
+  var pager = document.getElementById('proxyip-pager');
+  var topPager = document.getElementById('proxyip-pager-top');
+  if (!tbody) return;
+  function renderProxyIPPagers(html) {
+    if (pager) pager.innerHTML = html;
+    if (topPager) topPager.innerHTML = html;
+  }
+  var data = proxyipPageData || {};
+  var rows = Array.isArray(data.proxyips) ? data.proxyips : [];
+  var total = Math.max(0, Number(data.filtered_total || 0));
+  var proxyIPTotal = Math.max(0, Number(data.proxyip_total || 0));
+  var pageSize = Math.max(1, Number(data.page_size || proxyipPageSize || 50));
+  var pageCount = Math.max(1, Math.ceil(total / pageSize));
+  var page = Math.max(1, Number(data.page || proxyipPage || 1));
+  if (page > pageCount) page = pageCount;
+  proxyipPage = page;
+  proxyipPageSize = pageSize;
+  var start = total ? (page - 1) * pageSize : 0;
+
+  setText('proxyip-total', formatCount(proxyIPTotal));
+  setText('tab-link-proxyip', 'ProxyIP (' + formatCount(proxyIPTotal) + ')');
+  setText('proxyip-matching', formatCount(total));
+  setText('proxyip-count', (total ? ('显示 ' + formatCount(start + 1) + '-' + formatCount(start + rows.length) + ' · 匹配 ' + formatCount(total)) : '匹配 0') + ' · ProxyIP ' + formatCount(proxyIPTotal));
+
+  if (!proxyIPTotal) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">当前没有 ProxyIP 资源；添加 ProxyIP 来源并刷新后会出现在这里。</td></tr>';
+    renderProxyIPPagers('');
+    return;
+  }
+  if (!total) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">没有符合当前筛选条件的 ProxyIP 资源</td></tr>';
+    renderProxyIPPagers('');
+    return;
+  }
+
+  tbody.innerHTML = rows.map(function(candidate) {
+    var country = normalizedCountry(candidate.country);
+    var location = country ? countryLabel(country) : '🏳️ 国家未知';
+    if (candidate.city) location += ' · ' + String(candidate.city);
+    var sources = Array.isArray(candidate.source_names) && candidate.source_names.length ? candidate.source_names.join(', ') : (candidate.source || '');
+    var candidateKey = String(candidate.key || '');
+    var address = String(candidate.proxy_url || candidate.addr || '');
+    return '<tr data-key="' + escapeHtml(candidateKey) + '">' +
+      '<td data-label="地址" class="mono">' + escapeHtml(address) + '<button type="button" class="copy-btn" data-action="copy" data-copy-address="' + escapeHtml(address) + '" aria-label="复制 ProxyIP 地址">复制</button></td>' +
+      '<td data-label="来源标注地区" class="loc-cell" title="' + escapeHtml(location) + '">' + escapeHtml(location) + '</td>' +
+      '<td data-label="来源" class="small mobile-secondary">' + escapeHtml(sources) + '</td>' +
+      '<td data-label="专用验证" class="candidate-verify-cell">' + proxyIPVerifyCellHTML(candidateKey, 'proxyip') + '</td></tr>';
+  }).join('');
+
+  if (total <= pageSize) {
+    renderProxyIPPagers('');
+  } else {
+    renderProxyIPPagers(
+      '<button type="button" class="btn-sm" data-action="goto-proxyip-page" data-page="' + (page - 1) + '" ' + (page <= 1 ? 'disabled' : '') + '>上一页</button>' +
+      '<span class="small">第 ' + page + ' / ' + pageCount + ' 页</span>' +
+      '<button type="button" class="btn-sm" data-action="goto-proxyip-page" data-page="' + (page + 1) + '" ' + (page >= pageCount ? 'disabled' : '') + '>下一页</button>');
+  }
+}
+
+function candidateBatchLimitDefault() {
+  var opt = document.getElementById('opt-maxcandidates');
+  var value = opt ? parseInt(opt.value, 10) : 0;
+  if (!isFinite(value) || value <= 0) value = opt ? parseInt(opt.placeholder, 10) : 0;
+  return isFinite(value) && value > 0 ? value : 100;
+}
+
+function setCandidateCheckButtonsDisabled(disabled) {
+  var batchButton = document.getElementById('candidate-batch-check-button');
+  if (batchButton) batchButton.disabled = disabled;
+  var retryButton = document.getElementById('failed-retry-button');
+  if (retryButton) retryButton.disabled = disabled || !selectedFailedList().length;
+}
+
+function renderCandidateCheckOperation(statusElId, operation) {
+  var total = Math.max(0, Number(operation.total) || 0);
+  var completed = Math.max(0, Number(operation.completed) || 0);
+  var text = operation.status === 'queued'
+    ? '检测任务已排队，等待当前任务结束…'
+    : '正式检测中：' + formatCount(completed) + ' / ' + formatCount(total) + '（通过 ' + formatCount(operation.alive || 0) + ' · 失败 ' + formatCount(operation.failed || 0) + (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '') + '）';
+  setText(statusElId, text);
+}
+
+function refreshAfterCandidateCheck() {
+  requestStatus();
+  requestCandidates(true);
+  requestFailedCandidates(true);
+  requestProxyIPs(true);
+}
+
+function finishCandidateCheckOperation(statusElId, operation) {
+  candidateCheckPollTimer = null;
+  candidateCheckOperationID = '';
+  candidateCheckActive = false;
+  setCandidateCheckButtonsDisabled(false);
+  updateCandidateSelectionUI();
+  updateFailedSelectionUI();
+  var summary = '检测完成：通过 ' + formatCount(operation.alive || 0) + ' · 失败 ' + formatCount(operation.failed || 0) + (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '') + '，失败项已移入失败节点页';
+  var tone = 'success';
+  if (operation.status === 'failed') { summary = '检测任务失败' + (operation.error ? '：' + operation.error : '。'); tone = 'error'; }
+  else if (operation.status === 'cancelled') { summary = '检测任务已取消' + (operation.error ? '：' + operation.error : '。'); tone = 'error'; }
+  else if (operation.status === 'superseded') { summary = '检测任务被更新的配置取代，结果未应用。'; tone = 'error'; }
+  setText(statusElId, summary);
+  notify(summary, tone, 7000);
+  refreshAfterCandidateCheck();
+}
+
+function pollCandidateCheckOperation(statusURL, operationID) {
+  if (candidateCheckPollTimer) clearTimeout(candidateCheckPollTimer);
+  candidateCheckOperationID = String(operationID || '');
+  candidateCheckActive = true;
+  setCandidateCheckButtonsDisabled(true);
+  candidateCheckPollTimer = setTimeout(checkCandidateCheckOperation, 1200);
+  function checkCandidateCheckOperation() {
+    fetchJSON(statusURL).then(function(operation) {
+      if (!operation || operation.status === 'idle') {
+        candidateCheckPollTimer = setTimeout(checkCandidateCheckOperation, 1200);
+        return;
+      }
+      if (candidateCheckOperationID && String(operation.id || '') !== candidateCheckOperationID) {
+        candidateCheckPollTimer = setTimeout(checkCandidateCheckOperation, 1200);
+        return;
+      }
+      candidateCheckOperationID = String(operation.id || '');
+      var statusElId = operation.kind === 'failed_retry' ? 'failed-operation-status' : 'candidate-operation-status';
+      if (['complete','cancelled','superseded','failed'].indexOf(operation.status) >= 0) {
+        finishCandidateCheckOperation(statusElId, operation);
+        return;
+      }
+      renderCandidateCheckOperation(statusElId, operation);
+      candidateCheckPollTimer = setTimeout(checkCandidateCheckOperation, 1200);
+    }).catch(function() {
+      candidateCheckPollTimer = setTimeout(checkCandidateCheckOperation, 3000);
+    });
+  }
+}
+
+function startCandidateBatchCheck(button) {
+  if (candidateCheckActive) { notify('已有检测任务在进行，请等待完成', 'error'); return; }
+  var input = document.getElementById('candidate-batch-limit');
+  var raw = input ? String(input.value || '').trim() : '';
+  var limit = raw ? parseInt(raw, 10) : candidateBatchLimitDefault();
+  if (!isFinite(limit) || limit < 1) { notify('检测数量必须是正整数', 'error'); return; }
+  if (input && !raw) input.value = String(limit);
+  setText('candidate-operation-status', '正在提交批量正式检测…');
+  fetchJSON('/api/candidates/batch-check', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({limit:limit})
+  }).then(function(result) {
+    pollCandidateCheckOperation(String(result && result.status_url || '/api/candidates/batch-check/status'), String(result && result.id || ''));
+  }).catch(function(err) {
+    if (err.status === 409 && err.code === 'candidate_check_busy') {
+      setText('candidate-operation-status', '已有检测任务在进行，转入状态跟踪…');
+      pollCandidateCheckOperation('/api/candidates/batch-check/status', '');
+      return;
+    }
+    candidateCheckActive = false;
+    setCandidateCheckButtonsDisabled(false);
+    setText('candidate-operation-status', '批量正式检测提交失败：' + String(err));
+    notify('批量正式检测失败：' + String(err), 'error', 7000);
+  });
+}
+
+function retryFailedCandidates() {
+  var keys = selectedFailedList();
+  if (!keys.length || candidateCheckActive) return;
+  setText('failed-operation-status', '正在提交手动重新检测…');
+  fetchJSON('/api/failed-candidates/retry', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({keys:keys})
+  }).then(function(result) {
+    selectedFailedKeys = Object.create(null);
+    updateFailedSelectionUI();
+    pollCandidateCheckOperation(String(result && result.status_url || '/api/failed-candidates/retry/status'), String(result && result.id || ''));
+  }).catch(function(err) {
+    if (err.status === 409 && err.code === 'candidate_check_busy') {
+      setText('failed-operation-status', '已有检测任务在进行，转入状态跟踪…');
+      pollCandidateCheckOperation('/api/failed-candidates/retry/status', '');
+      return;
+    }
+    candidateCheckActive = false;
+    setCandidateCheckButtonsDisabled(false);
+    updateFailedSelectionUI();
+    setText('failed-operation-status', '手动重新检测提交失败：' + String(err));
+    notify('手动重新检测失败：' + String(err), 'error', 7000);
+  });
 }
 
 function onNodePageFetched(pageData) {
@@ -1702,7 +2119,17 @@ function applyStatusSummary(d) {
 	} else if (clearHelp) {
 		clearHelp.textContent = '不可用节点默认只隐藏并会在恢复后重新出现。仅在确认不再保留历史节点时执行永久清理。';
 	}
-  if (typeof d.proxyip_total === 'number') setText('stat-proxyip', d.proxyip_total);
+  if (typeof d.failed_candidate_total === 'number') {
+    var failedTotal = Math.max(0, Number(d.failed_candidate_total));
+    setText('tab-link-failed-candidates', '失败节点 (' + formatCount(failedTotal) + ')');
+    if (!failedLoaded) setText('failed-total', formatCount(failedTotal));
+  }
+  if (typeof d.proxyip_total === 'number') {
+    var proxyIPTotal = Math.max(0, Number(d.proxyip_total));
+    setText('tab-link-proxyip', 'ProxyIP (' + formatCount(proxyIPTotal) + ')');
+    if (!proxyipLoaded) setText('proxyip-total', formatCount(proxyIPTotal));
+    setText('stat-proxyip', proxyIPTotal);
+  }
   var sourceLastAt = d.last_source_refresh_at || d.last_scrape_at;
   var sourceNextAt = d.next_source_refresh_at || d.next_scrape_at;
   var sourceLast = d.last_source_refresh || d.last_scrape;
@@ -1720,7 +2147,7 @@ function applyStatusSummary(d) {
 
   if (typeof d.candidate_total === 'number') {
     var candidateTotal = Math.max(0, Number(d.candidate_total));
-    setText('tab-link-candidates', '候选库 (' + formatCount(candidateTotal) + ')');
+    setText('tab-link-candidates', '候选待检 (' + formatCount(candidateTotal) + ')');
     if (!candidatesLoaded) setText('candidate-total', formatCount(candidateTotal));
     var candidateLink = document.getElementById('tab-link-candidates');
     if (candidateLink) {
@@ -1874,12 +2301,10 @@ function candidatePageURL() {
   var source = requiredControl('cf-source').value;
   var protocol = requiredControl('cf-proto').value;
   var country = requiredControl('cf-country').value;
-  var status = requiredControl('cf-status').value;
   if (text) q.push('search=' + encodeURIComponent(text));
   if (source) q.push('source=' + encodeURIComponent(source));
   if (protocol) q.push('protocol=' + encodeURIComponent(protocol));
   if (country) q.push('country=' + encodeURIComponent(country));
-  if (status) q.push('status=' + encodeURIComponent(status));
   if (candidatePage > 1 && candidateSnapshotID) q.push('snapshot_id=' + encodeURIComponent(candidateSnapshotID));
   return '/api/candidates/page?' + q.join('&');
 }
@@ -1947,9 +2372,157 @@ function abortCandidateRequest() {
   if (candidatesAbortController) candidatesAbortController.abort();
 }
 
+function canFetchFailed() { return currentTab === 'failed-candidates' && pageIsVisible(); }
+
+function failedPageURL() {
+  var q = [
+    'page=' + encodeURIComponent(failedPage),
+    'page_size=' + encodeURIComponent(failedPageSize)
+  ];
+  var text = (requiredControl('fc-text').value || '').trim();
+  var source = requiredControl('fc-source').value;
+  var protocol = requiredControl('fc-proto').value;
+  var failureType = requiredControl('fc-failure-type').value;
+  if (text) q.push('search=' + encodeURIComponent(text));
+  if (source) q.push('source=' + encodeURIComponent(source));
+  if (protocol) q.push('protocol=' + encodeURIComponent(protocol));
+  if (failureType) q.push('failure_type=' + encodeURIComponent(failureType));
+  if (failedPage > 1 && failedSnapshotID) q.push('snapshot_id=' + encodeURIComponent(failedSnapshotID));
+  return '/api/failed-candidates?' + q.join('&');
+}
+
+var queuedFailedRefresh = false;
+function requestFailedCandidates(force) {
+  if (!canFetchFailed()) return Promise.resolve(null);
+  if (failedRequest) {
+    queuedFailedRefresh = queuedFailedRefresh || !!force;
+    return failedRequest;
+  }
+  if (!force && Date.now() - lastFailedFetchAt < 120000) return Promise.resolve(null);
+
+  failedAbortController = typeof AbortController === 'function' ? new AbortController() : null;
+  var options = failedAbortController ? {signal:failedAbortController.signal} : undefined;
+  var requestGeneration = failedQueryGeneration;
+  if (!failedLoaded) setListNotice('failed-notice', 'loading', '正在查询失败节点快照，请稍候…');
+  failedRequest = Promise.resolve().then(function() { return fetchJSON(failedPageURL(), options); })
+    .then(function(pageData) {
+      if (canFetchFailed() && requestGeneration === failedQueryGeneration) {
+        lastFailedFetchAt = Date.now();
+        onFailedPageFetched(pageData);
+      }
+      return pageData;
+    })
+    .catch(function(err) {
+      if (err && err.status === 409 && err.code === 'snapshot_changed') {
+        failedSnapshotID = '';
+        failedPage = 1;
+        selectedFailedKeys = Object.create(null);
+        updateFailedSelectionUI();
+        queuedFailedRefresh = true;
+        setListNotice('failed-notice', 'loading', '失败节点目录已生成新快照，正在从第一页继续浏览…');
+        return null;
+      }
+      if (!err || err.name !== 'AbortError') {
+        setText('failed-count', '失败节点目录更新失败');
+        setListNotice('failed-notice', 'error', '无法更新失败节点目录：' + String(err) + '。已保留上一次成功加载的内容。');
+      }
+      return null;
+    })
+    .finally(function() {
+      var runAgain = queuedFailedRefresh;
+      queuedFailedRefresh = false;
+      failedRequest = null;
+      failedAbortController = null;
+      if (runAgain && canFetchFailed()) setTimeout(function(){ requestFailedCandidates(true); }, 0);
+    });
+  return failedRequest;
+}
+
+function abortFailedRequest() {
+  queuedFailedRefresh = false;
+  if (failedFilterTimer) {
+    clearTimeout(failedFilterTimer);
+    failedFilterTimer = null;
+  }
+  if (failedAbortController) failedAbortController.abort();
+}
+
+function canFetchProxyIPs() { return currentTab === 'proxyip' && pageIsVisible(); }
+
+function proxyIPPageURL() {
+  var q = [
+    'page=' + encodeURIComponent(proxyipPage),
+    'page_size=' + encodeURIComponent(proxyipPageSize)
+  ];
+  var text = (requiredControl('px-text').value || '').trim();
+  var source = requiredControl('px-source').value;
+  var country = requiredControl('px-country').value;
+  if (text) q.push('search=' + encodeURIComponent(text));
+  if (source) q.push('source=' + encodeURIComponent(source));
+  if (country) q.push('country=' + encodeURIComponent(country));
+  if (proxyipPage > 1 && proxyipSnapshotID) q.push('snapshot_id=' + encodeURIComponent(proxyipSnapshotID));
+  return '/api/proxyip/page?' + q.join('&');
+}
+
+var queuedProxyipRefresh = false;
+function requestProxyIPs(force) {
+  if (!canFetchProxyIPs()) return Promise.resolve(null);
+  if (proxyipRequest) {
+    queuedProxyipRefresh = queuedProxyipRefresh || !!force;
+    return proxyipRequest;
+  }
+  if (!force && Date.now() - lastProxyipFetchAt < 120000) return Promise.resolve(null);
+
+  proxyipAbortController = typeof AbortController === 'function' ? new AbortController() : null;
+  var options = proxyipAbortController ? {signal:proxyipAbortController.signal} : undefined;
+  var requestGeneration = proxyipQueryGeneration;
+  if (!proxyipLoaded) setListNotice('proxyip-notice', 'loading', '正在查询 ProxyIP 资源快照，请稍候…');
+  proxyipRequest = Promise.resolve().then(function() { return fetchJSON(proxyIPPageURL(), options); })
+    .then(function(pageData) {
+      if (canFetchProxyIPs() && requestGeneration === proxyipQueryGeneration) {
+        lastProxyipFetchAt = Date.now();
+        onProxyIPPageFetched(pageData);
+      }
+      return pageData;
+    })
+    .catch(function(err) {
+      if (err && err.status === 409 && err.code === 'snapshot_changed') {
+        proxyipSnapshotID = '';
+        proxyipPage = 1;
+        queuedProxyipRefresh = true;
+        setListNotice('proxyip-notice', 'loading', 'ProxyIP 目录已生成新快照，正在从第一页继续浏览…');
+        return null;
+      }
+      if (!err || err.name !== 'AbortError') {
+        setText('proxyip-count', 'ProxyIP 目录更新失败');
+        setListNotice('proxyip-notice', 'error', '无法更新 ProxyIP 目录：' + String(err) + '。已保留上一次成功加载的内容。');
+      }
+      return null;
+    })
+    .finally(function() {
+      var runAgain = queuedProxyipRefresh;
+      queuedProxyipRefresh = false;
+      proxyipRequest = null;
+      proxyipAbortController = null;
+      if (runAgain && canFetchProxyIPs()) setTimeout(function(){ requestProxyIPs(true); }, 0);
+    });
+  return proxyipRequest;
+}
+
+function abortProxyIPRequest() {
+  queuedProxyipRefresh = false;
+  if (proxyipFilterTimer) {
+    clearTimeout(proxyipFilterTimer);
+    proxyipFilterTimer = null;
+  }
+  if (proxyipAbortController) proxyipAbortController.abort();
+}
+
 function requestCurrentCatalog(force) {
   if (currentTab === 'nodes') return requestNodes(!!force);
   if (currentTab === 'candidates') return requestCandidates(!!force);
+  if (currentTab === 'failed-candidates') return requestFailedCandidates(!!force);
+  if (currentTab === 'proxyip') return requestProxyIPs(!!force);
   return Promise.resolve(null);
 }
 
@@ -2126,6 +2699,8 @@ function loadCheckOptions() {
     if (mc) { mc.value = Number(overrides.max_concurrent || 0) || ''; mc.placeholder = String(result.max_concurrent || ''); }
     if (ct) { ct.value = Number(overrides.check_timeout_seconds || 0) || ''; ct.placeholder = String(result.check_timeout_seconds || ''); }
     if (cand) { cand.value = Number(overrides.max_candidates || 0) || ''; cand.placeholder = String(result.max_candidates || ''); }
+    var batchLimit = document.getElementById('candidate-batch-limit');
+    if (batchLimit) batchLimit.placeholder = String(Number(overrides.max_candidates || 0) || result.max_candidates || '');
     if (sourceRefresh) {
       sourceRefresh.value = Number(overrides.source_refresh_interval_seconds || 0) ? String(Number(overrides.source_refresh_interval_seconds) / 60) : '';
       sourceRefresh.placeholder = String(Number(result.source_refresh_interval_seconds || 0) / 60 || '');
@@ -2508,12 +3083,14 @@ function deleteListener(element) {
     .catch(function(err) { notify(String(err), 'error', 7000); });
 }
 
+var validTabs = ['nodes','candidates','failed-candidates','proxyip','sources','rules','groups','listeners'];
 function showTab(name) {
-  var validTabs = ['nodes','candidates','sources','rules','groups','listeners'];
   if (validTabs.indexOf(name) < 0) name = 'nodes';
   var viewMeta = {
     nodes: ['转发代理池','健康节点、真实出口与全量复检。'],
-    candidates: ['候选库存','按资源类型与来源地区浏览完整快照。'],
+    candidates: ['候选待检','等待正式检测的候选；失败会隔离到失败节点页。'],
+    'failed-candidates': ['失败节点','正式检查失败或策略排除的候选；只能手动重新检测。'],
+    'proxyip': ['Cloudflare ProxyIP','独立的 Worker 外部资源与专用验证。'],
     sources: ['来源管理','远程订阅、本地导入与库存保留策略。'],
     rules: ['分流规则','从上到下构建可预测的路由决策。'],
     groups: ['分组策略','组合节点、地区、协议与来源。'],
@@ -2526,6 +3103,8 @@ function showTab(name) {
   var previousTab = currentTab;
   var leavingNodes = currentTab === 'nodes' && name !== 'nodes';
   var leavingCandidates = currentTab === 'candidates' && name !== 'candidates';
+  var leavingFailed = currentTab === 'failed-candidates' && name !== 'failed-candidates';
+  var leavingProxyIP = currentTab === 'proxyip' && name !== 'proxyip';
   currentTab = name;
   var panels = document.querySelectorAll('.tab-panel');
   for (var i = 0; i < panels.length; i++) {
@@ -2546,8 +3125,12 @@ function showTab(name) {
   }
   if (leavingNodes || !pageIsVisible()) abortNodeRequest();
   if (leavingCandidates || !pageIsVisible()) abortCandidateRequest();
+  if (leavingFailed || !pageIsVisible()) abortFailedRequest();
+  if (leavingProxyIP || !pageIsVisible()) abortProxyIPRequest();
   if (name === 'nodes' && pageIsVisible()) requestNodes(true);
   if (name === 'candidates' && pageIsVisible()) requestCandidates(true);
+  if (name === 'failed-candidates' && pageIsVisible()) requestFailedCandidates(true);
+  if (name === 'proxyip' && pageIsVisible()) requestProxyIPs(true);
   if (name === 'listeners' && pageIsVisible()) requestListeners(true);
   if (previousTab !== name && target) {
     requestAnimationFrame(function(){ target.scrollIntoView({block:'start', behavior:'auto'}); });
@@ -2556,7 +3139,7 @@ function showTab(name) {
 
 function syncTabFromHash() {
   var requested = (location.hash || '#nodes').slice(1);
-  if (['nodes','candidates','sources','rules','groups','listeners'].indexOf(requested) < 0) {
+  if (validTabs.indexOf(requested) < 0) {
     requested = 'nodes';
     history.replaceState(null, '', location.pathname + location.search + '#nodes');
   }
@@ -2587,6 +3170,8 @@ document.addEventListener('visibilitychange', function() {
   if (!pageIsVisible()) {
     abortNodeRequest();
     abortCandidateRequest();
+    abortFailedRequest();
+    abortProxyIPRequest();
     return;
   }
   pollStatus(true);
@@ -2607,7 +3192,6 @@ document.addEventListener('click', function(event) {
   }
   switch (actionElement.getAttribute('data-action')) {
     case 'refresh': doRefresh(actionElement); break;
-    case 'show-candidate-protocol': showCandidateProtocol(actionElement.getAttribute('data-protocol')); break;
     case 'save-check-url': saveCheckURL(actionElement); break;
     case 'save-check-options': saveCheckOptions(actionElement); break;
     case 'refresh-baseline': refreshBaselineExit(actionElement); break;
@@ -2640,10 +3224,16 @@ document.addEventListener('click', function(event) {
     case 'result-dialog-backdrop': resultDialogBackdrop(event); break;
     case 'close-result-dialog': closeResultDialog(); break;
     case 'choose-candidate-protocol': chooseCandidateProtocol(actionElement.getAttribute('data-protocol') || ''); break;
-    case 'choose-candidate-summary': chooseCandidateSummary(actionElement.getAttribute('data-summary') || ''); break;
     case 'set-candidate-continent': setCandidateContinentFilter(actionElement.getAttribute('data-continent') || ''); break;
     case 'choose-candidate-country': chooseCandidateCountry(actionElement.getAttribute('data-country') || ''); break;
     case 'proxyip-verify': runProxyIPVerify(actionElement); break;
+    case 'candidate-batch-check': startCandidateBatchCheck(actionElement); break;
+    case 'failed-retry-selected': retryFailedCandidates(); break;
+    case 'failed-select': toggleFailedSelection(actionElement); return;
+    case 'failed-select-page': toggleFailedPageSelection(actionElement); return;
+    case 'goto-failed-page': gotoFailedPage(actionElement.getAttribute('data-page')); break;
+    case 'open-proxyip-country-picker': openProxyIPCountryPicker(); break;
+    case 'goto-proxyip-page': gotoProxyIPPage(actionElement.getAttribute('data-page')); break;
     case 'node-select': toggleNodeSelection(actionElement); return;
     case 'node-select-page': toggleNodePageSelection(actionElement); return;
     case 'copy-selected-nodes': copySelectedNodes(actionElement); break;
@@ -2683,6 +3273,8 @@ document.addEventListener('click', function(event) {
 
 syncNodePageSizeSelect();
 syncCandidatePageSizeSelect();
+syncFailedPageSizeSelect();
+syncProxyIPPageSizeSelect();
 syncTabFromHash();
 loadCheckOptions();
 loadBaselineExit();

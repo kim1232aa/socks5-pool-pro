@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -15,204 +16,284 @@ import (
 	"unsafe"
 )
 
-func TestCandidateCatalogPageClassificationFilteringAndCredentials(t *testing.T) {
-	available := Proxy{IP: "192.0.2.1", Port: "8080", Protocol: "http", Available: true}
-	unavailable := Proxy{IP: "192.0.2.1", Port: "8080", Protocol: "socks5", Available: false}
-	failed := Proxy{
-		IP: "192.0.2.2", Port: "3128", Protocol: "http", Country: "JP", City: "Tokyo", Continent: "AS",
-		SourceName: "alpha", SourceNames: []string{"alpha", "beta"}, Username: "catalog-user", Password: "do-not-leak",
-	}
-	policy := Proxy{IP: "192.0.2.3", Port: "443", Protocol: "https", Country: "JP", Continent: "AS", SourceName: "alpha", Available: true}
-	deferred := Proxy{IP: "192.0.2.4", Port: "1080", Protocol: "socks5", SourceName: "gamma"}
-	resource := Proxy{IP: "198.51.100.5", Port: "443", Protocol: "proxyip", Country: "HK", Continent: "AS", SourceName: "resource-feed"}
-	available.Country, available.Continent, available.SourceName = "US", "NA", "alpha"
-	unavailable.SourceName = "beta"
+func TestCandidatePageContainsOnlyPendingForwardingRecords(t *testing.T) {
+	known := Proxy{IP: "192.0.2.10", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
+	pending := Proxy{IP: "192.0.2.11", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	failed := Proxy{IP: "192.0.2.12", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	policy := Proxy{IP: "192.0.2.13", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	resource := Proxy{IP: "198.51.100.10", Port: "443", Protocol: "proxyip", SourceName: "resource-feed"}
 
 	pool := NewProxyPool()
-	pool.Prime([]Proxy{available, unavailable, policy}, nil)
-	inventory := []Proxy{resource, deferred, policy, failed, unavailable, available}
-	refresh := pool.candidates.begin(inventory, nil, nil, 0)
-	pool.candidates.complete(refresh, []Proxy{available, failed, policy}, []Proxy{available}, map[string]bool{policy.Key(): true})
-	server := NewStatusServer(pool, &ConfigStore{})
+	pool.Prime([]Proxy{known}, nil)
+	refresh := pool.candidates.begin([]Proxy{known, pending, failed, policy, resource}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{failed, policy}, nil, map[string]bool{policy.Key(): true})
 
-	page, raw := getCandidatePage(t, server.handler(), "/api/candidates/page?page_size=100")
-	if page.CandidateTotal != 6 || page.FilteredTotal != 6 || page.Phase != "complete" {
-		t.Fatalf("catalog page totals/phase = %#v", page)
+	page := NewStatusServer(pool, &ConfigStore{}).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
+	if page.CandidateTotal != 1 || page.FilteredTotal != 1 || len(page.Candidates) != 1 {
+		t.Fatalf("pending candidate page = %#v", page)
 	}
-	if !strings.Contains(raw, "catalog-user") || !strings.Contains(raw, "do-not-leak") {
-		t.Fatalf("candidate response omitted upstream credentials: %s", raw)
+	if got := page.Candidates[0]; got.Key != pending.Key() || got.Status != candidateDeferred.String() || !got.Routable {
+		t.Fatalf("candidate page record = %#v, want pending forwarding candidate %q", got, pending.Key())
 	}
-	byKey := make(map[string]CandidateView)
-	for _, candidate := range page.Candidates {
-		byKey[candidate.Key] = candidate
-	}
-	assertCandidateStatus(t, byKey, available.Key(), "known_available")
-	assertCandidateStatus(t, byKey, unavailable.Key(), "known_unavailable")
-	assertCandidateStatus(t, byKey, failed.Key(), "checked_failed")
-	assertCandidateStatus(t, byKey, policy.Key(), "policy_filtered")
-	assertCandidateStatus(t, byKey, deferred.Key(), "deferred")
-	assertCandidateStatus(t, byKey, resource.Key(), "resource")
-	if !byKey[failed.Key()].HasAuth {
-		t.Fatal("authenticated candidate did not expose has_auth=true")
-	}
-	if got, want := byKey[failed.Key()].ProxyURL, failed.ConsumerURL(); got != want || byKey[failed.Key()].Username != failed.Username || byKey[failed.Key()].Password != failed.Password {
-		t.Fatalf("authenticated candidate credentials = %#v, want URL %q and original fields", byKey[failed.Key()], want)
-	}
-	if byKey[resource.Key()].Routable {
-		t.Fatal("proxyip resource was marked routable")
-	}
-	if got := byKey[failed.Key()].SourceNames; len(got) != 2 || got[0] != "alpha" || got[1] != "beta" {
-		t.Fatalf("multi-source attribution = %v", got)
-	}
-	if byKey[failed.Key()].SourceCountry != "JP" || byKey[failed.Key()].Country != "JP" {
-		t.Fatalf("source geography missing: %#v", byKey[failed.Key()])
-	}
-	if byKey[failed.Key()].LastChecked == "" || byKey[deferred.Key()].LastChecked != "" {
-		t.Fatalf("last_checked semantics failed: failed=%q deferred=%q", byKey[failed.Key()].LastChecked, byKey[deferred.Key()].LastChecked)
-	}
-
-	beta, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?source=beta&page_size=100")
-	if beta.FilteredTotal != 2 {
-		t.Fatalf("source=beta total = %d, want both primary and secondary attribution", beta.FilteredTotal)
-	}
-	unknown, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?country=__unknown__&page_size=100")
-	if unknown.FilteredTotal != 2 {
-		t.Fatalf("unknown-country total = %d, want 2", unknown.FilteredTotal)
-	}
-	jpFailed, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?country=JP&status=failed&page_size=100")
-	if jpFailed.FilteredTotal != 1 || jpFailed.Candidates[0].Key != failed.Key() {
-		t.Fatalf("JP failed filter = %#v", jpFailed)
-	}
-	knownPage, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?status=known&page_size=100")
-	if knownPage.FilteredTotal != 2 {
-		t.Fatalf("status=known total = %d, want available and unavailable pool members", knownPage.FilteredTotal)
-	}
-	unknownDeferred, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?status=deferred&country=__unknown__&page_size=100")
-	if unknownDeferred.FilteredTotal != 1 || unknownDeferred.Candidates[0].Key != deferred.Key() {
-		t.Fatalf("unknown deferred filter = %#v", unknownDeferred)
-	}
-	knownJP, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?status=known&country=US&page_size=100")
-	knownFacetTotal := 0
-	for _, facet := range knownJP.Statuses {
-		if facet.Status == "known_available" || facet.Status == "known_unavailable" {
-			knownFacetTotal += facet.Total
-		}
-	}
-	if knownFacetTotal != 1 {
-		t.Fatalf("US contextual known facet total = %d, facets=%#v", knownFacetTotal, knownJP.Statuses)
-	}
-	protocolVariant, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?search=192.0.2.1&page_size=100")
-	if protocolVariant.FilteredTotal != 2 {
-		t.Fatalf("protocol-aware variants at one address = %d, want 2", protocolVariant.FilteredTotal)
-	}
-	clamped, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?page=999&page_size=100000")
-	if clamped.Page != 1 || clamped.PageSize != maxCandidatePageSize {
-		t.Fatalf("page bounds = page %d size %d", clamped.Page, clamped.PageSize)
-	}
-
-	// Availability is a live overlay, not frozen at scrape completion.
-	pool.SetAvailable(available.Key(), false)
-	updated, _ := getCandidatePage(t, server.handler(), "/api/candidates/page?search=192.0.2.1:8080&page_size=100")
-	updatedByKey := make(map[string]CandidateView)
-	for _, candidate := range updated.Candidates {
-		updatedByKey[candidate.Key] = candidate
-	}
-	assertCandidateStatus(t, updatedByKey, available.Key(), "known_unavailable")
 }
 
-func TestCandidateRecordStatusCheckedFailedNotOverlaidAsAvailable(t *testing.T) {
-	// A node that is in the pool as Available=true but failed its most recent
-	// check must not be relabeled "known_available" - the check result takes
-	// priority, matching candidatePolicyFiltered's behavior.
-	failedButInPool := Proxy{IP: "192.0.2.200", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
-	pool := NewProxyPool()
-	pool.Prime([]Proxy{failedButInPool}, nil)
-	refresh := pool.candidates.begin([]Proxy{failedButInPool}, nil, nil, 0)
-	// complete marks the node as checked_failed because it was checked but not alive.
-	pool.candidates.complete(refresh, []Proxy{failedButInPool}, nil, nil)
-
-	// The node is in the pool (Available=true) but the candidate record says
-	// checked_failed. The rendered status must be "checked_failed", not
-	// "known_available".
-	page, _ := getCandidatePage(t, NewStatusServer(pool, &ConfigStore{}).handler(), "/api/candidates/page?page_size=100")
-	if len(page.Candidates) != 1 {
-		t.Fatalf("expected 1 candidate, got %d", len(page.Candidates))
-	}
-	if page.Candidates[0].Status != "checked_failed" {
-		t.Fatalf("candidate status = %q, want %q", page.Candidates[0].Status, "checked_failed")
-	}
-	if page.Candidates[0].Available {
-		t.Fatal("checked_failed candidate was incorrectly marked as available")
-	}
-
-	// Verify policy_filtered still takes priority as before, and that a node
-	// with deferred status still gets overlaid by known availability.
-	policyInPool := Proxy{IP: "192.0.2.201", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
-	deferredInPool := Proxy{IP: "192.0.2.202", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
-	pool2 := NewProxyPool()
-	pool2.Prime([]Proxy{policyInPool, deferredInPool}, nil)
-	r2 := pool2.candidates.begin([]Proxy{policyInPool, deferredInPool}, nil, nil, 0)
-	pool2.candidates.complete(r2, []Proxy{policyInPool, deferredInPool}, []Proxy{deferredInPool}, map[string]bool{policyInPool.Key(): true})
-
-	page2, _ := getCandidatePage(t, NewStatusServer(pool2, &ConfigStore{}).handler(), "/api/candidates/page?page_size=100")
-	byKey := make(map[string]CandidateView)
-	for _, c := range page2.Candidates {
-		byKey[c.Key] = c
-	}
-	assertCandidateStatus(t, byKey, policyInPool.Key(), "policy_filtered")
-	assertCandidateStatus(t, byKey, deferredInPool.Key(), "known_available")
-}
-
-func TestCandidateCatalogRemoveKeysRetriesAfterConcurrentHealthOutcome(t *testing.T) {
-	dir := t.TempDir()
+func TestCandidateOutcomeMovesFailureOutOfCandidates(t *testing.T) {
+	unreachable := Proxy{IP: "192.0.2.20", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	policy := Proxy{IP: "192.0.2.21", Port: "8080", Protocol: "http", SourceName: "feed"}
 	catalog := &CandidateCatalog{}
-	catalog.SetDiskCache(newCandidateCatalogCache(dir))
-	remove := Proxy{IP: "8.8.8.81", Port: "1080", Protocol: "socks5", SourceName: "feed"}
-	keep := Proxy{IP: "8.8.4.51", Port: "8080", Protocol: "http", SourceName: "feed"}
-	refresh := catalog.begin([]Proxy{remove, keep}, nil, nil, 0)
-	catalog.complete(refresh, nil, nil, nil)
+	refresh := catalog.begin([]Proxy{unreachable, policy}, nil, nil, 0)
+	catalog.complete(refresh, []Proxy{unreachable, policy}, nil, map[string]bool{policy.Key(): true})
 
-	hookCalls := 0
-	catalog.removeBeforeCommit = func() {
-		if hookCalls != 0 {
-			return
-		}
-		hookCalls++
-		if changed := catalog.ApplyHealthOutcomes([]Proxy{keep}, nil, nil); changed != 1 {
-			t.Fatalf("concurrent health outcomes changed %d candidates, want 1", changed)
-		}
+	snapshot := catalog.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.records) != 0 || len(snapshot.failedRecords) != 2 {
+		t.Fatalf("outcome ownership = pending %d failed %d, want 0/2", len(snapshot.records), len(snapshot.failedRecords))
 	}
-	removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
-	if err != nil || len(removed) != 1 || removed[0] != remove.Key() || len(notFound) != 0 {
-		t.Fatalf("RemoveKeys result removed=%v notFound=%v err=%v", removed, notFound, err)
+	failures := make(map[string]CandidateFailureKind, 2)
+	for _, record := range snapshot.failedRecords {
+		key := snapshot.protocols[record.protocolID] + "://" + record.addr
+		failures[key] = record.kind
 	}
-	if hookCalls != 1 {
-		t.Fatalf("remove commit hook calls = %d, want 1", hookCalls)
+	if failures[unreachable.Key()] != candidateFailureUnreachable || failures[policy.Key()] != candidateFailurePolicyFiltered {
+		t.Fatalf("failure kinds = %#v", failures)
 	}
-	live := catalog.snapshot.Load()
-	live.mu.RLock()
-	keepIndex := live.find(keep.Protocol, keep.Addr())
-	if keepIndex < 0 || live.records[keepIndex].status != candidateCheckedFailed || live.records[keepIndex].checkedUnix == 0 {
-		live.mu.RUnlock()
-		t.Fatalf("live concurrent health outcome was lost: index=%d", keepIndex)
-	}
-	liveRevision := live.revision
-	live.mu.RUnlock()
+}
 
-	restored := &CandidateCatalog{}
-	restored.SetDiskCache(newCandidateCatalogCache(dir))
-	loaded, err := restored.LoadDiskCache()
-	if err != nil || !loaded {
-		t.Fatalf("LoadDiskCache = %v, %v", loaded, err)
+func TestCandidateOutcomeHidesAliveRecordBehindPoolOwnership(t *testing.T) {
+	alive := Proxy{IP: "192.0.2.22", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
+	pool := NewProxyPool()
+	refresh := pool.candidates.begin([]Proxy{alive}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{alive}, []Proxy{alive}, nil)
+	pool.Prime([]Proxy{alive}, nil)
+
+	page := NewStatusServer(pool, &ConfigStore{}).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page", nil))
+	if page.CandidateTotal != 0 || page.FilteredTotal != 0 || len(page.Candidates) != 0 {
+		t.Fatalf("alive pool-owned record remained pending: %#v", page)
 	}
-	persisted := restored.snapshot.Load()
-	persisted.mu.RLock()
-	persistedKeepIndex := persisted.find(keep.Protocol, keep.Addr())
-	if persistedKeepIndex < 0 || persisted.records[persistedKeepIndex].status != candidateCheckedFailed || persisted.revision != liveRevision {
-		persisted.mu.RUnlock()
-		t.Fatalf("persisted retry lost health outcome/revision: index=%d revision=%d want=%d", persistedKeepIndex, persisted.revision, liveRevision)
+}
+
+func TestFailedRediscoveryMergesSourcesWithoutRequeueing(t *testing.T) {
+	failed := Proxy{IP: "192.0.2.23", Port: "1080", Protocol: "socks5", SourceName: "source-a", SourceNames: []string{"source-a"}}
+	catalog := &CandidateCatalog{}
+	first := catalog.begin([]Proxy{failed}, map[string]string{"source-a": "Source A", "source-b": "Source B"}, nil, 0)
+	catalog.complete(first, []Proxy{failed}, nil, nil)
+	before := catalog.snapshot.Load()
+	before.mu.Lock()
+	before.failedRecords[0].lastError = "dial timeout"
+	checkedUnix := before.failedRecords[0].checkedUnix
+	before.mu.Unlock()
+
+	rediscovered := failed
+	rediscovered.SourceName = "source-b"
+	rediscovered.SourceNames = []string{"source-b"}
+	catalog.begin([]Proxy{rediscovered}, map[string]string{"source-a": "Source A", "source-b": "Source B"}, nil, 0)
+
+	snapshot := catalog.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.records) != 0 || len(snapshot.failedRecords) != 1 {
+		t.Fatalf("rediscovered failure ownership = pending %d failed %d", len(snapshot.records), len(snapshot.failedRecords))
 	}
-	persisted.mu.RUnlock()
+	record := snapshot.failedRecords[0]
+	if record.kind != candidateFailureUnreachable || record.lastError != "dial timeout" || record.checkedUnix != checkedUnix {
+		t.Fatalf("rediscovery changed failure conclusion: %#v", record)
+	}
+	sources := make([]string, 0, record.sourceCount)
+	for i := uint32(0); i < uint32(record.sourceCount); i++ {
+		sources = append(sources, snapshot.sources[snapshot.sourceRefs[record.sourceOffset+i]])
+	}
+	sort.Strings(sources)
+	if !reflect.DeepEqual(sources, []string{"Source A", "Source B"}) {
+		t.Fatalf("rediscovered failure sources = %v", sources)
+	}
+}
+
+func TestCandidateFailureKeysRemainProtocolAware(t *testing.T) {
+	httpProxy := Proxy{IP: "192.0.2.24", Port: "8080", Protocol: "http", SourceName: "feed"}
+	socksProxy := httpProxy
+	socksProxy.Protocol = "socks5"
+	catalog := &CandidateCatalog{}
+	refresh := catalog.begin([]Proxy{httpProxy, socksProxy}, nil, nil, 0)
+	catalog.complete(refresh, []Proxy{httpProxy, socksProxy}, nil, nil)
+
+	snapshot := catalog.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.failedRecords) != 2 {
+		t.Fatalf("protocol-aware failures = %d, want 2", len(snapshot.failedRecords))
+	}
+	if snapshot.protocols[snapshot.failedRecords[0].protocolID] == snapshot.protocols[snapshot.failedRecords[1].protocolID] {
+		t.Fatalf("failure protocols collapsed: %#v", snapshot.failedRecords)
+	}
+}
+
+func TestResetHealthOutcomesPreservesFailures(t *testing.T) {
+	failed := Proxy{IP: "192.0.2.25", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	catalog := &CandidateCatalog{}
+	refresh := catalog.begin([]Proxy{failed}, nil, nil, 0)
+	catalog.complete(refresh, []Proxy{failed}, nil, nil)
+
+	catalog.ResetHealthOutcomes()
+	snapshot := catalog.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.failedRecords) != 1 || snapshot.failedRecords[0].kind != candidateFailureUnreachable {
+		t.Fatalf("criterion reset changed failures: %#v", snapshot.failedRecords)
+	}
+}
+
+func TestCandidateLeasePreventsDuplicateClaims(t *testing.T) {
+	candidate := Proxy{IP: "192.0.2.26", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	catalog := &CandidateCatalog{}
+	catalog.begin([]Proxy{candidate}, nil, nil, 0)
+
+	first := catalog.LeasePending(1, nil)
+	if len(first) != 1 || first[0].Key != candidate.Key() {
+		t.Fatalf("first lease = %#v", first)
+	}
+	if duplicate := catalog.LeasePending(1, nil); len(duplicate) != 0 {
+		t.Fatalf("duplicate lease = %#v", duplicate)
+	}
+	catalog.ReleaseLeases(first)
+	retried := catalog.LeasePending(1, nil)
+	if len(retried) != 1 || retried[0].Token == first[0].Token {
+		t.Fatalf("released candidate was not leased with a fresh token: first=%#v retried=%#v", first, retried)
+	}
+}
+
+func TestFailedLeaseRequiresExplicitKeys(t *testing.T) {
+	failed := Proxy{IP: "192.0.2.27", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	catalog := &CandidateCatalog{}
+	refresh := catalog.begin([]Proxy{failed}, nil, nil, 0)
+	catalog.complete(refresh, []Proxy{failed}, nil, nil)
+
+	if automatic := catalog.LeasePending(10, nil); len(automatic) != 0 {
+		t.Fatalf("automatic pending lease claimed failures: %#v", automatic)
+	}
+	leases, missing := catalog.LeaseFailed([]string{failed.Key(), "socks5://192.0.2.99:1080"})
+	if len(leases) != 0 || !reflect.DeepEqual(missing, []string{"socks5://192.0.2.99:1080"}) {
+		t.Fatalf("partial failed lease = leases %#v missing %v", leases, missing)
+	}
+	leases, missing = catalog.LeaseFailed([]string{failed.Key()})
+	if len(leases) != 1 || len(missing) != 0 || leases[0].Kind != "failed" {
+		t.Fatalf("explicit failed lease = leases %#v missing %v", leases, missing)
+	}
+}
+
+// TestReconcileFailuresKeepsMergedSourcesSorted guards the cache encoder
+// invariants: when a rediscovered failure merges the current declaration's
+// sources with the old failure's retained attributions, the merged source
+// segment must stay strictly sorted, and the failure collection itself must
+// stay sorted when rediscovered and retained failures interleave — otherwise
+// the candidate cache refuses to persist the snapshot.
+func TestReconcileFailuresKeepsMergedSourcesSorted(t *testing.T) {
+	labels := map[string]string{"alpha-feed": "Alpha Feed", "zulu-feed": "Zulu Feed"}
+	previous := buildCandidateSnapshot([]Proxy{
+		{IP: "192.0.2.70", Port: "1080", Protocol: "socks5", SourceNames: []string{"zulu-feed"}},
+		{IP: "192.0.2.80", Port: "1080", Protocol: "socks5", SourceNames: []string{"alpha-feed", "zulu-feed"}},
+	}, labels)
+	previous.failedRecords = []candidateFailureRecord{
+		{candidateRecord: previous.records[0], kind: candidateFailureUnreachable, lastError: "dial timeout"},
+		{candidateRecord: previous.records[1], kind: candidateFailureUnreachable, lastError: "dial timeout"},
+	}
+	previous.records = nil
+
+	// Only the .80 failure is rediscovered; the .70 failure is retained. The
+	// rediscovered record is appended before the retained one, which breaks
+	// the collection order unless reconciliation re-sorts.
+	current := buildCandidateSnapshot([]Proxy{
+		{IP: "192.0.2.80", Port: "1080", Protocol: "socks5", SourceNames: []string{"zulu-feed"}},
+	}, labels)
+
+	reconciled := reconcileCandidateFailures(previous, current)
+	if len(reconciled.records) != 0 || len(reconciled.failedRecords) != 2 {
+		t.Fatalf("reconciled = %d pending %d failed, want 0 pending 2 failed", len(reconciled.records), len(reconciled.failedRecords))
+	}
+	rediscovered := reconciled.failedRecords[1]
+	if !strings.HasSuffix(rediscovered.addr, ".80:1080") || rediscovered.sourceCount != 2 {
+		t.Fatalf("rediscovered failure = addr %q sources %d, want .80:1080 with both attributions retained", rediscovered.addr, rediscovered.sourceCount)
+	}
+	// begin() assigns these after reconciliation in the live refresh path.
+	reconciled.generation = 1
+	reconciled.revision = 1
+	reconciled.phase = "complete"
+	if err := validateCandidateSnapshot(reconciled); err != nil {
+		t.Fatalf("reconciled snapshot violates cache invariants: %v", err)
+	}
+}
+
+func TestCancelledLeaseLeavesRecordInOriginalCollection(t *testing.T) {
+	pending := Proxy{IP: "192.0.2.28", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	failed := Proxy{IP: "192.0.2.29", Port: "1080", Protocol: "socks5", SourceName: "feed"}
+	catalog := &CandidateCatalog{}
+	refresh := catalog.begin([]Proxy{pending, failed}, nil, nil, 0)
+	catalog.complete(refresh, []Proxy{failed}, nil, nil)
+
+	pendingLeases := catalog.LeasePending(1, nil)
+	failedLeases, missing := catalog.LeaseFailed([]string{failed.Key()})
+	if len(pendingLeases) != 1 || len(failedLeases) != 1 || len(missing) != 0 {
+		t.Fatalf("initial leases = pending %#v failed %#v missing %v", pendingLeases, failedLeases, missing)
+	}
+	catalog.ReleaseLeases(append(pendingLeases, failedLeases...))
+	if len(catalog.LeasePending(1, nil)) != 1 {
+		t.Fatal("cancelled pending lease did not remain pending")
+	}
+	if retried, missing := catalog.LeaseFailed([]string{failed.Key()}); len(retried) != 1 || len(missing) != 0 {
+		t.Fatalf("cancelled failure lease did not remain failed: %#v %v", retried, missing)
+	}
+}
+
+func TestStaleLeaseCannotPublishIntoReplacementSnapshot(t *testing.T) {
+	candidate := Proxy{IP: "192.0.2.30", Port: "1080", Protocol: "socks5", SourceName: "feed", Username: "old", Password: "secret"}
+	catalog := &CandidateCatalog{}
+	catalog.begin([]Proxy{candidate}, nil, nil, 0)
+	leases := catalog.LeasePending(1, nil)
+	if len(leases) != 1 {
+		t.Fatalf("initial leases = %#v", leases)
+	}
+	replacement := candidate
+	replacement.Username = "new"
+	replacement.Password = "changed"
+	catalog.begin([]Proxy{replacement}, nil, nil, 0)
+	outcomes := map[string]candidateCheckOutcome{
+		candidate.Key(): {Key: candidate.Key(), Proxy: candidate, Kind: candidateCheckUnreachable, Error: "dial timeout"},
+	}
+	if err := catalog.CommitLeaseOutcomes(leases, outcomes); err == nil {
+		t.Fatal("stale lease committed into changed declaration")
+	}
+	snapshot := catalog.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.records) != 1 || len(snapshot.failedRecords) != 0 || snapshot.records[0].username != "new" {
+		t.Fatalf("stale lease changed replacement snapshot: pending=%#v failed=%#v", snapshot.records, snapshot.failedRecords)
+	}
+}
+
+func TestCatalogBudgetCountsInventoryAndFailuresWithoutEviction(t *testing.T) {
+	snapshot := buildCandidateSnapshot([]Proxy{
+		{IP: "192.0.2.71", Port: "1080", Protocol: "socks5", SourceName: "feed"},
+		{IP: "192.0.2.72", Port: "8080", Protocol: "http", SourceName: "feed"},
+	}, nil)
+	failedRecord := snapshot.records[1]
+	snapshot.records = snapshot.records[:1]
+	snapshot.failedRecords = []candidateFailureRecord{{candidateRecord: failedRecord, kind: candidateFailureUnreachable}}
+	snapshot.generation = 1
+	snapshot.revision = 1
+	snapshot.phase = "complete"
+
+	if err := validateCandidateSnapshot(snapshot); err != nil {
+		t.Fatalf("inventory+failure snapshot under budget rejected: %v", err)
+	}
+	oversized := cloneCandidateSnapshot(snapshot)
+	oversized.records = make([]candidateRecord, maxCandidateCacheRecords)
+	oversized.failedRecords = []candidateFailureRecord{{kind: candidateFailureUnreachable}}
+	if err := validateCandidateSnapshot(oversized); err == nil || !strings.Contains(err.Error(), "combined record limit") {
+		t.Fatalf("combined inventory+failure budget overflow error = %v", err)
+	}
+	if got := len(snapshot.failedRecords); got != 1 {
+		t.Fatalf("budget validation evicted %d failures, want 1 retained", got)
+	}
 }
 
 // TestCandidateCatalogBeginDoesNotResurrectConcurrentRemoval guards against a
@@ -334,13 +415,12 @@ func TestCandidateCatalogRemoveKeysRestoresCacheAfterUnpublishedStaleWrites(t *t
 	var hookCalls int
 	catalog.removeAfterPersist = func() {
 		hookCalls++
-		policy := map[string]bool(nil)
-		if hookCalls%2 == 1 {
-			policy = map[string]bool{keep.Key(): true}
-		}
-		if changed := catalog.ApplyHealthOutcomes([]Proxy{keep}, nil, policy); changed != 1 {
-			t.Errorf("conflicting health outcome changed %d candidates, want 1", changed)
-		}
+		catalog.publicationMu.Lock()
+		live := catalog.snapshot.Load()
+		live.mu.Lock()
+		live.revision++
+		live.mu.Unlock()
+		catalog.publicationMu.Unlock()
 	}
 	removed, notFound, err := catalog.RemoveKeys([]string{remove.Key()})
 	if err == nil || len(removed) != 0 || len(notFound) != 0 {
@@ -482,7 +562,7 @@ func TestCandidateCatalogRemoveKeysDuringCheckingPersistsWithoutEndingRefresh(t 
 	}
 }
 
-func TestCandidateCatalogResetHealthOutcomesRetainsInventoryAndResources(t *testing.T) {
+func TestCandidateCatalogResetHealthOutcomesRetainsFailuresAndResources(t *testing.T) {
 	failed := Proxy{IP: "192.0.2.51", Port: "8080", Protocol: "http", SourceName: "feed"}
 	policy := Proxy{IP: "192.0.2.52", Port: "1080", Protocol: "socks5", SourceName: "feed"}
 	resource := Proxy{IP: "198.51.100.52", Port: "443", Protocol: "proxyip", SourceName: "resource"}
@@ -490,22 +570,14 @@ func TestCandidateCatalogResetHealthOutcomesRetainsInventoryAndResources(t *test
 	refresh := pool.candidates.begin([]Proxy{failed, policy, resource}, nil, nil, 0)
 	pool.candidates.complete(refresh, []Proxy{failed, policy}, nil, map[string]bool{policy.Key(): true})
 
-	if reset := pool.candidates.ResetHealthOutcomes(); reset != 2 {
-		t.Fatalf("reset=%d, want 2", reset)
+	if reset := pool.candidates.ResetHealthOutcomes(); reset != 0 {
+		t.Fatalf("reset=%d, want no failure reset", reset)
 	}
-	page := NewStatusServer(pool, &ConfigStore{}).buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
-	if page.CandidateTotal != 3 || page.Phase != "restored" {
-		t.Fatalf("reset page = %#v", page)
-	}
-	byKey := make(map[string]CandidateView)
-	for _, candidate := range page.Candidates {
-		byKey[candidate.Key] = candidate
-	}
-	assertCandidateStatus(t, byKey, failed.Key(), "deferred")
-	assertCandidateStatus(t, byKey, policy.Key(), "deferred")
-	assertCandidateStatus(t, byKey, resource.Key(), "resource")
-	if byKey[failed.Key()].LastChecked != "" || byKey[policy.Key()].LastChecked != "" {
-		t.Fatalf("criterion-dependent timestamps survived reset: %#v", byKey)
+	snapshot := pool.candidates.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.records) != 1 || snapshot.protocols[snapshot.records[0].protocolID] != "proxyip" || len(snapshot.failedRecords) != 2 {
+		t.Fatalf("reset ownership = records %#v failures %#v", snapshot.records, snapshot.failedRecords)
 	}
 }
 
@@ -682,20 +754,26 @@ func TestCandidateCatalogFullRefreshReplacesInventoryAndKeepsIntersectionHistory
 	first := pool.candidates.begin([]Proxy{removed, shared}, labels, nil, 0)
 	pool.candidates.complete(first, []Proxy{shared}, nil, nil)
 	before := pool.candidates.snapshot.Load()
-	sharedIndex := before.find(shared.Protocol, shared.Addr())
-	wantCheckedAt := before.records[sharedIndex].checkedUnix
-	if before.records[sharedIndex].status != candidateCheckedFailed || wantCheckedAt == 0 {
-		t.Fatalf("initial shared outcome = %#v", before.records[sharedIndex])
+	sharedIndex := before.findFailed(shared.Protocol, shared.Addr())
+	if sharedIndex < 0 {
+		t.Fatalf("shared failure missing from initial snapshot: %#v", before.failedRecords)
+	}
+	wantCheckedAt := before.failedRecords[sharedIndex].checkedUnix
+	if before.failedRecords[sharedIndex].kind != candidateFailureUnreachable || wantCheckedAt == 0 {
+		t.Fatalf("initial shared outcome = %#v", before.failedRecords[sharedIndex])
 	}
 
 	second := pool.candidates.begin([]Proxy{shared, added}, labels, nil, 0)
 	after := pool.candidates.snapshot.Load()
-	if len(after.records) != 2 || after.find(removed.Protocol, removed.Addr()) >= 0 || after.find(added.Protocol, added.Addr()) < 0 {
-		t.Fatalf("full replacement inventory = %#v", after.records)
+	if len(after.records) != 1 || after.find(removed.Protocol, removed.Addr()) >= 0 || after.find(added.Protocol, added.Addr()) < 0 {
+		t.Fatalf("full replacement pending inventory = %#v", after.records)
 	}
-	sharedIndex = after.find(shared.Protocol, shared.Addr())
-	if got := after.records[sharedIndex]; got.status != candidateCheckedFailed || got.checkedUnix != wantCheckedAt {
-		t.Fatalf("intersection history = %#v, want failed at %d", got, wantCheckedAt)
+	sharedIndex = after.findFailed(shared.Protocol, shared.Addr())
+	if sharedIndex < 0 {
+		t.Fatalf("rediscovered shared failure was requeued: pending=%#v failed=%#v", after.records, after.failedRecords)
+	}
+	if got := after.failedRecords[sharedIndex]; got.kind != candidateFailureUnreachable || got.checkedUnix != wantCheckedAt {
+		t.Fatalf("intersection failure history = %#v, want unreachable at %d", got, wantCheckedAt)
 	}
 	pool.candidates.complete(second, nil, nil, nil)
 }
@@ -759,7 +837,7 @@ func TestCandidateSnapshotIDChangesForSameGenerationCompletionAndPoolOverlay(t *
 
 	pool.SetAvailable(px.Key(), false)
 	overlaid := server.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page", nil))
-	if overlaid.SnapshotID == completed.SnapshotID || len(overlaid.Candidates) != 1 || overlaid.Candidates[0].Status != candidateKnownUnavailable.String() {
+	if overlaid.SnapshotID == completed.SnapshotID || overlaid.CandidateTotal != 0 || len(overlaid.Candidates) != 0 {
 		t.Fatalf("pool overlay reused token/content: completed=%q overlaid=%#v", completed.SnapshotID, overlaid)
 	}
 

@@ -24,11 +24,12 @@ type RefreshCoordinator struct {
 	nextFullRecheckTime time.Time
 	fullRecheckMu       sync.RWMutex
 
-	refreshChan       chan struct{}
-	recheckChan       chan struct{}
-	fullRecheckChan   chan struct{}
-	sourceRefreshChan chan string
-	healthCycleMu     sync.Mutex
+	refreshChan        chan struct{}
+	recheckChan        chan struct{}
+	fullRecheckChan    chan struct{}
+	sourceRefreshChan  chan string
+	candidateCheckChan chan struct{}
+	healthCycleMu      sync.Mutex
 	// sourceLifecycleMu makes source changes and the final pool install one
 	// ordered transaction, preventing stale refresh results from reviving nodes.
 	sourceLifecycleMu sync.RWMutex
@@ -54,6 +55,13 @@ type RefreshCoordinator struct {
 	healthRecheckActive  *HealthRecheckOperation
 	healthRecheckPending *HealthRecheckOperation
 	healthRecheckLast    *HealthRecheckOperation
+
+	candidateCheckMu      sync.RWMutex
+	candidateCheckSeq     uint64
+	candidateCheckActive  *CandidateCheckOperation
+	candidateCheckPending *CandidateCheckOperation
+	candidateCheckLast    *CandidateCheckOperation
+	candidateCheckRequest *candidateCheckRequest
 }
 
 func newRefreshCoordinator() *RefreshCoordinator {
@@ -62,6 +70,7 @@ func newRefreshCoordinator() *RefreshCoordinator {
 		recheckChan:          make(chan struct{}, 1),
 		fullRecheckChan:      make(chan struct{}, 1),
 		sourceRefreshChan:    make(chan string, maxConfiguredSources),
+		candidateCheckChan:   make(chan struct{}, 1),
 		sourceRefreshPending: make(map[string]*SourceRefreshOperation),
 		sourceRefreshActive:  make(map[string]*SourceRefreshOperation),
 		sourceRefreshLast:    make(map[string]time.Time),
@@ -580,9 +589,26 @@ func (c *RefreshCoordinator) shutdown() {
 		c.healthRecheckPending = nil
 		c.healthRecheckOpMu.Unlock()
 
+		c.candidateCheckMu.Lock()
+		candidateOperation := c.candidateCheckActive
+		if candidateOperation == nil {
+			candidateOperation = c.candidateCheckPending
+		}
+		if candidateOperation != nil {
+			candidateOperation.Status = "cancelled"
+			candidateOperation.CompletedAt = now
+			candidateOperation.Error = "application is shutting down"
+			c.candidateCheckLast = cloneCandidateCheckOperation(candidateOperation)
+		}
+		c.candidateCheckActive = nil
+		c.candidateCheckPending = nil
+		c.candidateCheckRequest = nil
+		c.candidateCheckMu.Unlock()
+
 		drainSignal(c.refreshChan)
 		drainSignal(c.recheckChan)
 		drainSignal(c.fullRecheckChan)
+		drainSignal(c.candidateCheckChan)
 		for {
 			select {
 			case <-c.sourceRefreshChan:
@@ -652,6 +678,13 @@ func (c *RefreshCoordinator) resetForTest() {
 	c.healthRecheckPending = nil
 	c.healthRecheckLast = nil
 	c.healthRecheckOpMu.Unlock()
+	c.candidateCheckMu.Lock()
+	c.candidateCheckSeq = 0
+	c.candidateCheckActive = nil
+	c.candidateCheckPending = nil
+	c.candidateCheckLast = nil
+	c.candidateCheckRequest = nil
+	c.candidateCheckMu.Unlock()
 	for {
 		drained := false
 		select {
@@ -666,6 +699,11 @@ func (c *RefreshCoordinator) resetForTest() {
 		}
 		select {
 		case <-c.fullRecheckChan:
+			drained = true
+		default:
+		}
+		select {
+		case <-c.candidateCheckChan:
 			drained = true
 		default:
 		}

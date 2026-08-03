@@ -123,110 +123,41 @@ func checkProxiesDetailed(proxies []Proxy, timeout time.Duration, maxConcurrent 
 }
 
 func checkProxiesDetailedContext(parent context.Context, proxies []Proxy, timeout time.Duration, maxConcurrent int, requireIPChange bool, testURL string) (alive []Proxy, unreachable, policyFiltered map[string]bool) {
-	if parent == nil {
-		parent = context.Background()
-	}
 	baseline := BaselineExitIP()
-	var (
-		mu      sync.Mutex
-		dropped int // transparent proxies filtered by requireIPChange
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, maxConcurrent)
-	)
-	unreachable = make(map[string]bool, len(proxies))
+	outcomes := checkCandidateBatchContext(parent, proxies, candidateCheckOptions{
+		Timeout: timeout, MaxConcurrent: maxConcurrent, RequireIPChange: requireIPChange, TestURL: testURL, BaselineIP: baseline,
+	}, nil)
+	unreachable = make(map[string]bool, len(outcomes))
 	policyFiltered = make(map[string]bool)
-	markUnreachable := func(key string) {
-		mu.Lock()
-		unreachable[key] = true
-		mu.Unlock()
-	}
-
-checkLoop:
-	for _, p := range proxies {
-		select {
-		case sem <- struct{}{}:
-		case <-parent.Done():
-			break checkLoop
+	for _, px := range proxies {
+		outcome, exists := outcomes[px.Key()]
+		if !exists {
+			continue
 		}
-		wg.Add(1)
-		go func(px Proxy) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			nodeContext, cancelNode := context.WithTimeout(parent, timeout)
-			defer cancelNode()
-
-			if !isForwardingProtocol(px.Protocol) {
-				return
-			} else {
-				checked, ok, latency := checkCredentialCandidates(nodeContext, px, testURL, timeout)
-				if !ok {
-					if parent.Err() == nil {
-						markUnreachable(px.Key())
-					}
-					return
-				}
-				px = checked
-				px.LatencyMs = latency.Milliseconds()
-
-				// Best-effort: discover the REAL exit IP (how the outside
-				// world sees this proxy) and geolocate THAT, so country is
-				// trustworthy. All of this is non-fatal - a node stays
-				// alive even if the exit/geo probes are rate-limited; it
-				// just falls back to source-supplied or front-IP geo.
-				px.ExitIP = probeExitIPContext(nodeContext, px, timeout)
-				policy := evaluateIPChangePolicy(px.ExitIP, baseline, requireIPChange)
-				px.IPChangeKnown = policy.IPChangeKnown
-				px.IPChanged = policy.IPChanged
-
-				// Drop transparent proxies that don't actually change the
-				// exit IP - but only when we can positively tell. Unknown
-				// exits are kept rather than falsely dropped. This is a
-				// policy exclusion, not a connectivity failure - the node
-				// genuinely answered - so it does NOT go into unreachable.
-				if !policy.PolicyAllowed {
-					mu.Lock()
-					dropped++
-					policyFiltered[px.Key()] = true
-					mu.Unlock()
-					return
-				}
-
-				normalizeProxyGeoFields(&px)
-				if lookupIP := proxyGeoLookupTarget(px); lookupIP != "" {
-					c, ci, co := LookupGeoContext(nodeContext, lookupIP, timeout)
-					if c != "" && c != "Unknown" {
-						px.Country, px.City, px.Continent = c, ci, co
-					} else if strings.TrimSpace(px.Country) == "" {
-						px.Country = "Unknown"
-					}
-				}
-
-				px.Anonymity = probeAnonymityContext(nodeContext, px, timeout)
-			}
-			if parent.Err() != nil {
-				return
-			}
-
-			mu.Lock()
-			alive = append(alive, px)
-			mu.Unlock()
-		}(p)
+		switch outcome.Kind {
+		case candidateCheckAlive:
+			alive = append(alive, outcome.Proxy)
+		case candidateCheckUnreachable:
+			unreachable[outcome.Key] = true
+		case candidateCheckPolicyFiltered:
+			policyFiltered[outcome.Key] = true
+		}
 	}
-
-	wg.Wait()
-	if dropped > 0 {
-		log.Printf("[checker] dropped %d transparent proxies (exit IP == our own egress %s; disable with -require-ip-change=false)", dropped, baseline)
+	if len(policyFiltered) > 0 {
+		log.Printf("[checker] dropped %d transparent proxies (exit IP == our own egress %s; disable with -require-ip-change=false)", len(policyFiltered), baseline)
 	}
 	return alive, unreachable, policyFiltered
 }
 
 // checkURL verifies a forwarding-capable proxy by fetching testURL through
 // the upstream tunnel and checking that a real HTTP response comes back.
-// Redirects and non-2xx responses fail: otherwise a captive/intercepting proxy
-// could return its own error page and be advertised as healthy. The built-in
-// connectivity endpoint is stricter and must return 204. The response body is
-// never read (Close is called immediately after headers arrive), so this stays
-// cheap even against a heavy page.
+// The built-in connectivity endpoint is strict and must return 204. A custom
+// target accepts successful and target-generated 4xx responses because sites
+// protected by authentication, geo policy, or bot checks commonly reject a
+// generic health-check request even though the proxy reached the configured
+// host. Redirects, proxy-auth challenges, and 5xx responses still fail. The
+// response body is never read (Close is called immediately after headers
+// arrive), so this stays cheap even against a heavy page.
 func checkURL(px Proxy, testURL string, timeout time.Duration) bool {
 	return checkURLContext(context.Background(), px, testURL, timeout)
 }
@@ -317,7 +248,8 @@ func healthResponseStatusAccepted(testURL string, status int) bool {
 	if strings.TrimSpace(testURL) == defaultCheckURL {
 		return status == http.StatusNoContent
 	}
-	return status >= http.StatusOK && status < http.StatusMultipleChoices
+	return status >= http.StatusOK && status < http.StatusMultipleChoices ||
+		status >= http.StatusBadRequest && status < http.StatusInternalServerError && status != http.StatusProxyAuthRequired
 }
 
 // probeExitIP fetches the proxy's real exit IP by asking a lenient

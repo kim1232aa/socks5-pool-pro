@@ -108,8 +108,17 @@ func TestRefreshCoordinatorShutdownRejectsNewOperationsAndFinalizesActiveWork(t 
 		t.Fatal("health recheck was not accepted before shutdown")
 	}
 	coordinator.beginHealthRecheckOperation(pool, 1)
+	candidate, err := coordinator.requestCandidateCheck(candidateCheckOperationCandidateBatch, 1, nil)
+	if err != nil {
+		t.Fatalf("candidate operation was rejected before shutdown: %v", err)
+	}
 
 	coordinator.shutdown()
+
+	cancelledCandidate := coordinator.candidateCheckOperationStatus()
+	if cancelledCandidate.ID != candidate.ID || cancelledCandidate.Status != "cancelled" || cancelledCandidate.CompletedAt == "" {
+		t.Fatalf("candidate status immediately after shutdown = %+v", cancelledCandidate)
+	}
 
 	if operation, accepted := coordinator.requestRefresh(); accepted || operation.Status != "cancelled" {
 		t.Fatalf("post-shutdown refresh = (%+v, %v), want cancelled rejection", operation, accepted)
@@ -119,6 +128,9 @@ func TestRefreshCoordinatorShutdownRejectsNewOperationsAndFinalizesActiveWork(t 
 	}
 	if operation, accepted := coordinator.triggerFullRecheck(pool); accepted || operation.Status != "cancelled" {
 		t.Fatalf("post-shutdown health recheck = (%+v, %v), want cancelled rejection", operation, accepted)
+	}
+	if operation, err := coordinator.requestCandidateCheck(candidateCheckOperationCandidateBatch, 1, nil); err == nil || operation.Status != "cancelled" {
+		t.Fatalf("post-shutdown candidate check = (%+v, %v), want cancelled rejection", operation, err)
 	}
 	coordinator.triggerRecheck()
 	if coordinator.drainRecheckSignalForTest() {

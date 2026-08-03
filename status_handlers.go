@@ -95,8 +95,8 @@ func (s *StatusServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			AvailableTotal: summary.AvailableTotal, UnavailableTotal: summary.UnavailableTotal,
 			HealthRecheckPending: summary.HealthRecheckPending,
 			Scrape:               summary.Scrape,
-			CandidateTotal:       candidate.Total, CandidatePhase: candidate.Phase,
-			CandidateSourceErrors: candidate.SourceErrors, CandidateUpdatedAt: candidate.UpdatedAt,
+			CandidateTotal:       candidate.Total, FailedCandidateTotal: candidate.FailedTotal,
+			CandidatePhase: candidate.Phase, CandidateSourceErrors: candidate.SourceErrors, CandidateUpdatedAt: candidate.UpdatedAt,
 		})
 		return
 	}
@@ -340,15 +340,6 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusConflict, fmt.Errorf("node disappeared while verification was running"))
 		return
 	}
-	reachableKeys := map[string]bool{}
-	policyFiltered := map[string]bool{}
-	if reachable {
-		reachableKeys[in.Key] = true
-	}
-	if reachable && !policyAllowed {
-		policyFiltered[in.Key] = true
-	}
-	s.pool.candidates.ApplyHealthOutcomes([]Proxy{px}, reachableKeys, policyFiltered)
 	labelMatchKnown, labelMatched := manualNodeLabelMatch(country, prevCountry)
 	// Manual verification is an explicit operator action, so make the health
 	// state durable before replying instead of leaving it in the debounce window.

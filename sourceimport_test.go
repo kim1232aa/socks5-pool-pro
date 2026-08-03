@@ -170,12 +170,17 @@ func TestUploadedSourceRefreshRetainsInventoryAndSamplesChecks(t *testing.T) {
 	}
 	snapshot.mu.RLock()
 	defer snapshot.mu.RUnlock()
-	if got := len(snapshot.records); got != 3 {
+	if got := len(snapshot.records) + len(snapshot.failedRecords); got != 3 {
 		t.Fatalf("candidate inventory = %d, want all 3 imported candidates", got)
 	}
 	checked := 0
 	for _, record := range snapshot.records {
 		if record.checkedUnix != 0 {
+			checked++
+		}
+	}
+	for _, failure := range snapshot.failedRecords {
+		if failure.checkedUnix != 0 {
 			checked++
 		}
 	}

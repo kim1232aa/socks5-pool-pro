@@ -68,10 +68,31 @@ type candidateRecord struct {
 	credentialAlternateCount  uint8
 }
 
+type CandidateFailureKind uint8
+
+const (
+	candidateFailureUnreachable CandidateFailureKind = iota + 1
+	candidateFailurePolicyFiltered
+)
+
+func (k CandidateFailureKind) String() string {
+	if k == candidateFailurePolicyFiltered {
+		return "policy_filtered"
+	}
+	return "unreachable"
+}
+
+type candidateFailureRecord struct {
+	candidateRecord
+	kind      CandidateFailureKind
+	lastError string
+}
+
 type candidateSnapshot struct {
 	mu sync.RWMutex
 
 	records                  []candidateRecord
+	failedRecords            []candidateFailureRecord
 	credentialAlternateTable []ProxyCredential
 	sourceRefs               []uint32
 	sourceKeys               []string // stable Source.ID (or a legacy synthetic key)
@@ -107,11 +128,32 @@ type CandidateCatalog struct {
 	removalMu      sync.Mutex
 	removing       map[string]struct{} // guarded by publicationMu
 
+	leaseMu            sync.Mutex
+	nextLeaseToken     uint64
+	pendingLeases      map[string]candidateLeaseState
+	failedLeases       map[string]candidateLeaseState
+	pendingLeaseCursor int
+
 	// Deterministic test seams around persistence and removal publication.
 	persistLocked      func()
 	removeBeforeCommit func()
 	removeAfterPersist func()
 	beginBeforePublish func()
+}
+
+type CandidateLease struct {
+	Token      uint64
+	Key        string
+	Proxy      Proxy
+	Kind       string
+	Snapshot   *candidateSnapshot
+	Generation uint64
+	Revision   uint64
+}
+
+type candidateLeaseState struct {
+	token       uint64
+	fingerprint string
 }
 
 type candidatePromotionLease struct {
@@ -191,7 +233,22 @@ func candidateProxyByKeyLocked(snapshot *candidateSnapshot, key string) (Proxy, 
 	if index < 0 {
 		return Proxy{}, false
 	}
-	record := snapshot.records[index]
+	return candidateProxyFromRecordLocked(snapshot, snapshot.records[index])
+}
+
+func failedCandidateProxyByKeyLocked(snapshot *candidateSnapshot, key string) (Proxy, bool) {
+	protocol, addr, ok := strings.Cut(key, "://")
+	if !ok || protocol == "" || addr == "" {
+		return Proxy{}, false
+	}
+	index := snapshot.findFailed(strings.ToLower(protocol), addr)
+	if index < 0 {
+		return Proxy{}, false
+	}
+	return candidateProxyFromRecordLocked(snapshot, snapshot.failedRecords[index].candidateRecord)
+}
+
+func candidateProxyFromRecordLocked(snapshot *candidateSnapshot, record candidateRecord) (Proxy, bool) {
 	if snapshot.protocols[record.protocolID] == "proxyip" {
 		return Proxy{}, false
 	}
@@ -230,6 +287,422 @@ func candidateProxyByKeyLocked(snapshot *candidateSnapshot, key string) (Proxy, 
 		}
 	}
 	return px, true
+}
+
+func candidateLeaseFingerprint(px Proxy) string {
+	var builder strings.Builder
+	builder.WriteString(px.Key())
+	builder.WriteByte(0)
+	builder.WriteString(px.Username)
+	builder.WriteByte(0)
+	builder.WriteString(px.Password)
+	for _, credential := range px.CredentialAlternates {
+		builder.WriteByte(0)
+		builder.WriteString(credential.Username)
+		builder.WriteByte(0)
+		builder.WriteString(credential.Password)
+	}
+	return builder.String()
+}
+
+func (c *CandidateCatalog) newLeaseLocked(snapshot *candidateSnapshot, key, kind string, px Proxy, leases map[string]candidateLeaseState) CandidateLease {
+	c.nextLeaseToken++
+	if c.nextLeaseToken == 0 {
+		c.nextLeaseToken++
+	}
+	state := candidateLeaseState{token: c.nextLeaseToken, fingerprint: candidateLeaseFingerprint(px)}
+	leases[key] = state
+	return CandidateLease{
+		Token: state.token, Key: key, Proxy: px, Kind: kind,
+		Snapshot: snapshot, Generation: snapshot.generation, Revision: snapshot.revision,
+	}
+}
+
+func (c *CandidateCatalog) LeasePending(limit int, known candidateKnownIndex) []CandidateLease {
+	if limit <= 0 {
+		return nil
+	}
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if c.pendingLeases == nil {
+		c.pendingLeases = make(map[string]candidateLeaseState)
+	}
+	result := make([]CandidateLease, 0, limit)
+	if len(snapshot.records) == 0 {
+		return result
+	}
+	start := c.pendingLeaseCursor % len(snapshot.records)
+	for scanned := 0; scanned < len(snapshot.records) && len(result) < limit; scanned++ {
+		index := (start + scanned) % len(snapshot.records)
+		record := snapshot.records[index]
+		if !candidatePendingRecord(snapshot, record, known) {
+			continue
+		}
+		key := snapshot.protocols[record.protocolID] + "://" + record.addr
+		if _, leased := c.pendingLeases[key]; leased {
+			continue
+		}
+		px, ok := candidateProxyFromRecordLocked(snapshot, record)
+		if !ok {
+			continue
+		}
+		result = append(result, c.newLeaseLocked(snapshot, key, "candidate", px, c.pendingLeases))
+		c.pendingLeaseCursor = (index + 1) % len(snapshot.records)
+	}
+	return result
+}
+
+func (c *CandidateCatalog) LeasePendingKeys(keys []string, known candidateKnownIndex) []CandidateLease {
+	if len(keys) == 0 {
+		return nil
+	}
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if c.pendingLeases == nil {
+		c.pendingLeases = make(map[string]candidateLeaseState)
+	}
+	result := make([]CandidateLease, 0, len(keys))
+	for _, key := range keys {
+		if _, leased := c.pendingLeases[key]; leased {
+			continue
+		}
+		protocol, addr, ok := strings.Cut(key, "://")
+		if !ok {
+			continue
+		}
+		index := snapshot.find(strings.ToLower(protocol), addr)
+		if index < 0 || !candidatePendingRecord(snapshot, snapshot.records[index], known) {
+			continue
+		}
+		canonicalKey := snapshot.protocols[snapshot.records[index].protocolID] + "://" + snapshot.records[index].addr
+		if key != canonicalKey {
+			continue
+		}
+		px, ok := candidateProxyFromRecordLocked(snapshot, snapshot.records[index])
+		if ok {
+			result = append(result, c.newLeaseLocked(snapshot, key, "candidate", px, c.pendingLeases))
+		}
+	}
+	return result
+}
+
+// FilterPendingCandidates compacts one source-derived work slice to the exact
+// entries still owned by the pending catalog. Failed records, ProxyIP resources,
+// and every key already owned by ProxyPool are removed before MaxCandidates is
+// applied, so they cannot consume a bounded automatic-check slot.
+func (c *CandidateCatalog) FilterPendingCandidates(candidates []Proxy, known candidateKnownIndex) []Proxy {
+	snapshot := c.snapshot.Load()
+	if snapshot == nil || len(candidates) == 0 {
+		return nil
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	write := 0
+	for _, px := range candidates {
+		index := snapshot.find(strings.ToLower(px.Protocol), px.Addr())
+		if index < 0 || !candidatePendingRecord(snapshot, snapshot.records[index], known) {
+			continue
+		}
+		candidates[write] = px
+		write++
+	}
+	for i := write; i < len(candidates); i++ {
+		candidates[i] = Proxy{}
+	}
+	return candidates[:write:write]
+}
+
+// ValidateFailedKeys performs the read-only, all-or-nothing validation used by
+// the failed-retry API before it creates an operation. Exact canonical keys are
+// required so a case-folded or otherwise rewritten key cannot select a different
+// catalog record than the one the administrator saw.
+func (c *CandidateCatalog) ValidateFailedKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return append([]string(nil), keys...)
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	missing := make([]string, 0)
+	for _, key := range keys {
+		protocol, addr, ok := strings.Cut(key, "://")
+		if !ok {
+			missing = append(missing, key)
+			continue
+		}
+		index := snapshot.findFailed(strings.ToLower(protocol), addr)
+		if index < 0 {
+			missing = append(missing, key)
+			continue
+		}
+		canonicalKey := snapshot.protocols[snapshot.failedRecords[index].protocolID] + "://" + snapshot.failedRecords[index].addr
+		if key != canonicalKey {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func (c *CandidateCatalog) LeaseFailed(keys []string) ([]CandidateLease, []string) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return nil, append([]string(nil), keys...)
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if c.failedLeases == nil {
+		c.failedLeases = make(map[string]candidateLeaseState)
+	}
+	missing := make([]string, 0)
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, leased := c.failedLeases[key]; leased {
+			missing = append(missing, key)
+			continue
+		}
+		protocol, addr, ok := strings.Cut(key, "://")
+		if !ok {
+			missing = append(missing, key)
+			continue
+		}
+		index := snapshot.findFailed(strings.ToLower(protocol), addr)
+		if index < 0 {
+			missing = append(missing, key)
+			continue
+		}
+		canonicalKey := snapshot.protocols[snapshot.failedRecords[index].protocolID] + "://" + snapshot.failedRecords[index].addr
+		if key != canonicalKey {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, missing
+	}
+	result := make([]CandidateLease, 0, len(seen))
+	seen = make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		px, _ := failedCandidateProxyByKeyLocked(snapshot, key)
+		result = append(result, c.newLeaseLocked(snapshot, key, "failed", px, c.failedLeases))
+	}
+	return result, nil
+}
+
+func (c *CandidateCatalog) ReleaseLeases(leases []CandidateLease) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	for _, lease := range leases {
+		states := c.pendingLeases
+		if lease.Kind == "failed" {
+			states = c.failedLeases
+		}
+		if state, ok := states[lease.Key]; ok && state.token == lease.Token {
+			delete(states, lease.Key)
+		}
+	}
+}
+
+// withCandidateLease keeps one pending declaration and its runtime lease
+// current through a pool-promotion callback. It is the single-entry equivalent
+// of CommitLeaseOutcomes' validation boundary, without changing catalog state.
+func (c *CandidateCatalog) withCandidateLease(lease CandidateLease, promote func(Proxy) bool) bool {
+	if lease.Kind != "candidate" || promote == nil {
+		return false
+	}
+	c.publicationMu.RLock()
+	defer c.publicationMu.RUnlock()
+	current := c.snapshot.Load()
+	if current == nil || current != lease.Snapshot {
+		return false
+	}
+	current.mu.RLock()
+	defer current.mu.RUnlock()
+	if current.generation != lease.Generation || current.revision != lease.Revision {
+		return false
+	}
+	declared, ok := candidateProxyByKeyLocked(current, lease.Key)
+	if !ok || candidateLeaseFingerprint(declared) != candidateLeaseFingerprint(lease.Proxy) {
+		return false
+	}
+	c.leaseMu.Lock()
+	state, currentLease := c.pendingLeases[lease.Key]
+	valid := currentLease && state.token == lease.Token && state.fingerprint == candidateLeaseFingerprint(declared)
+	c.leaseMu.Unlock()
+	return valid && promote(declared)
+}
+
+func (c *CandidateCatalog) CommitLeaseOutcomes(leases []CandidateLease, outcomes map[string]candidateCheckOutcome) error {
+	if len(leases) == 0 {
+		return nil
+	}
+	defer c.ReleaseLeases(leases)
+	c.publicationMu.Lock()
+	defer c.publicationMu.Unlock()
+	current := c.snapshot.Load()
+	if current == nil {
+		return fmt.Errorf("candidate catalog is empty")
+	}
+	current.mu.RLock()
+	baseRevision := current.revision
+	c.leaseMu.Lock()
+	for _, lease := range leases {
+		states := c.pendingLeases
+		lookup := candidateProxyByKeyLocked
+		if lease.Kind == "failed" {
+			states = c.failedLeases
+			lookup = failedCandidateProxyByKeyLocked
+		} else if lease.Kind != "candidate" {
+			c.leaseMu.Unlock()
+			current.mu.RUnlock()
+			return fmt.Errorf("candidate lease %q has invalid kind %q", lease.Key, lease.Kind)
+		}
+		state, ok := states[lease.Key]
+		if !ok || state.token != lease.Token {
+			c.leaseMu.Unlock()
+			current.mu.RUnlock()
+			return fmt.Errorf("candidate lease %q is no longer current", lease.Key)
+		}
+		declared, ok := lookup(current, lease.Key)
+		if !ok || state.fingerprint != candidateLeaseFingerprint(declared) || state.fingerprint != candidateLeaseFingerprint(lease.Proxy) {
+			c.leaseMu.Unlock()
+			current.mu.RUnlock()
+			return fmt.Errorf("candidate lease %q declaration changed", lease.Key)
+		}
+		if outcome, exists := outcomes[lease.Key]; exists && outcome.Key != "" && outcome.Key != lease.Key {
+			c.leaseMu.Unlock()
+			current.mu.RUnlock()
+			return fmt.Errorf("candidate lease %q outcome key mismatch", lease.Key)
+		}
+	}
+	c.leaseMu.Unlock()
+
+	next := cloneCandidateSnapshotLocked(current)
+	current.mu.RUnlock()
+	checkedAt := time.Now().Unix()
+	changed := false
+	for _, lease := range leases {
+		outcome, hasOutcome := outcomes[lease.Key]
+		if !hasOutcome || outcome.Kind == candidateCheckNoResult || outcome.Kind == candidateCheckAlive && lease.Kind == "candidate" {
+			continue
+		}
+		if lease.Kind == "candidate" {
+			index := next.find(lease.Proxy.Protocol, lease.Proxy.Addr())
+			if index < 0 || outcome.Kind != candidateCheckUnreachable && outcome.Kind != candidateCheckPolicyFiltered {
+				continue
+			}
+			record := next.records[index]
+			record.checkedUnix = checkedAt
+			kind := candidateFailureUnreachable
+			if outcome.Kind == candidateCheckPolicyFiltered {
+				kind = candidateFailurePolicyFiltered
+			}
+			next.records = append(next.records[:index], next.records[index+1:]...)
+			next.failedRecords = append(next.failedRecords, candidateFailureRecord{
+				candidateRecord: record, kind: kind, lastError: sanitizeCandidateFailureError(outcome.Error),
+			})
+			sort.Slice(next.failedRecords, func(i, j int) bool {
+				return compareCandidateRecords(next, next.failedRecords[i].candidateRecord, next, next.failedRecords[j].candidateRecord) < 0
+			})
+			changed = true
+			continue
+		}
+		index := next.findFailed(lease.Proxy.Protocol, lease.Proxy.Addr())
+		if index < 0 {
+			continue
+		}
+		switch outcome.Kind {
+		case candidateCheckAlive:
+			next.failedRecords = append(next.failedRecords[:index], next.failedRecords[index+1:]...)
+			changed = true
+		case candidateCheckUnreachable, candidateCheckPolicyFiltered:
+			record := &next.failedRecords[index]
+			record.checkedUnix = checkedAt
+			record.lastError = sanitizeCandidateFailureError(outcome.Error)
+			record.kind = candidateFailureUnreachable
+			if outcome.Kind == candidateCheckPolicyFiltered {
+				record.kind = candidateFailurePolicyFiltered
+			}
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	next.revision = baseRevision + 1
+	rebuildCandidateSourceFacets(next)
+	cachePhase := next.phase
+	if cachePhase == "checking" {
+		if next.sourceErrors > 0 {
+			next.phase = "partial"
+		} else {
+			next.phase = "complete"
+		}
+	}
+	if err := c.persistImmutableSnapshot(next, false); err != nil {
+		return fmt.Errorf("persist candidate lease outcomes: %w", err)
+	}
+	next.phase = cachePhase
+	current.mu.RLock()
+	consistent := c.snapshot.Load() == current && current.revision == baseRevision
+	current.mu.RUnlock()
+	if !consistent || !c.snapshot.CompareAndSwap(current, next) {
+		if err := c.restoreLiveSnapshot(); err != nil {
+			return fmt.Errorf("candidate lease outcome publication conflicted; restore live snapshot: %w", err)
+		}
+		return fmt.Errorf("candidate lease outcome publication conflicted")
+	}
+	return nil
+}
+
+func cloneCandidateSnapshotLocked(snapshot *candidateSnapshot) *candidateSnapshot {
+	return &candidateSnapshot{
+		records: append([]candidateRecord(nil), snapshot.records...), failedRecords: append([]candidateFailureRecord(nil), snapshot.failedRecords...),
+		credentialAlternateTable: append([]ProxyCredential(nil), snapshot.credentialAlternateTable...),
+		sourceRefs:               append([]uint32(nil), snapshot.sourceRefs...), sourceKeys: append([]string(nil), snapshot.sourceKeys...),
+		sources: append([]string(nil), snapshot.sources...), protocols: append([]string(nil), snapshot.protocols...),
+		countries: append([]string(nil), snapshot.countries...), cities: append([]string(nil), snapshot.cities...),
+		sourceTotals: append([]int(nil), snapshot.sourceTotals...), sourceFacetValues: append([]string(nil), snapshot.sourceFacetValues...),
+		sourceFacetTotals: append([]int(nil), snapshot.sourceFacetTotals...), protocolTotals: append([]int(nil), snapshot.protocolTotals...),
+		generation: snapshot.generation, revision: snapshot.revision, phase: snapshot.phase, sourceErrors: snapshot.sourceErrors,
+		seenAt: snapshot.seenAt, refreshAttempt: snapshot.refreshAttempt, completedAt: snapshot.completedAt,
+	}
+}
+
+const maxCandidateFailureErrorLength = 512
+
+func sanitizeCandidateFailureError(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) > maxCandidateFailureErrorLength {
+		value = value[:maxCandidateFailureErrorLength]
+	}
+	return value
 }
 
 const candidateRemovalMaxAttempts = 4
@@ -281,6 +754,9 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 				continue
 			}
 			builder.appendRecord(current, record, nil)
+		}
+		for _, failure := range current.failedRecords {
+			builder.appendFailure(current, failure)
 		}
 		next := builder.snapshot
 		builder.finalizeCredentialAlternates()
@@ -408,45 +884,10 @@ func (c *CandidateCatalog) ResetHealthOutcomes() int {
 // inventory or phase; those belong to the scrape lifecycle. Results are
 // process-local (startup resets criterion-dependent cache annotations), so a
 // five-minute recheck does not recompress the entire large catalog on disk.
-func (c *CandidateCatalog) ApplyHealthOutcomes(checked []Proxy, reachable, policyFiltered map[string]bool) int {
-	if len(checked) == 0 {
-		return 0
-	}
-	c.publicationMu.RLock()
-	defer c.publicationMu.RUnlock()
-	snapshot := c.snapshot.Load()
-	if snapshot == nil {
-		return 0
-	}
-	checkedAt := time.Now().Unix()
-	snapshot.mu.Lock()
-	changed := 0
-	for _, px := range checked {
-		if px.Protocol == "proxyip" {
-			continue
-		}
-		index := snapshot.find(px.Protocol, px.Addr())
-		if index < 0 {
-			continue
-		}
-		record := &snapshot.records[index]
-		status := candidateCheckedFailed
-		if policyFiltered[px.Key()] {
-			status = candidatePolicyFiltered
-		} else if reachable[px.Key()] {
-			status = candidateDeferred
-		}
-		if record.status != status || record.checkedUnix != checkedAt {
-			record.status = status
-			record.checkedUnix = checkedAt
-			changed++
-		}
-	}
-	if changed > 0 {
-		snapshot.revision++
-	}
-	snapshot.mu.Unlock()
-	return changed
+func (c *CandidateCatalog) ApplyHealthOutcomes(_ []Proxy, _, _ map[string]bool) int {
+	// Retained-pool health checks own only ProxyPool state. Candidate failures are
+	// created exclusively by checks that hold candidate/failed catalog leases.
+	return 0
 }
 
 func (c *CandidateCatalog) protocolTotal(protocol string) (int, bool) {
@@ -456,12 +897,13 @@ func (c *CandidateCatalog) protocolTotal(protocol string) (int, bool) {
 	}
 	snapshot.mu.RLock()
 	defer snapshot.mu.RUnlock()
-	for i, value := range snapshot.protocols {
-		if strings.EqualFold(value, protocol) {
-			return snapshot.protocolTotals[i], true
+	total := 0
+	for _, record := range snapshot.records {
+		if strings.EqualFold(snapshot.protocols[record.protocolID], protocol) {
+			total++
 		}
 	}
-	return 0, true
+	return total, true
 }
 
 type candidateRefresh struct {
@@ -563,13 +1005,16 @@ func (c *CandidateCatalog) begin(candidates []Proxy, sourceLabels map[string]str
 		// attribution from failed feeds remains visible, while successful feeds
 		// are replaced by exactly what they advertised this cycle. This preserves
 		// failures without turning removed entries from healthy feeds immortal.
-		if previous != nil && len(previous.records) > 0 {
+		if previous != nil {
 			previous.mu.RLock()
-			if len(failedSources) > 0 {
-				snapshot = mergeCandidateSnapshots(previous, snapshot, failedSources)
-			} else {
-				carryCandidateHistory(previous, snapshot)
+			if len(previous.records) > 0 {
+				if len(failedSources) > 0 {
+					snapshot = mergeCandidateSnapshots(previous, snapshot, failedSources)
+				} else {
+					carryCandidateHistory(previous, snapshot)
+				}
 			}
+			snapshot = reconcileCandidateFailures(previous, snapshot)
 			previous.mu.RUnlock()
 		}
 		snapshot.generation = refresh.generation
@@ -614,6 +1059,107 @@ func carryCandidateHistory(previous, current *candidateSnapshot) {
 		}
 	}
 	current.completedAt = previous.completedAt
+}
+
+// reconcileCandidateFailures carries the durable failure collection across
+// source generations. A rediscovered failed key is removed from pending and its
+// current declaration is merged into the existing failure without changing the
+// last checked conclusion. Failures not rediscovered remain retained.
+func reconcileCandidateFailures(previous, current *candidateSnapshot) *candidateSnapshot {
+	if len(previous.failedRecords) == 0 {
+		return current
+	}
+	builder := newCandidateSnapshotBuilder(len(current.records) + len(previous.failedRecords))
+	failed := make(map[string]candidateFailureRecord, len(previous.failedRecords))
+	for _, failure := range previous.failedRecords {
+		key := previous.protocols[failure.protocolID] + "://" + failure.addr
+		failed[key] = failure
+	}
+	for _, record := range current.records {
+		key := current.protocols[record.protocolID] + "://" + record.addr
+		failure, exists := failed[key]
+		if !exists {
+			builder.appendRecord(current, record, nil)
+			continue
+		}
+		merged := record
+		merged.checkedUnix = failure.checkedUnix
+		alts := copyCredentialAlternates(current, record)
+		alts = mergeCredentialAlternates(alts, merged, previous, failure.candidateRecord)
+		merged.hasAuth = merged.hasAuth || failure.hasAuth || credentialAlternatesHaveAuth(alts)
+		translated, _ := builder.translateRecord(current, merged, nil)
+		currentSourceEnd := len(builder.snapshot.sourceRefs)
+		for i := uint32(0); i < uint32(failure.sourceCount); i++ {
+			ref := previous.sourceRefs[failure.sourceOffset+i]
+			key, label := previous.sourceKeys[ref], previous.sources[ref]
+			duplicate := false
+			for offset := int(translated.sourceOffset); offset < currentSourceEnd; offset++ {
+				if builder.snapshot.sourceKeys[builder.snapshot.sourceRefs[offset]] == key {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				id := builder.internSource(key, label)
+				builder.snapshot.sourceRefs = append(builder.snapshot.sourceRefs, id)
+				builder.snapshot.sourceTotals[id]++
+				translated.sourceCount++
+			}
+		}
+		// The retained failure attributions can sort before the current
+		// declaration's sources (the rediscovered feed list dropped the
+		// alphabetically earlier feeds), so the appended segment is not
+		// inherently ordered. Re-sort it or the cache encoder rejects the
+		// snapshot as "source references are not strictly sorted".
+		sourceStart := int(translated.sourceOffset)
+		segment := builder.snapshot.sourceRefs[sourceStart : sourceStart+int(translated.sourceCount)]
+		sort.Slice(segment, func(i, j int) bool {
+			return builder.snapshot.sourceKeys[segment[i]] < builder.snapshot.sourceKeys[segment[j]]
+		})
+		builder.snapshot.failedRecords = append(builder.snapshot.failedRecords, candidateFailureRecord{
+			candidateRecord: translated, kind: failure.kind, lastError: failure.lastError,
+		})
+		builder.perFailedAlts = append(builder.perFailedAlts, alts)
+		delete(failed, key)
+	}
+	for _, failure := range previous.failedRecords {
+		key := previous.protocols[failure.protocolID] + "://" + failure.addr
+		if _, retained := failed[key]; !retained {
+			continue
+		}
+		translated, alts := builder.translateRecord(previous, failure.candidateRecord, nil)
+		builder.snapshot.failedRecords = append(builder.snapshot.failedRecords, candidateFailureRecord{
+			candidateRecord: translated, kind: failure.kind, lastError: failure.lastError,
+		})
+		builder.perFailedAlts = append(builder.perFailedAlts, alts)
+	}
+	// Rediscovered failures were appended in current-record order and retained
+	// failures in previous-failure order, so the concatenation is not globally
+	// sorted. Re-sort while keeping perFailedAlts aligned, or the cache
+	// encoder rejects the snapshot as "failed records are not strictly
+	// sorted" and finalizeCredentialAlternates would bind the wrong
+	// credentials to each record.
+	failures := builder.snapshot.failedRecords
+	order := make([]int, len(failures))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return compareCandidateRecords(builder.snapshot, failures[order[i]].candidateRecord, builder.snapshot, failures[order[j]].candidateRecord) < 0
+	})
+	sortedFailures := make([]candidateFailureRecord, len(failures))
+	sortedAlts := make([][]ProxyCredential, len(failures))
+	for newPos, oldPos := range order {
+		sortedFailures[newPos] = failures[oldPos]
+		sortedAlts[newPos] = builder.perFailedAlts[oldPos]
+	}
+	builder.snapshot.failedRecords = sortedFailures
+	builder.perFailedAlts = sortedAlts
+	builder.finalizeCredentialAlternates()
+	result := builder.snapshot
+	result.completedAt = previous.completedAt
+	rebuildCandidateSourceFacets(result)
+	return result
 }
 
 func buildCandidateSnapshot(candidates []Proxy, sourceLabels map[string]string) *candidateSnapshot {
@@ -796,8 +1342,9 @@ func rebuildCandidateSourceFacets(snapshot *candidateSnapshot) {
 	// two separately configured feeds with the same name). Epoch markers keep
 	// that per-record de-duplication linear without allocating a map per row.
 	seenFolded := make([]uint32, len(foldedIndex))
-	for recordIndex, record := range snapshot.records {
-		epoch := uint32(recordIndex + 1)
+	epoch := uint32(0)
+	countRecord := func(record candidateRecord) {
+		epoch++
 		for i := uint32(0); i < uint32(record.sourceCount); i++ {
 			ref := snapshot.sourceRefs[record.sourceOffset+i]
 			display := snapshot.sources[ref]
@@ -812,6 +1359,12 @@ func rebuildCandidateSourceFacets(snapshot *candidateSnapshot) {
 				displays[folded] = display
 			}
 		}
+	}
+	for _, record := range snapshot.records {
+		countRecord(record)
+	}
+	for _, failure := range snapshot.failedRecords {
+		countRecord(failure.candidateRecord)
 	}
 	keys := make([]string, 0, len(totals))
 	for key := range totals {
@@ -838,6 +1391,7 @@ type candidateSnapshotBuilder struct {
 	countryIDs    map[string]uint32
 	cityIDs       map[string]uint32
 	perRecordAlts [][]ProxyCredential
+	perFailedAlts [][]ProxyCredential
 }
 
 func newCandidateSnapshotBuilder(capacity int) *candidateSnapshotBuilder {
@@ -945,19 +1499,24 @@ func credentialAlternatesHaveAuth(alternates []ProxyCredential) bool {
 
 func (b *candidateSnapshotBuilder) finalizeCredentialAlternates() {
 	var table []ProxyCredential
-	for i := range b.snapshot.records {
-		alts := b.perRecordAlts[i]
+	appendAlternates := func(record *candidateRecord, alts []ProxyCredential) {
 		if len(alts) > maxAlternatesPerCandidate {
 			alts = alts[:maxAlternatesPerCandidate]
 		}
-		b.snapshot.records[i].credentialAlternateOffset = uint32(len(table))
-		b.snapshot.records[i].credentialAlternateCount = uint8(len(alts))
+		record.credentialAlternateOffset = uint32(len(table))
+		record.credentialAlternateCount = uint8(len(alts))
 		table = append(table, alts...)
+	}
+	for i := range b.snapshot.records {
+		appendAlternates(&b.snapshot.records[i], b.perRecordAlts[i])
+	}
+	for i := range b.snapshot.failedRecords {
+		appendAlternates(&b.snapshot.failedRecords[i].candidateRecord, b.perFailedAlts[i])
 	}
 	b.snapshot.credentialAlternateTable = table
 }
 
-func (b *candidateSnapshotBuilder) appendRecord(source *candidateSnapshot, record candidateRecord, sourceNames []string) {
+func (b *candidateSnapshotBuilder) translateRecord(source *candidateSnapshot, record candidateRecord, sourceNames []string) (candidateRecord, []ProxyCredential) {
 	protocol := source.protocols[record.protocolID]
 	country := source.countries[record.countryID]
 	city := source.cities[record.cityID]
@@ -991,8 +1550,23 @@ func (b *candidateSnapshotBuilder) appendRecord(source *candidateSnapshot, recor
 		record.sourceCount = 1
 	}
 	b.snapshot.protocolTotals[record.protocolID]++
+	return record, alts
+}
+
+func (b *candidateSnapshotBuilder) appendRecord(source *candidateSnapshot, record candidateRecord, sourceNames []string) {
+	record, alts := b.translateRecord(source, record, sourceNames)
 	b.snapshot.records = append(b.snapshot.records, record)
 	b.perRecordAlts = append(b.perRecordAlts, alts)
+}
+
+func (b *candidateSnapshotBuilder) appendFailure(source *candidateSnapshot, failure candidateFailureRecord) {
+	record, alts := b.translateRecord(source, failure.candidateRecord, nil)
+	b.snapshot.failedRecords = append(b.snapshot.failedRecords, candidateFailureRecord{
+		candidateRecord: record,
+		kind:            failure.kind,
+		lastError:       failure.lastError,
+	})
+	b.perFailedAlts = append(b.perFailedAlts, alts)
 }
 
 func recordHasSourceIn(snapshot *candidateSnapshot, record candidateRecord, allowed map[string]bool) bool {
@@ -1226,10 +1800,9 @@ func candidateMergedSize(a, b *candidateSnapshot, failedSources map[string]bool)
 	return total + len(b.records) - j
 }
 
-// complete applies the bounded check results to a detached copy and atomically
-// publishes it. Source-declared country/city are intentionally not replaced by
-// exit-geo observations: catalog country facets describe source inventory,
-// while /api/nodes/page describes verified routable exits.
+// complete applies one bounded source-check cycle. Failed checks move out of
+// pending inventory into the separate failure collection; successful checks
+// remain represented only by ProxyPool ownership at read and lease time.
 func (c *CandidateCatalog) complete(refresh candidateRefresh, checked, alive []Proxy, policyFiltered map[string]bool) {
 	current := c.snapshot.Load()
 	if current == nil {
@@ -1247,26 +1820,34 @@ func (c *CandidateCatalog) complete(refresh candidateRefresh, checked, alive []P
 	for _, px := range alive {
 		aliveKeys[px.Key()] = true
 	}
+	failureKinds := make(map[string]CandidateFailureKind, len(checked))
 	for _, px := range checked {
-		if px.Protocol == "proxyip" {
+		if px.Protocol == "proxyip" || aliveKeys[px.Key()] {
 			continue
 		}
-		idx := current.find(px.Protocol, px.Addr())
-		if idx < 0 {
-			continue
-		}
-		record := &current.records[idx]
-		record.checkedUnix = checkedAt
+		kind := candidateFailureUnreachable
 		if policyFiltered[px.Key()] {
-			record.status = candidatePolicyFiltered
-		} else if aliveKeys[px.Key()] {
-			// Membership/availability is overlaid from ProxyPool at read time.
-			// Keeping only the discovery outcome here means an explicit later
-			// pool removal does not leave a stale "known" label behind.
-			record.status = candidateDeferred
-		} else {
-			record.status = candidateCheckedFailed
+			kind = candidateFailurePolicyFiltered
 		}
+		failureKinds[px.Key()] = kind
+	}
+	if len(failureKinds) > 0 {
+		pending := current.records[:0]
+		for _, record := range current.records {
+			key := current.protocols[record.protocolID] + "://" + record.addr
+			kind, failed := failureKinds[key]
+			if !failed {
+				pending = append(pending, record)
+				continue
+			}
+			record.status = candidateDeferred
+			record.checkedUnix = checkedAt
+			current.failedRecords = append(current.failedRecords, candidateFailureRecord{candidateRecord: record, kind: kind})
+		}
+		current.records = pending
+		sort.Slice(current.failedRecords, func(i, j int) bool {
+			return compareCandidateRecords(current, current.failedRecords[i].candidateRecord, current, current.failedRecords[j].candidateRecord) < 0
+		})
 	}
 	current.completedAt = time.Unix(checkedAt, 0)
 	if current.sourceErrors > 0 {
@@ -1291,6 +1872,21 @@ func (s *candidateSnapshot) find(protocol, addr string) int {
 	})
 	if idx < len(s.records) {
 		record := s.records[idx]
+		if s.protocols[record.protocolID] == protocol && record.addr == addr {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (s *candidateSnapshot) findFailed(protocol, addr string) int {
+	idx := sort.Search(len(s.failedRecords), func(i int) bool {
+		record := s.failedRecords[i]
+		recordProtocol := s.protocols[record.protocolID]
+		return recordProtocol > protocol || recordProtocol == protocol && record.addr >= addr
+	})
+	if idx < len(s.failedRecords) {
+		record := s.failedRecords[idx]
 		if s.protocols[record.protocolID] == protocol && record.addr == addr {
 			return idx
 		}
@@ -1385,11 +1981,6 @@ type CandidateFacet struct {
 	Total int    `json:"total"`
 }
 
-type CandidateStatusFacet struct {
-	Status string `json:"status"`
-	Total  int    `json:"total"`
-}
-
 type CandidateCountryFacet struct {
 	Country   string `json:"country"`
 	Continent string `json:"continent,omitempty"`
@@ -1409,9 +2000,42 @@ type CandidatePageResponse struct {
 	UpdatedAt           string                  `json:"updated_at,omitempty"`
 	RefreshAttemptedAt  string                  `json:"refresh_attempted_at,omitempty"`
 	SourceErrors        int                     `json:"source_errors"`
-	Statuses            []CandidateStatusFacet  `json:"statuses"`
 	Sources             []CandidateFacet        `json:"sources"`
 	Protocols           []CandidateFacet        `json:"protocols"`
+	Countries           []CandidateCountryFacet `json:"countries"`
+	CountryUnknownTotal int                     `json:"country_unknown_total"`
+}
+
+type FailedCandidateView struct {
+	CandidateView
+	FailureType string `json:"failure_type"`
+	LastError   string `json:"last_error"`
+}
+
+type FailedCandidatePageResponse struct {
+	FailedCandidates []FailedCandidateView `json:"failed_candidates"`
+	SnapshotID       string                `json:"snapshot_id"`
+	Page             int                   `json:"page"`
+	PageSize         int                   `json:"page_size"`
+	PageCount        int                   `json:"page_count"`
+	HasNext          bool                  `json:"has_next"`
+	FilteredTotal    int                   `json:"filtered_total"`
+	FailedTotal      int                   `json:"failed_total"`
+	Sources          []CandidateFacet      `json:"sources"`
+	Protocols        []CandidateFacet      `json:"protocols"`
+	FailureTypes     []CandidateFacet      `json:"failure_types"`
+}
+
+type ProxyIPPageResponse struct {
+	ProxyIPs            []CandidateView         `json:"proxyips"`
+	SnapshotID          string                  `json:"snapshot_id"`
+	Page                int                     `json:"page"`
+	PageSize            int                     `json:"page_size"`
+	PageCount           int                     `json:"page_count"`
+	HasNext             bool                    `json:"has_next"`
+	FilteredTotal       int                     `json:"filtered_total"`
+	ProxyIPTotal        int                     `json:"proxyip_total"`
+	Sources             []CandidateFacet        `json:"sources"`
 	Countries           []CandidateCountryFacet `json:"countries"`
 	CountryUnknownTotal int                     `json:"country_unknown_total"`
 }
@@ -1446,7 +2070,7 @@ func (s *StatusServer) buildCandidatePage(r *http.Request) CandidatePageResponse
 		return CandidatePageResponse{
 			Candidates: []CandidateView{}, SnapshotID: formatCandidateSnapshotID(0, 0, overlayHash), Page: 1, PageSize: defaultCandidatePageSize,
 			PageCount: 1,
-			Phase:     "loading", Statuses: candidateStatusFacets(nil), Sources: []CandidateFacet{},
+			Phase:     "loading", Sources: []CandidateFacet{},
 			Protocols: []CandidateFacet{}, Countries: []CandidateCountryFacet{},
 		}
 	}
@@ -1457,23 +2081,24 @@ func (s *StatusServer) buildCandidatePage(r *http.Request) CandidatePageResponse
 	known, overlayHash := s.pool.candidateKnownSnapshot()
 	snapshotID := formatCandidateSnapshotID(snapshot.generation, snapshot.revision, overlayHash)
 
-	statusCounts := make(map[CandidateStatus]int, 6)
 	countryCounts := make(map[uint32]int)
 	countryContinents := make(map[uint32]string)
 	unknownCountryTotal := 0
 	filteredTotal := 0
+	candidateTotal := 0
+	sourceCounts := make(map[string]int)
+	protocolCounts := make(map[string]int)
 	start := (page - 1) * pageSize
 	pageRows := make([]CandidateView, 0, pageSize)
 	for i := range snapshot.records {
 		record := snapshot.records[i]
-		status := candidateRecordStatus(snapshot, record, known)
-		if !filter.matchesBase(snapshot, record) {
+		if !candidatePendingRecord(snapshot, record, known) {
 			continue
 		}
-		if filter.matchesCountry(record) {
-			statusCounts[status]++
-		}
-		if !filter.matchesStatus(status) {
+		candidateTotal++
+		protocolCounts[snapshot.protocols[record.protocolID]]++
+		countCandidateRecordSources(snapshot, record, sourceCounts)
+		if !filter.matchesBase(snapshot, record) {
 			continue
 		}
 		if record.countryID == 0 {
@@ -1488,7 +2113,7 @@ func (s *StatusServer) buildCandidatePage(r *http.Request) CandidatePageResponse
 			continue
 		}
 		if filteredTotal >= start && len(pageRows) < pageSize {
-			pageRows = append(pageRows, snapshot.view(record, status))
+			pageRows = append(pageRows, snapshot.view(record, candidateDeferred))
 		}
 		filteredTotal++
 	}
@@ -1504,12 +2129,11 @@ func (s *StatusServer) buildCandidatePage(r *http.Request) CandidatePageResponse
 		matched := 0
 		for i := range snapshot.records {
 			record := snapshot.records[i]
-			status := candidateRecordStatus(snapshot, record, known)
-			if !filter.matchesNonCountry(snapshot, record, status) || !filter.matchesCountry(record) {
+			if !candidatePendingRecord(snapshot, record, known) || !filter.matchesBase(snapshot, record) || !filter.matchesCountry(record) {
 				continue
 			}
 			if matched >= start && len(pageRows) < pageSize {
-				pageRows = append(pageRows, snapshot.view(record, status))
+				pageRows = append(pageRows, snapshot.view(record, candidateDeferred))
 			}
 			matched++
 			if len(pageRows) == pageSize {
@@ -1521,14 +2145,185 @@ func (s *StatusServer) buildCandidatePage(r *http.Request) CandidatePageResponse
 	return CandidatePageResponse{
 		Candidates: pageRows, SnapshotID: snapshotID, Page: page, PageSize: pageSize,
 		PageCount: pageCount, HasNext: page < pageCount,
-		FilteredTotal: filteredTotal, CandidateTotal: len(snapshot.records),
+		FilteredTotal: filteredTotal, CandidateTotal: candidateTotal,
 		Phase: snapshot.phase, UpdatedAt: formatCandidateTime(snapshot.seenAt),
 		RefreshAttemptedAt: formatCandidateTime(snapshot.refreshAttempt), SourceErrors: snapshot.sourceErrors,
-		Statuses:  candidateStatusFacets(statusCounts),
-		Sources:   candidateDictionaryFacets(snapshot.sourceFacetValues, snapshot.sourceFacetTotals),
-		Protocols: candidateDictionaryFacets(snapshot.protocols, snapshot.protocolTotals),
+		Sources: candidateMapFacets(sourceCounts), Protocols: candidateMapFacets(protocolCounts),
 		Countries: snapshot.countryFacets(countryCounts, countryContinents), CountryUnknownTotal: unknownCountryTotal,
 	}
+}
+
+func (s *StatusServer) handleFailedCandidatesPage(w http.ResponseWriter, r *http.Request) {
+	page := s.buildFailedCandidatePage(r)
+	w.Header().Set("X-Snapshot-ID", page.SnapshotID)
+	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != page.SnapshotID {
+		writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
+		return
+	}
+	writeJSON(w, page)
+}
+
+func (s *StatusServer) buildFailedCandidatePage(r *http.Request) FailedCandidatePageResponse {
+	page, pageSize := candidatePageParams(r)
+	snapshot := s.pool.candidates.snapshot.Load()
+	if snapshot == nil {
+		return FailedCandidatePageResponse{
+			FailedCandidates: []FailedCandidateView{}, SnapshotID: formatCandidateSnapshotID(0, 0, 0),
+			Page: 1, PageSize: pageSize, PageCount: 1,
+			Sources: []CandidateFacet{}, Protocols: []CandidateFacet{}, FailureTypes: []CandidateFacet{},
+		}
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	filter := newCandidateFilter(r, snapshot)
+	failureType := strings.TrimSpace(r.URL.Query().Get("failure_type"))
+	snapshotID := formatCandidateSnapshotID(snapshot.generation, snapshot.revision, 0)
+	filteredTotal := 0
+	failedTotal := len(snapshot.failedRecords)
+	sourceCounts := make(map[string]int)
+	protocolCounts := make(map[string]int)
+	failureTypeCounts := make(map[string]int)
+	start := (page - 1) * pageSize
+	rows := make([]FailedCandidateView, 0, pageSize)
+	for _, failure := range snapshot.failedRecords {
+		kind := failure.kind.String()
+		protocolCounts[snapshot.protocols[failure.protocolID]]++
+		failureTypeCounts[kind]++
+		countCandidateRecordSources(snapshot, failure.candidateRecord, sourceCounts)
+		if !filter.matchesBase(snapshot, failure.candidateRecord) || failureType != "" && !strings.EqualFold(failureType, kind) {
+			continue
+		}
+		if filteredTotal >= start && len(rows) < pageSize {
+			rows = append(rows, FailedCandidateView{
+				CandidateView: snapshot.view(failure.candidateRecord, candidateDeferred),
+				FailureType:   kind, LastError: failure.lastError,
+			})
+		}
+		filteredTotal++
+	}
+	pageCount := pageCountForTotal(filteredTotal, pageSize)
+	if page > pageCount {
+		page = pageCount
+		start = (page - 1) * pageSize
+		rows = rows[:0]
+		matched := 0
+		for _, failure := range snapshot.failedRecords {
+			kind := failure.kind.String()
+			if !filter.matchesBase(snapshot, failure.candidateRecord) || failureType != "" && !strings.EqualFold(failureType, kind) {
+				continue
+			}
+			if matched >= start && len(rows) < pageSize {
+				rows = append(rows, FailedCandidateView{
+					CandidateView: snapshot.view(failure.candidateRecord, candidateDeferred),
+					FailureType:   kind, LastError: failure.lastError,
+				})
+			}
+			matched++
+			if len(rows) == pageSize {
+				break
+			}
+		}
+	}
+	return FailedCandidatePageResponse{
+		FailedCandidates: rows, SnapshotID: snapshotID, Page: page, PageSize: pageSize,
+		PageCount: pageCount, HasNext: page < pageCount, FilteredTotal: filteredTotal, FailedTotal: failedTotal,
+		Sources: candidateMapFacets(sourceCounts), Protocols: candidateMapFacets(protocolCounts),
+		FailureTypes: candidateMapFacets(failureTypeCounts),
+	}
+}
+
+func (s *StatusServer) handleProxyIPPage(w http.ResponseWriter, r *http.Request) {
+	if err := validateCountryQuery(r); err != nil {
+		writeErrCode(w, http.StatusBadRequest, "invalid_country", err)
+		return
+	}
+	page := s.buildProxyIPPage(r)
+	w.Header().Set("X-Snapshot-ID", page.SnapshotID)
+	if requested := strings.TrimSpace(r.URL.Query().Get("snapshot_id")); requested != "" && requested != page.SnapshotID {
+		writeErrCode(w, http.StatusConflict, "snapshot_changed", fmt.Errorf("requested snapshot %q is no longer current", requested))
+		return
+	}
+	writeJSON(w, page)
+}
+
+func (s *StatusServer) buildProxyIPPage(r *http.Request) ProxyIPPageResponse {
+	page, pageSize := candidatePageParams(r)
+	snapshot := s.pool.candidates.snapshot.Load()
+	if snapshot == nil {
+		return ProxyIPPageResponse{
+			ProxyIPs: []CandidateView{}, SnapshotID: formatCandidateSnapshotID(0, 0, 0),
+			Page: 1, PageSize: pageSize, PageCount: 1,
+			Sources: []CandidateFacet{}, Countries: []CandidateCountryFacet{},
+		}
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	filter := newCandidateFilter(r, snapshot)
+	snapshotID := formatCandidateSnapshotID(snapshot.generation, snapshot.revision, 0)
+	filteredTotal := 0
+	proxyIPTotal := 0
+	unknownCountryTotal := 0
+	sourceCounts := make(map[string]int)
+	countryCounts := make(map[uint32]int)
+	countryContinents := make(map[uint32]string)
+	start := (page - 1) * pageSize
+	rows := make([]CandidateView, 0, pageSize)
+	for _, record := range snapshot.records {
+		if snapshot.protocols[record.protocolID] != "proxyip" {
+			continue
+		}
+		proxyIPTotal++
+		countCandidateRecordSources(snapshot, record, sourceCounts)
+		if !filter.matchesBase(snapshot, record) {
+			continue
+		}
+		if record.countryID == 0 {
+			unknownCountryTotal++
+		} else {
+			countryCounts[record.countryID]++
+			countryContinents[record.countryID] = decodeContinent(record.continent)
+		}
+		if !filter.matchesCountry(record) {
+			continue
+		}
+		if filteredTotal >= start && len(rows) < pageSize {
+			rows = append(rows, snapshot.view(record, candidateResource))
+		}
+		filteredTotal++
+	}
+	pageCount := pageCountForTotal(filteredTotal, pageSize)
+	if page > pageCount {
+		page = pageCount
+		start = (page - 1) * pageSize
+		rows = rows[:0]
+		matched := 0
+		for _, record := range snapshot.records {
+			if snapshot.protocols[record.protocolID] != "proxyip" || !filter.matchesBase(snapshot, record) || !filter.matchesCountry(record) {
+				continue
+			}
+			if matched >= start && len(rows) < pageSize {
+				rows = append(rows, snapshot.view(record, candidateResource))
+			}
+			matched++
+			if len(rows) == pageSize {
+				break
+			}
+		}
+	}
+	return ProxyIPPageResponse{
+		ProxyIPs: rows, SnapshotID: snapshotID, Page: page, PageSize: pageSize,
+		PageCount: pageCount, HasNext: page < pageCount, FilteredTotal: filteredTotal, ProxyIPTotal: proxyIPTotal,
+		Sources: candidateMapFacets(sourceCounts), Countries: snapshot.countryFacets(countryCounts, countryContinents),
+		CountryUnknownTotal: unknownCountryTotal,
+	}
+}
+
+func candidatePendingRecord(snapshot *candidateSnapshot, record candidateRecord, known candidateKnownIndex) bool {
+	if record.status != candidateDeferred || snapshot.protocols[record.protocolID] == "proxyip" {
+		return false
+	}
+	_, exists := knownCandidateStatus(known, snapshot.protocols[record.protocolID], record.addr)
+	return !exists
 }
 
 func candidateRecordStatus(snapshot *candidateSnapshot, record candidateRecord, known candidateKnownIndex) CandidateStatus {
@@ -1607,9 +2402,6 @@ type candidateFilter struct {
 	search         string
 	protocolID     int
 	source         string
-	status         CandidateStatus
-	statusSet      bool
-	knownOnly      bool
 	countryID      int
 	unknownCountry bool
 }
@@ -1621,17 +2413,6 @@ func newCandidateFilter(r *http.Request, snapshot *candidateSnapshot) candidateF
 		filter.protocolID = findFold(snapshot.protocols, value)
 	}
 	filter.source = strings.TrimSpace(query.Get("source"))
-	if value := strings.TrimSpace(query.Get("status")); value != "" {
-		if strings.EqualFold(value, "known") || strings.EqualFold(value, "in_pool") {
-			filter.knownOnly = true
-		} else {
-			filter.status, filter.statusSet = parseCandidateStatus(value)
-			if !filter.statusSet {
-				filter.status = 255
-				filter.statusSet = true
-			}
-		}
-	}
 	filter.unknownCountry = nodeQueryEnabled(query.Get("country_unknown")) || strings.EqualFold(strings.TrimSpace(query.Get("country")), "__unknown__")
 	if !filter.unknownCountry {
 		if raw := strings.TrimSpace(query.Get("country")); raw != "" {
@@ -1643,25 +2424,6 @@ func newCandidateFilter(r *http.Request, snapshot *candidateSnapshot) candidateF
 		}
 	}
 	return filter
-}
-
-func parseCandidateStatus(value string) (CandidateStatus, bool) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "deferred":
-		return candidateDeferred, true
-	case "checked_failed", "failed":
-		return candidateCheckedFailed, true
-	case "policy_filtered", "policy_excluded", "excluded":
-		return candidatePolicyFiltered, true
-	case "known_available", "available":
-		return candidateKnownAvailable, true
-	case "known_unavailable", "unavailable":
-		return candidateKnownUnavailable, true
-	case "resource", "non_routable":
-		return candidateResource, true
-	default:
-		return candidateDeferred, false
-	}
 }
 
 func (f candidateFilter) matchesBase(snapshot *candidateSnapshot, record candidateRecord) bool {
@@ -1684,17 +2446,6 @@ func (f candidateFilter) matchesBase(snapshot *candidateSnapshot, record candida
 		}
 	}
 	return f.search == "" || snapshot.recordContains(record, f.search)
-}
-
-func (f candidateFilter) matchesStatus(status CandidateStatus) bool {
-	if f.knownOnly {
-		return status == candidateKnownAvailable || status == candidateKnownUnavailable
-	}
-	return !f.statusSet || status == f.status
-}
-
-func (f candidateFilter) matchesNonCountry(snapshot *candidateSnapshot, record candidateRecord, status CandidateStatus) bool {
-	return f.matchesBase(snapshot, record) && f.matchesStatus(status)
 }
 
 func (f candidateFilter) matchesCountry(record candidateRecord) bool {
@@ -1772,12 +2523,30 @@ func candidatePageParams(r *http.Request) (page, pageSize int) {
 	return page, pageSize
 }
 
-func candidateStatusFacets(counts map[CandidateStatus]int) []CandidateStatusFacet {
-	statuses := []CandidateStatus{candidateDeferred, candidateCheckedFailed, candidatePolicyFiltered, candidateKnownAvailable, candidateKnownUnavailable, candidateResource}
-	out := make([]CandidateStatusFacet, 0, len(statuses))
-	for _, status := range statuses {
-		out = append(out, CandidateStatusFacet{Status: status.String(), Total: counts[status]})
+func countCandidateRecordSources(snapshot *candidateSnapshot, record candidateRecord, counts map[string]int) {
+	seen := make(map[string]bool, record.sourceCount)
+	for i := uint32(0); i < uint32(record.sourceCount); i++ {
+		value := snapshot.sources[snapshot.sourceRefs[record.sourceOffset+i]]
+		folded := strings.ToLower(value)
+		if seen[folded] {
+			continue
+		}
+		seen[folded] = true
+		counts[value]++
 	}
+}
+
+func candidateMapFacets(counts map[string]int) []CandidateFacet {
+	out := make([]CandidateFacet, 0, len(counts))
+	for value, total := range counts {
+		out = append(out, CandidateFacet{Value: value, Total: total})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Total != out[j].Total {
+			return out[i].Total > out[j].Total
+		}
+		return out[i].Value < out[j].Value
+	})
 	return out
 }
 

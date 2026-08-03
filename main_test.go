@@ -182,7 +182,7 @@ func TestRefreshPoolPrioritizesUnseenCandidateWhenCapped(t *testing.T) {
 	}
 }
 
-func TestRefreshPoolTerminalFailureIsFilteredFromLaterAutomaticRefreshes(t *testing.T) {
+func TestRefreshPoolKnownNodeIsLeftToIndependentRecheck(t *testing.T) {
 	var proxyAttempts atomic.Int64
 	failingProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxyAttempts.Add(1)
@@ -232,18 +232,16 @@ func TestRefreshPoolTerminalFailureIsFilteredFromLaterAutomaticRefreshes(t *test
 
 	refreshPool(cfg, store, pool, newRefreshCoordinator())
 	got, ok := pool.Find(known.Key())
-	st := pool.stats[known.Key()]
-	if !ok || got.Available || !got.HealthInvalidated || !st.HealthFailureTerminal {
-		t.Fatalf("first refresh failure = proxy=%+v stats=%+v found=%v", got, st, ok)
+	if !ok || !got.Available || got.HealthInvalidated {
+		t.Fatalf("source refresh changed known node owned by independent recheck: proxy=%+v found=%v", got, ok)
 	}
-	firstAttempts := proxyAttempts.Load()
-	if firstAttempts == 0 {
-		t.Fatal("first refresh did not health-check known node")
+	if attempts := proxyAttempts.Load(); attempts != 0 {
+		t.Fatalf("source refresh health-checked known node %d time(s), want 0", attempts)
 	}
 
 	refreshPool(cfg, store, pool, newRefreshCoordinator())
-	if got := proxyAttempts.Load(); got != firstAttempts {
-		t.Fatalf("terminal node was automatically retried: attempts=%d want=%d", got, firstAttempts)
+	if attempts := proxyAttempts.Load(); attempts != 0 {
+		t.Fatalf("later automatic refresh checked known node %d time(s), want 0", attempts)
 	}
 }
 

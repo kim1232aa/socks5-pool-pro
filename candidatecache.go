@@ -18,7 +18,7 @@ import (
 const (
 	candidateCacheFilename                  = "candidate_catalog.v1.bin.gz"
 	candidateCacheMagic                     = "SPCAND01"
-	candidateCacheVersion            uint16 = 3
+	candidateCacheVersion            uint16 = 4
 	maxCandidateCacheCompressedBytes        = 96 << 20
 	maxCandidateCacheDecodedBytes           = 256 << 20
 	maxCandidateCacheStringBytes            = 96 << 20
@@ -180,27 +180,7 @@ func cloneCandidateSnapshot(snapshot *candidateSnapshot) *candidateSnapshot {
 	}
 	snapshot.mu.RLock()
 	defer snapshot.mu.RUnlock()
-	return &candidateSnapshot{
-		records:                  append([]candidateRecord(nil), snapshot.records...),
-		credentialAlternateTable: append([]ProxyCredential(nil), snapshot.credentialAlternateTable...),
-		sourceRefs:               append([]uint32(nil), snapshot.sourceRefs...),
-		sourceKeys:               append([]string(nil), snapshot.sourceKeys...),
-		sources:                  append([]string(nil), snapshot.sources...),
-		protocols:                append([]string(nil), snapshot.protocols...),
-		countries:                append([]string(nil), snapshot.countries...),
-		cities:                   append([]string(nil), snapshot.cities...),
-		sourceTotals:             append([]int(nil), snapshot.sourceTotals...),
-		sourceFacetValues:        append([]string(nil), snapshot.sourceFacetValues...),
-		sourceFacetTotals:        append([]int(nil), snapshot.sourceFacetTotals...),
-		protocolTotals:           append([]int(nil), snapshot.protocolTotals...),
-		generation:               snapshot.generation,
-		revision:                 snapshot.revision,
-		phase:                    snapshot.phase,
-		sourceErrors:             snapshot.sourceErrors,
-		seenAt:                   snapshot.seenAt,
-		refreshAttempt:           snapshot.refreshAttempt,
-		completedAt:              snapshot.completedAt,
-	}
+	return cloneCandidateSnapshotLocked(snapshot)
 }
 
 func (cache *candidateCatalogCache) load() (*candidateSnapshot, error) {
@@ -413,41 +393,7 @@ func (e *candidateCacheEncoder) encode(snapshot *candidateSnapshot) error {
 		return err
 	}
 	for _, record := range snapshot.records {
-		if err := e.string(record.addr, maxCandidateCacheStringLength); err != nil {
-			return err
-		}
-		if err := e.string(record.username, maxCandidateCacheStringLength); err != nil {
-			return err
-		}
-		if err := e.string(record.password, maxCandidateCacheStringLength); err != nil {
-			return err
-		}
-		for _, value := range []uint32{record.sourceOffset, record.countryID, record.cityID} {
-			if err := e.uint32(value); err != nil {
-				return err
-			}
-		}
-		if err := e.uint16(record.protocolID); err != nil {
-			return err
-		}
-		if err := e.uint16(record.sourceCount); err != nil {
-			return err
-		}
-		for _, value := range []byte{record.continent, byte(record.status), boolByte(record.hasAuth)} {
-			if err := e.uint8(value); err != nil {
-				return err
-			}
-		}
-		if err := e.int64(record.seenUnix); err != nil {
-			return err
-		}
-		if err := e.int64(record.checkedUnix); err != nil {
-			return err
-		}
-		if err := e.uint32(record.credentialAlternateOffset); err != nil {
-			return err
-		}
-		if err := e.uint8(record.credentialAlternateCount); err != nil {
+		if err := e.record(record); err != nil {
 			return err
 		}
 	}
@@ -463,7 +409,59 @@ func (e *candidateCacheEncoder) encode(snapshot *candidateSnapshot) error {
 			return err
 		}
 	}
+	if err := e.uint32(uint32(len(snapshot.failedRecords))); err != nil {
+		return err
+	}
+	for _, failure := range snapshot.failedRecords {
+		if err := e.record(failure.candidateRecord); err != nil {
+			return err
+		}
+		if err := e.uint8(uint8(failure.kind)); err != nil {
+			return err
+		}
+		if err := e.string(failure.lastError, maxCandidateFailureErrorLength); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (e *candidateCacheEncoder) record(record candidateRecord) error {
+	if err := e.string(record.addr, maxCandidateCacheStringLength); err != nil {
+		return err
+	}
+	if err := e.string(record.username, maxCandidateCacheStringLength); err != nil {
+		return err
+	}
+	if err := e.string(record.password, maxCandidateCacheStringLength); err != nil {
+		return err
+	}
+	for _, value := range []uint32{record.sourceOffset, record.countryID, record.cityID} {
+		if err := e.uint32(value); err != nil {
+			return err
+		}
+	}
+	if err := e.uint16(record.protocolID); err != nil {
+		return err
+	}
+	if err := e.uint16(record.sourceCount); err != nil {
+		return err
+	}
+	for _, value := range []byte{record.continent, byte(record.status), boolByte(record.hasAuth)} {
+		if err := e.uint8(value); err != nil {
+			return err
+		}
+	}
+	if err := e.int64(record.seenUnix); err != nil {
+		return err
+	}
+	if err := e.int64(record.checkedUnix); err != nil {
+		return err
+	}
+	if err := e.uint32(record.credentialAlternateOffset); err != nil {
+		return err
+	}
+	return e.uint8(record.credentialAlternateCount)
 }
 
 func boolByte(value bool) byte {
@@ -548,7 +546,7 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version != 1 && version != 2 && version != 3 {
+	if version < 1 || version > candidateCacheVersion {
 		return nil, fmt.Errorf("unsupported candidate cache version %d", version)
 	}
 	flags, err := d.uint16()
@@ -608,63 +606,8 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 	}
 	snapshot.records = make([]candidateRecord, recordCount)
 	for i := range snapshot.records {
-		record := &snapshot.records[i]
-		if record.addr, err = d.string(maxCandidateCacheStringLength); err != nil {
+		if err := d.record(&snapshot.records[i], version); err != nil {
 			return nil, err
-		}
-		if version >= 2 {
-			if record.username, err = d.string(maxCandidateCacheStringLength); err != nil {
-				return nil, err
-			}
-			if record.password, err = d.string(maxCandidateCacheStringLength); err != nil {
-				return nil, err
-			}
-		}
-		for _, destination := range []*uint32{&record.sourceOffset, &record.countryID, &record.cityID} {
-			if *destination, err = d.uint32(); err != nil {
-				return nil, err
-			}
-		}
-		if record.protocolID, err = d.uint16(); err != nil {
-			return nil, err
-		}
-		if record.sourceCount, err = d.uint16(); err != nil {
-			return nil, err
-		}
-		continent, readErr := d.uint8()
-		if readErr != nil {
-			return nil, readErr
-		}
-		record.continent = continent
-		status, readErr := d.uint8()
-		if readErr != nil {
-			return nil, readErr
-		}
-		record.status = CandidateStatus(status)
-		hasAuth, readErr := d.uint8()
-		if readErr != nil {
-			return nil, readErr
-		}
-		if hasAuth > 1 {
-			return nil, fmt.Errorf("invalid has_auth value %d", hasAuth)
-		}
-		record.hasAuth = hasAuth == 1
-		if record.seenUnix, err = d.int64(); err != nil {
-			return nil, err
-		}
-		if record.checkedUnix, err = d.int64(); err != nil {
-			return nil, err
-		}
-		if version >= 3 {
-			if record.credentialAlternateOffset, err = d.uint32(); err != nil {
-				return nil, err
-			}
-			if record.credentialAlternateCount, err = d.uint8(); err != nil {
-				return nil, err
-			}
-		} else {
-			record.credentialAlternateOffset = 0
-			record.credentialAlternateCount = 0
 		}
 	}
 	if version >= 3 {
@@ -683,7 +626,107 @@ func (d *candidateCacheDecoder) decode() (*candidateSnapshot, error) {
 			}
 		}
 	}
+	if version >= 4 {
+		failureCount, err := d.count(maxCandidateCacheRecords-recordCount, "failed records")
+		if err != nil {
+			return nil, err
+		}
+		snapshot.failedRecords = make([]candidateFailureRecord, failureCount)
+		for i := range snapshot.failedRecords {
+			failure := &snapshot.failedRecords[i]
+			if err := d.record(&failure.candidateRecord, version); err != nil {
+				return nil, err
+			}
+			kind, readErr := d.uint8()
+			if readErr != nil {
+				return nil, readErr
+			}
+			failure.kind = CandidateFailureKind(kind)
+			if failure.lastError, err = d.string(maxCandidateFailureErrorLength); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		migrateLegacyCandidateFailures(snapshot)
+	}
 	return snapshot, nil
+}
+
+func (d *candidateCacheDecoder) record(record *candidateRecord, version uint16) error {
+	var err error
+	if record.addr, err = d.string(maxCandidateCacheStringLength); err != nil {
+		return err
+	}
+	if version >= 2 {
+		if record.username, err = d.string(maxCandidateCacheStringLength); err != nil {
+			return err
+		}
+		if record.password, err = d.string(maxCandidateCacheStringLength); err != nil {
+			return err
+		}
+	}
+	for _, destination := range []*uint32{&record.sourceOffset, &record.countryID, &record.cityID} {
+		if *destination, err = d.uint32(); err != nil {
+			return err
+		}
+	}
+	if record.protocolID, err = d.uint16(); err != nil {
+		return err
+	}
+	if record.sourceCount, err = d.uint16(); err != nil {
+		return err
+	}
+	if record.continent, err = d.uint8(); err != nil {
+		return err
+	}
+	status, err := d.uint8()
+	if err != nil {
+		return err
+	}
+	record.status = CandidateStatus(status)
+	hasAuth, err := d.uint8()
+	if err != nil {
+		return err
+	}
+	if hasAuth > 1 {
+		return fmt.Errorf("invalid has_auth value %d", hasAuth)
+	}
+	record.hasAuth = hasAuth == 1
+	if record.seenUnix, err = d.int64(); err != nil {
+		return err
+	}
+	if record.checkedUnix, err = d.int64(); err != nil {
+		return err
+	}
+	if version >= 3 {
+		if record.credentialAlternateOffset, err = d.uint32(); err != nil {
+			return err
+		}
+		if record.credentialAlternateCount, err = d.uint8(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func migrateLegacyCandidateFailures(snapshot *candidateSnapshot) {
+	pending := snapshot.records[:0]
+	for _, record := range snapshot.records {
+		kind := CandidateFailureKind(0)
+		switch record.status {
+		case candidateCheckedFailed:
+			kind = candidateFailureUnreachable
+		case candidatePolicyFiltered:
+			kind = candidateFailurePolicyFiltered
+		}
+		if kind == 0 {
+			pending = append(pending, record)
+			continue
+		}
+		record.status = candidateDeferred
+		snapshot.failedRecords = append(snapshot.failedRecords, candidateFailureRecord{candidateRecord: record, kind: kind})
+	}
+	snapshot.records = pending
 }
 
 func (d *candidateCacheDecoder) strings(maxCount int) ([]string, error) {
@@ -766,11 +809,17 @@ func validateAndRebuildCandidateSnapshot(snapshot *candidateSnapshot) error {
 	}
 	snapshot.sourceTotals = make([]int, len(snapshot.sources))
 	snapshot.protocolTotals = make([]int, len(snapshot.protocols))
-	for _, record := range snapshot.records {
+	countRecord := func(record candidateRecord) {
 		snapshot.protocolTotals[record.protocolID]++
 		for i := uint32(0); i < uint32(record.sourceCount); i++ {
 			snapshot.sourceTotals[snapshot.sourceRefs[record.sourceOffset+i]]++
 		}
+	}
+	for _, record := range snapshot.records {
+		countRecord(record)
+	}
+	for _, failure := range snapshot.failedRecords {
+		countRecord(failure.candidateRecord)
 	}
 	rebuildCandidateSourceFacets(snapshot)
 	return nil
@@ -784,18 +833,28 @@ func validateAndRebuildCandidateSnapshot(snapshot *candidateSnapshot) error {
 // entries until the next successful network snapshot; all visible facets are
 // rebuilt from retained records only.
 func filterNonPublicCandidateRecords(snapshot *candidateSnapshot) int {
-	retained := snapshot.records[:0]
-	for _, record := range snapshot.records {
+	valid := func(record candidateRecord) bool {
 		host, port, _ := net.SplitHostPort(record.addr)
 		ip := net.ParseIP(host)
 		protocol := snapshot.protocols[record.protocolID]
-		if (ip != nil && !isPublicInternetIP(ip)) || (protocol == "proxyip" && (ip == nil || port != "443")) {
-			continue
+		return (ip == nil || isPublicInternetIP(ip)) && (protocol != "proxyip" || ip != nil && port == "443")
+	}
+	retained := snapshot.records[:0]
+	for _, record := range snapshot.records {
+		if valid(record) {
+			retained = append(retained, record)
 		}
-		retained = append(retained, record)
 	}
 	removed := len(snapshot.records) - len(retained)
 	snapshot.records = retained
+	retainedFailures := snapshot.failedRecords[:0]
+	for _, failure := range snapshot.failedRecords {
+		if valid(failure.candidateRecord) {
+			retainedFailures = append(retainedFailures, failure)
+		}
+	}
+	removed += len(snapshot.failedRecords) - len(retainedFailures)
+	snapshot.failedRecords = retainedFailures
 	return removed
 }
 
@@ -812,8 +871,11 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 	if snapshot.sourceErrors < 0 || snapshot.sourceErrors > maxCandidateCacheSources {
 		return fmt.Errorf("invalid source error count %d", snapshot.sourceErrors)
 	}
-	if len(snapshot.records) > maxCandidateCacheRecords || len(snapshot.sourceRefs) > maxCandidateCacheSourceRefs {
-		return fmt.Errorf("candidate snapshot exceeds record/reference limits")
+	if len(snapshot.records)+len(snapshot.failedRecords) > maxCandidateCacheRecords {
+		return fmt.Errorf("candidate snapshot exceeds combined record limit %d", maxCandidateCacheRecords)
+	}
+	if len(snapshot.sourceRefs) > maxCandidateCacheSourceRefs {
+		return fmt.Errorf("candidate snapshot exceeds source reference limit %d", maxCandidateCacheSourceRefs)
 	}
 	if len(snapshot.credentialAlternateTable) > maxCandidateCacheCredentialAlts {
 		return fmt.Errorf("candidate credential alternate table exceeds limit %d", maxCandidateCacheCredentialAlts)
@@ -826,7 +888,7 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 	if len(snapshot.sourceKeys) != len(snapshot.sources) || len(snapshot.sources) > maxCandidateCacheSources {
 		return fmt.Errorf("candidate source dictionaries do not align")
 	}
-	if len(snapshot.protocols) > maxCandidateCacheProtocols || len(snapshot.records) > 0 && len(snapshot.protocols) == 0 {
+	if len(snapshot.protocols) > maxCandidateCacheProtocols || len(snapshot.records)+len(snapshot.failedRecords) > 0 && len(snapshot.protocols) == 0 {
 		return fmt.Errorf("invalid protocol dictionary size %d", len(snapshot.protocols))
 	}
 	if len(snapshot.countries) == 0 || len(snapshot.countries) > maxCandidateCacheCountries || snapshot.countries[0] != "" {
@@ -852,21 +914,19 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 			return fmt.Errorf("source reference %d is out of range", ref)
 		}
 	}
-	var previous *candidateRecord
-	for i := range snapshot.records {
-		record := &snapshot.records[i]
+	validateRecord := func(record *candidateRecord, index int, collection string) error {
 		if len(record.addr) == 0 || len(record.addr) > maxCandidateCacheStringLength {
-			return fmt.Errorf("invalid address length at record %d", i)
+			return fmt.Errorf("invalid address length at %s record %d", collection, index)
 		}
 		if len(record.username) > maxCandidateCacheStringLength || len(record.password) > maxCandidateCacheStringLength {
-			return fmt.Errorf("invalid credential length at record %d", i)
+			return fmt.Errorf("invalid credential length at %s record %d", collection, index)
 		}
 		if record.credentialAlternateCount > maxAlternatesPerCandidate {
-			return fmt.Errorf("credential alternate count exceeds limit at record %d", i)
+			return fmt.Errorf("credential alternate count exceeds limit at %s record %d", collection, index)
 		}
 		alternateEnd := uint64(record.credentialAlternateOffset) + uint64(record.credentialAlternateCount)
 		if alternateEnd > uint64(len(snapshot.credentialAlternateTable)) {
-			return fmt.Errorf("credential alternate range is invalid at record %d", i)
+			return fmt.Errorf("credential alternate range is invalid at %s record %d", collection, index)
 		}
 		hasCredentials := record.username != "" || record.password != ""
 		for _, credential := range snapshot.credentialAlternateTable[record.credentialAlternateOffset:alternateEnd] {
@@ -876,42 +936,73 @@ func validateCandidateSnapshot(snapshot *candidateSnapshot) error {
 			}
 		}
 		// v1 persisted only this marker, not the credential strings. Accept a
-		// legacy true marker, but never allow v2/v3 credentials to be hidden by
+		// legacy true marker, but never allow persisted credentials to be hidden by
 		// a false marker.
 		if hasCredentials && !record.hasAuth {
-			return fmt.Errorf("authentication flag does not match credentials at record %d", i)
+			return fmt.Errorf("authentication flag does not match credentials at %s record %d", collection, index)
 		}
 		host, port, err := net.SplitHostPort(record.addr)
 		if err != nil || host == "" {
-			return fmt.Errorf("invalid address at record %d", i)
+			return fmt.Errorf("invalid address at %s record %d", collection, index)
 		}
 		portNumber, err := strconv.ParseUint(port, 10, 16)
 		if err != nil || portNumber == 0 {
-			return fmt.Errorf("invalid port at record %d", i)
+			return fmt.Errorf("invalid port at %s record %d", collection, index)
 		}
 		if int(record.protocolID) >= len(snapshot.protocols) || int(record.countryID) >= len(snapshot.countries) || int(record.cityID) >= len(snapshot.cities) {
-			return fmt.Errorf("dictionary reference out of range at record %d", i)
+			return fmt.Errorf("dictionary reference out of range at %s record %d", collection, index)
 		}
 		end := uint64(record.sourceOffset) + uint64(record.sourceCount)
 		if record.sourceCount == 0 || int(record.sourceCount) > len(snapshot.sources) || end > uint64(len(snapshot.sourceRefs)) {
-			return fmt.Errorf("source range out of bounds at record %d", i)
+			return fmt.Errorf("source range out of bounds at %s record %d", collection, index)
 		}
 		previousSourceKey := ""
 		for offset := uint64(record.sourceOffset); offset < end; offset++ {
 			ref := snapshot.sourceRefs[offset]
 			sourceKey := snapshot.sourceKeys[ref]
 			if offset > uint64(record.sourceOffset) && sourceKey <= previousSourceKey {
-				return fmt.Errorf("source references are not strictly sorted at record %d", i)
+				return fmt.Errorf("source references are not strictly sorted at %s record %d", collection, index)
 			}
 			previousSourceKey = sourceKey
 		}
 		if record.continent > 7 || record.status > candidateResource {
-			return fmt.Errorf("invalid state at record %d", i)
+			return fmt.Errorf("invalid state at %s record %d", collection, index)
+		}
+		return nil
+	}
+	var previous *candidateRecord
+	for i := range snapshot.records {
+		record := &snapshot.records[i]
+		if record.status == candidateCheckedFailed || record.status == candidatePolicyFiltered {
+			return fmt.Errorf("failure status remains in pending record %d", i)
+		}
+		if err := validateRecord(record, i, "pending"); err != nil {
+			return err
 		}
 		if previous != nil && compareCandidateRecords(snapshot, *previous, snapshot, *record) >= 0 {
 			return fmt.Errorf("candidate records are not strictly sorted at record %d", i)
 		}
 		previous = record
+	}
+	previous = nil
+	for i := range snapshot.failedRecords {
+		failure := &snapshot.failedRecords[i]
+		if failure.kind != candidateFailureUnreachable && failure.kind != candidateFailurePolicyFiltered {
+			return fmt.Errorf("invalid failure kind at failed record %d", i)
+		}
+		if len(failure.lastError) > maxCandidateFailureErrorLength {
+			return fmt.Errorf("failure error exceeds limit at failed record %d", i)
+		}
+		if failure.status != candidateDeferred {
+			return fmt.Errorf("invalid status at failed record %d", i)
+		}
+		if err := validateRecord(&failure.candidateRecord, i, "failed"); err != nil {
+			return err
+		}
+		if previous != nil && compareCandidateRecords(snapshot, *previous, snapshot, failure.candidateRecord) >= 0 {
+			return fmt.Errorf("failed records are not strictly sorted at record %d", i)
+		}
+		previous = &failure.candidateRecord
 	}
 	return nil
 }

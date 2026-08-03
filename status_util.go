@@ -494,6 +494,7 @@ type compactStatusSummary struct {
 	HealthRecheckPending  bool        `json:"health_recheck_pending"`
 	Scrape                ScrapeInfo  `json:"scrape"`
 	CandidateTotal        int         `json:"candidate_total"`
+	FailedCandidateTotal  int         `json:"failed_candidate_total"`
 	CandidatePhase        string      `json:"candidate_phase"`
 	CandidateSourceErrors int         `json:"candidate_source_errors"`
 	CandidateUpdatedAt    string      `json:"candidate_updated_at,omitempty"`
@@ -501,6 +502,7 @@ type compactStatusSummary struct {
 
 type compactCandidateSummary struct {
 	Total        int
+	FailedTotal  int
 	Phase        string
 	SourceErrors int
 	UpdatedAt    string
@@ -514,10 +516,17 @@ func (s *StatusServer) compactCandidateStatus() compactCandidateSummary {
 	if snapshot == nil {
 		return compactCandidateSummary{Phase: "loading"}
 	}
+	known, _ := s.pool.candidateKnownSnapshot()
 	snapshot.mu.RLock()
 	defer snapshot.mu.RUnlock()
+	pending := 0
+	for _, record := range snapshot.records {
+		if candidatePendingRecord(snapshot, record, known) {
+			pending++
+		}
+	}
 	return compactCandidateSummary{
-		Total: len(snapshot.records), Phase: snapshot.phase,
+		Total: pending, FailedTotal: len(snapshot.failedRecords), Phase: snapshot.phase,
 		SourceErrors: snapshot.sourceErrors, UpdatedAt: formatCandidateTime(snapshot.seenAt),
 	}
 }

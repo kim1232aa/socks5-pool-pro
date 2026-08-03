@@ -16,6 +16,7 @@ import (
 var (
 	candidateHealthCheckContext = checkURLCredentialCandidatesContext
 	candidateSpeedTestContext   = speedTestCredentialCandidatesContext
+	candidateSpeedProbeExitIP   = probeExitIPContext
 )
 
 type candidateSpeedtestRequest struct {
@@ -40,9 +41,9 @@ type candidateSpeedtestResponse struct {
 	Results []candidateSpeedtestItem `json:"results"`
 }
 
-// handleCandidateSpeedtest measures selected catalog entries concurrently.
-// Successful explicit tests are operator-approved admissions to ProxyPool;
-// failures remain catalog-only observations.
+// handleCandidateSpeedtest measures selected pending entries concurrently.
+// A failed formal health check moves the leased candidate into the failure
+// collection; a download-only speed-test failure releases the lease unchanged.
 func (s *StatusServer) handleCandidateSpeedtest(w http.ResponseWriter, r *http.Request) {
 	var in candidateSpeedtestRequest
 	if err := decodeJSON(r, &in); err != nil {
@@ -98,14 +99,15 @@ func uniqueCandidateSpeedtestKeys(input []string) ([]string, error) {
 
 func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candidateSpeedtestItem {
 	item := candidateSpeedtestItem{Key: key}
-	px, lease, found := s.pool.candidates.leaseByKey(key)
-	if !found || px.Key() != key {
-		// Candidate leases exclude ProxyIP resources and non-forwarding
-		// protocols, so the not-found path also covers an entry that cannot be
-		// dialed as an upstream.
-		item.Error = candidateSpeedtestError("candidate_not_found", fmt.Sprintf("candidate not found or not forwardable: %s", key))
+	known, _ := s.pool.candidateKnownSnapshot()
+	leases := s.pool.candidates.LeasePendingKeys([]string{key}, known)
+	if len(leases) != 1 || leases[0].Key != key {
+		item.Error = candidateSpeedtestError("candidate_not_found", fmt.Sprintf("candidate not found, not pending, or not forwardable: %s", key))
 		return item
 	}
+	lease := leases[0]
+	px := lease.Proxy
+	defer s.pool.candidates.ReleaseLeases(leases)
 	if err := s.beginCandidateSpeedTest(key); err != nil {
 		item.Error = candidateSpeedtestError(candidateSpeedtestBusyCode(err), err.Error())
 		return item
@@ -124,16 +126,33 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 	defer healthCancel()
 	healthVerified, reachable, healthErr := candidateHealthCheckContext(healthCtx, px, checkURL, manualNodeVerifyTotalTimeout)
 	if healthErr != nil || !reachable {
+		if ctx.Err() == nil {
+			message := "candidate failed current health check criterion before speedtest"
+			if healthErr != nil {
+				message = healthErr.Error()
+			}
+			outcome := candidateCheckOutcome{Key: key, Proxy: px, Kind: candidateCheckUnreachable, Error: message}
+			if err := s.pool.candidates.CommitLeaseOutcomes(leases, map[string]candidateCheckOutcome{key: outcome}); err == nil {
+				leases = nil
+			}
+		}
 		item.Error = candidateSpeedtestError("candidate_healthcheck_failed", "candidate failed current health check criterion before speedtest")
 		return item
 	}
 
 	exitIP := ""
 	if requireIPChange {
-		exitIP = probeExitIPContext(healthCtx, healthVerified, manualNodeVerifyExitTimeout)
+		exitIP = candidateSpeedProbeExitIP(healthCtx, healthVerified, manualNodeVerifyExitTimeout)
 	}
 	policy := evaluateIPChangePolicy(exitIP, BaselineExitIP(), requireIPChange)
 	if !policy.PolicyAllowed {
+		outcome := candidateCheckOutcome{
+			Key: key, Proxy: px, Kind: candidateCheckPolicyFiltered,
+			Error: fmt.Sprintf("proxy exit IP %s matches baseline egress", policy.ExitIP),
+		}
+		if err := s.pool.candidates.CommitLeaseOutcomes(leases, map[string]candidateCheckOutcome{key: outcome}); err == nil {
+			leases = nil
+		}
 		item.Error = candidateSpeedtestError("candidate_healthcheck_failed", "candidate failed IP change policy before speedtest")
 		return item
 	}
@@ -149,7 +168,7 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 	}
 
 	s.coordinator.sourceLifecycleMu.Lock()
-	ok := s.pool.candidates.withPromotionLease(lease, func(current Proxy) bool {
+	ok := s.pool.candidates.withCandidateLease(lease, func(current Proxy) bool {
 		verified.SourceName = current.SourceName
 		verified.SourceNames = append([]string(nil), current.SourceNames...)
 		verified.SourceIDs = append([]string(nil), current.SourceIDs...)

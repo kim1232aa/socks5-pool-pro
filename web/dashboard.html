@@ -19,7 +19,9 @@
   <div class="nav-label">资源管理</div>
   <nav class="tabs" role="tablist" aria-label="管理页面">
     <a id="tab-link-nodes" href="#nodes" class="tab-link" data-tab="nodes" data-icon="◉" role="tab" aria-controls="tab-nodes">转发代理池</a>
-    <a id="tab-link-candidates" href="#candidates" class="tab-link" data-tab="candidates" data-icon="◫" role="tab" aria-controls="tab-candidates">候选库存</a>
+    <a id="tab-link-candidates" href="#candidates" class="tab-link" data-tab="candidates" data-icon="◫" role="tab" aria-controls="tab-candidates">候选待检</a>
+    <a id="tab-link-failed-candidates" href="#failed-candidates" class="tab-link" data-tab="failed-candidates" data-icon="✕" role="tab" aria-controls="tab-failed-candidates">失败节点</a>
+    <a id="tab-link-proxyip" href="#proxyip" class="tab-link" data-tab="proxyip" data-icon="☁" role="tab" aria-controls="tab-proxyip">ProxyIP</a>
     <a id="tab-link-sources" href="#sources" class="tab-link" data-tab="sources" data-icon="⌁" role="tab" aria-controls="tab-sources">来源管理</a>
     <a id="tab-link-rules" href="#rules" class="tab-link" data-tab="rules" data-icon="⑂" role="tab" aria-controls="tab-rules">分流规则</a>
     <a id="tab-link-groups" href="#groups" class="tab-link" data-tab="groups" data-icon="◇" role="tab" aria-controls="tab-groups">分组策略</a>
@@ -49,8 +51,9 @@
     <div><span class="panel-kicker">Routable</span><h2>转发代理池</h2><p>只有进入这里的节点才参与 SOCKS/HTTP 转发。</p></div>
     <nav class="resource-rail" aria-label="代理资源边界">
       <a class="resource-pill active" href="#nodes"><b>01</b><span>转发池<small>可路由、可操作</small></span></a>
-      <a class="resource-pill" href="#candidates"><b>02</b><span>候选库存<small>完整只读目录</small></span></a>
-      <a class="resource-pill proxyip" href="#candidates" data-action="show-candidate-protocol" data-protocol="proxyip"><b>03</b><span>ProxyIP<small>Worker 外部资源</small></span></a>
+      <a class="resource-pill" href="#candidates"><b>02</b><span>候选待检<small>等待正式检测</small></span></a>
+      <a class="resource-pill" href="#failed-candidates"><b>03</b><span>失败节点<small>仅手动重测</small></span></a>
+      <a class="resource-pill proxyip" href="#proxyip"><b>04</b><span>ProxyIP<small>Worker 外部资源</small></span></a>
     </nav>
   </div>
 
@@ -66,7 +69,7 @@
       <div class="field-copy"><span class="step-number">健康标准</span><label class="checkurl-label" for="check-url-input">通过代理可访问的目标 URL</label></div>
       <input id="check-url-input" type="url" value="{{.CheckURL}}" placeholder="https://www.google.com/generate_204">
       <button id="check-url-save" type="button" class="btn-sm" data-action="save-check-url">保存并全量复检</button>
-      <span class="checkurl-hint">默认 HTTPS 探针必须返回 204；自定义目标必须返回 2xx，重定向不会被当作成功。更改后旧结果立即失效并全池复检。</span>
+      <span class="checkurl-hint">默认 HTTPS 探针必须返回 204；自定义目标接受 2xx 和目标站明确应答的 4xx（407 除外），重定向（3xx）和 5xx 不会被当作成功。更改后旧结果立即失效并全池复检。</span>
       <span id="check-url-status" class="small" role="status" aria-live="polite"></span>
     </div>
     <div class="checkurl-bar check-options-bar">
@@ -167,50 +170,35 @@
 
 <div id="tab-candidates" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-candidates">
   <div class="view-hero view-hero-catalog">
-    <div><span class="panel-kicker">Catalog</span><h2>候选库存</h2><p>按资源类型和来源地区浏览完整去重快照。</p></div>
-    <div class="catalog-boundary"><b>边界说明</b><span>候选是只读库存，不等于健康代理。</span></div>
+    <div><span class="panel-kicker">Catalog</span><h2>候选待检</h2><p>只列出等待正式检测、且尚未被转发池占用的候选。</p></div>
+    <div class="catalog-boundary"><b>边界说明</b><span>正式检查失败的候选会移入失败节点页，不会留在这里。</span></div>
   </div>
 
-  <section class="task-metrics task-metrics-candidate" aria-label="候选库存概览">
-    <button type="button" class="task-metric" data-action="choose-candidate-summary" data-summary="total" aria-pressed="false"><span>去重候选</span><strong id="candidate-total">加载中</strong></button>
-    <button type="button" class="task-metric" data-action="choose-candidate-summary" data-summary="matching" aria-pressed="true"><span>当前匹配</span><strong id="candidate-matching">加载中</strong></button>
-    <button type="button" class="task-metric healthy" data-action="choose-candidate-summary" data-summary="known" aria-pressed="false"><span>已进入转发池</span><strong id="candidate-known">加载中</strong></button>
-    <button type="button" class="task-metric" data-action="choose-candidate-summary" data-summary="deferred" aria-pressed="false"><span>仍待检测</span><strong id="candidate-deferred">加载中</strong></button>
-    <button type="button" class="task-metric warning" data-action="choose-candidate-summary" data-summary="unknown-country" aria-pressed="false"><span>来源地区未知</span><strong id="candidate-country-unknown">加载中</strong></button>
+  <section class="task-metrics task-metrics-candidate" aria-label="候选待检概览">
+    <div class="task-metric"><span>待检测候选</span><strong id="candidate-total">加载中</strong></div>
+    <div class="task-metric"><span>当前匹配</span><strong id="candidate-matching">加载中</strong></div>
   </section>
 
   <section class="catalog-workflow" aria-label="按类型和地区浏览候选">
     <div class="workflow-heading"><span>浏览路径</span><strong>资源类型 → 来源地区 → 节点结果</strong></div>
     <div class="workflow-step workflow-step-type">
-      <span class="workflow-index">1</span><div class="workflow-copy"><b>选择资源类型</b><small>SOCKS/HTTP 可进入本地转发；ProxyIP 是独立的 Cloudflare 资源。</small></div>
+      <span class="workflow-index">1</span><div class="workflow-copy"><b>选择资源类型</b><small>SOCKS/HTTP 可进入本地转发；ProxyIP 是独立的 Cloudflare 资源，已移到专属页面。</small></div>
       <div id="candidate-protocol-cards" class="protocol-quick" aria-label="按协议快速筛选候选"></div>
     </div>
     <div class="workflow-step workflow-step-region">
       <span class="workflow-index">2</span><div class="workflow-copy"><b>选择来源地区</b><small>先选大洲，再从实时数量中选择国家或地区。</small></div>
       <button id="cf-country-button" type="button" class="country-picker-trigger browse-region-button" data-action="open-candidate-country-picker" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">打开地区浏览器</button>
     </div>
-    <div class="proxyip-rule"><b>Cloudflare ProxyIP</b><span>只接受端口集合含 443 的记录，使用时仅取纯 IP；它不是 <code>host&amp;port=1080&amp;user=...&amp;pass=...</code> 这类 SOCKS/HTTP 链式代理参数。</span></div>
   </section>
 
-  <div class="filter-bar" aria-label="候选目录筛选">
+  <div class="filter-bar" aria-label="候选筛选">
     <label class="sr-only" for="cf-text">搜索候选地址或来源</label>
     <input id="cf-text" placeholder="搜索 IP / 地址 / 来源..." oninput="onCandidateFilterChange()" autocomplete="off">
     <input id="cf-country" type="hidden" value="">
     <label class="sr-only" for="cf-source">按来源筛选候选</label>
     <select id="cf-source" onchange="onCandidateFilterChange()"><option value="">全部来源</option></select>
     <label class="sr-only" for="cf-proto">按协议筛选候选</label>
-    <select id="cf-proto" onchange="onCandidateFilterChange()"><option value="">全部协议</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https（HTTP CONNECT）</option><option value="proxyip">proxyip（不参与转发）</option></select>
-    <label class="sr-only" for="cf-status">按检测状态筛选候选</label>
-    <select id="cf-status" onchange="onCandidateFilterChange()">
-      <option value="">全部状态</option>
-      <option value="known">已进入转发池</option>
-      <option value="known_available">池内可用</option>
-      <option value="known_unavailable">池内不可用</option>
-      <option value="checked_failed">最近检测失败</option>
-      <option value="policy_filtered">策略排除</option>
-      <option value="resource">ProxyIP 资源（不路由）</option>
-      <option value="deferred">仍待检测</option>
-    </select>
+    <select id="cf-proto" onchange="onCandidateFilterChange()"><option value="">全部协议</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https（HTTP CONNECT）</option></select>
     <label class="sr-only" for="cf-pagesize">候选每页显示数量</label>
     <select id="cf-pagesize" onchange="onCandidatePageSizeChange()">
       <option value="10">每页10</option>
@@ -223,21 +211,126 @@
       <span id="candidate-selected-count" role="status" aria-live="polite">已选 0 / 16</span>
       <button type="button" class="btn-sm" data-action="candidate-speedtest-selected" disabled>批量测速并加入转发池</button>
       <button type="button" class="btn-sm danger" data-action="candidate-delete-selected" disabled>删除已选</button>
-      <span class="candidate-speedtest-note">人工测速不受冷却限制；成功后立即加入转发池，失败项仍留在候选库存。</span>
+      <span class="candidate-speedtest-note">人工测速不受冷却限制；成功后立即加入转发池，正式检查失败的会移入失败节点页。</span>
     </div>
-    <span class="candidate-filter-note">筛选和分页均在服务端执行。ProxyIP 的逐条专用验证只提供外部参考，不改变本地转发池状态。</span>
+    <div class="candidate-check-bar" aria-label="批量正式检测">
+      <label class="small" for="candidate-batch-limit">本次检测数量</label>
+      <input id="candidate-batch-limit" type="number" min="1" step="1" inputmode="numeric">
+      <button type="button" class="btn-sm" id="candidate-batch-check-button" data-action="candidate-batch-check">开始批量正式检测</button>
+      <span class="candidate-speedtest-note">按有效“每轮抽样”数量为上限；检测在后台运行，可同时浏览其他页面。</span>
+      <span id="candidate-operation-status" class="small" role="status" aria-live="polite"></span>
+    </div>
+    <span class="candidate-filter-note">筛选和分页均在服务端执行。正式检查失败的候选会移入失败节点页，只能在那里手动重新检测。</span>
   </div>
   <div id="candidate-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
 
   <div class="pager candidate-pager-top" id="candidate-pager-top" aria-label="候选分页（顶部）"></div>
-  <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="全部抓取候选表格">
+  <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="待检测候选表格">
   <table class="candidate-table">
-  <caption class="sr-only">所有来源抓取到的去重代理候选</caption>
-  <thead><tr><th><input id="candidate-select-page" type="checkbox" data-action="candidate-select-page" aria-label="选择本页候选"></th><th>状态</th><th>协议</th><th>候选地址</th><th>来源标注地区</th><th>来源</th><th>测速结果</th><th>操作</th></tr></thead>
-  <tbody id="candidate-tbody"><tr><td colspan="8" class="empty">切换到本页后加载完整候选目录...</td></tr></tbody>
+  <caption class="sr-only">等待正式检测的去重代理候选</caption>
+  <thead><tr><th><input id="candidate-select-page" type="checkbox" data-action="candidate-select-page" aria-label="选择本页候选"></th><th>协议</th><th>候选地址</th><th>来源标注地区</th><th>来源</th><th>测速结果</th><th>操作</th></tr></thead>
+  <tbody id="candidate-tbody"><tr><td colspan="7" class="empty">切换到本页后加载待检测候选...</td></tr></tbody>
   </table>
   </div>
   <div class="pager" id="candidate-pager"></div>
+</div>
+
+<div id="tab-failed-candidates" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-failed-candidates">
+  <div class="view-hero view-hero-catalog">
+    <div><span class="panel-kicker">Quarantine</span><h2>失败节点</h2><p>正式检查失败或被出口策略排除的候选，隔离在这里等待人工处置。</p></div>
+    <div class="catalog-boundary"><b>边界说明</b><span>失败节点不会自动重新检测，也不会自动回到候选待检。</span></div>
+  </div>
+
+  <section class="task-metrics task-metrics-candidate" aria-label="失败节点概览">
+    <div class="task-metric warning"><span>失败节点总数</span><strong id="failed-total">加载中</strong></div>
+    <div class="task-metric"><span>当前匹配</span><strong id="failed-matching">加载中</strong></div>
+  </section>
+
+  <div class="filter-bar" aria-label="失败节点筛选">
+    <label class="sr-only" for="fc-text">搜索失败节点地址或来源</label>
+    <input id="fc-text" placeholder="搜索 IP / 地址 / 来源 / 错误..." oninput="onFailedFilterChange()" autocomplete="off">
+    <label class="sr-only" for="fc-source">按来源筛选失败节点</label>
+    <select id="fc-source" onchange="onFailedFilterChange()"><option value="">全部来源</option></select>
+    <label class="sr-only" for="fc-proto">按协议筛选失败节点</label>
+    <select id="fc-proto" onchange="onFailedFilterChange()"><option value="">全部协议</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https（HTTP CONNECT）</option></select>
+    <label class="sr-only" for="fc-failure-type">按失败类型筛选</label>
+    <select id="fc-failure-type" onchange="onFailedFilterChange()"><option value="">全部失败类型</option></select>
+    <label class="sr-only" for="fc-pagesize">失败节点每页显示数量</label>
+    <select id="fc-pagesize" onchange="onFailedPageSizeChange()">
+      <option value="10">每页10</option>
+      <option value="20">每页20</option>
+      <option value="50" selected>每页50</option>
+      <option value="100">每页100</option>
+    </select>
+    <span id="failed-count" class="small" role="status" aria-live="polite"></span>
+    <div class="candidate-batch-bar" aria-label="失败节点批量操作">
+      <span id="failed-selected-count" role="status" aria-live="polite">已选 0</span>
+      <button type="button" class="btn-sm" id="failed-retry-button" data-action="failed-retry-selected" disabled>手动重新检测已选</button>
+      <span class="candidate-speedtest-note">失败节点不会自动重新检测；勾选后手动提交，通过的回到转发池，仍失败的留在这里。</span>
+      <span id="failed-operation-status" class="small" role="status" aria-live="polite"></span>
+    </div>
+    <span class="candidate-filter-note">筛选和分页均在服务端执行。失败节点只能从这里手动重新检测，来源刷新和定时任务不会触碰它们。</span>
+  </div>
+  <div id="failed-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
+
+  <div class="pager candidate-pager-top" id="failed-pager-top" aria-label="失败节点分页（顶部）"></div>
+  <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="失败节点表格">
+  <table class="candidate-table">
+  <caption class="sr-only">正式检查失败或被策略排除的候选</caption>
+  <thead><tr><th><input id="failed-select-page" type="checkbox" data-action="failed-select-page" aria-label="选择本页失败节点"></th><th>失败类型</th><th>协议</th><th>候选地址</th><th>来源</th><th>错误摘要</th></tr></thead>
+  <tbody id="failed-tbody"><tr><td colspan="6" class="empty">切换到本页后加载失败节点...</td></tr></tbody>
+  </table>
+  </div>
+  <div class="pager" id="failed-pager"></div>
+</div>
+
+<div id="tab-proxyip" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-proxyip">
+  <div class="view-hero view-hero-catalog">
+    <div><span class="panel-kicker">Cloudflare</span><h2>Cloudflare ProxyIP</h2><p>独立的 Worker 外部资源目录，不参与本地转发。</p></div>
+    <div class="catalog-boundary"><b>边界说明</b><span>ProxyIP 不是 SOCKS/HTTP 候选，不会进入转发池。</span></div>
+  </div>
+
+  <section class="task-metrics task-metrics-candidate" aria-label="ProxyIP 概览">
+    <div class="task-metric"><span>ProxyIP 总数</span><strong id="proxyip-total">加载中</strong></div>
+    <div class="task-metric"><span>当前匹配</span><strong id="proxyip-matching">加载中</strong></div>
+  </section>
+
+  <section class="catalog-workflow" aria-label="按地区浏览 ProxyIP">
+    <div class="workflow-heading"><span>浏览路径</span><strong>来源地区 → 资源结果</strong></div>
+    <div class="workflow-step workflow-step-region">
+      <span class="workflow-index">1</span><div class="workflow-copy"><b>选择来源地区</b><small>先选大洲，再从实时数量中选择国家或地区。</small></div>
+      <button id="px-country-button" type="button" class="country-picker-trigger browse-region-button" data-action="open-proxyip-country-picker" aria-haspopup="dialog" aria-expanded="false" aria-controls="candidate-country-modal">打开地区浏览器</button>
+    </div>
+    <div class="proxyip-rule"><b>Cloudflare ProxyIP</b><span>只接受端口集合含 443 的记录，使用时仅取纯 IP；它不是 <code>host&amp;port=1080&amp;user=...&amp;pass=...</code> 这类 SOCKS/HTTP 链式代理参数。</span></div>
+  </section>
+
+  <div class="filter-bar" aria-label="ProxyIP 筛选">
+    <label class="sr-only" for="px-text">搜索 ProxyIP 地址或来源</label>
+    <input id="px-text" placeholder="搜索 IP / 地址 / 来源..." oninput="onProxyIPFilterChange()" autocomplete="off">
+    <input id="px-country" type="hidden" value="">
+    <label class="sr-only" for="px-source">按来源筛选 ProxyIP</label>
+    <select id="px-source" onchange="onProxyIPFilterChange()"><option value="">全部来源</option></select>
+    <label class="sr-only" for="px-pagesize">ProxyIP 每页显示数量</label>
+    <select id="px-pagesize" onchange="onProxyIPPageSizeChange()">
+      <option value="10">每页10</option>
+      <option value="20">每页20</option>
+      <option value="50" selected>每页50</option>
+      <option value="100">每页100</option>
+    </select>
+    <span id="proxyip-count" class="small" role="status" aria-live="polite"></span>
+    <span class="candidate-filter-note">筛选和分页均在服务端执行。逐条专用验证只提供外部参考，不改变本地转发池状态。</span>
+  </div>
+  <div id="proxyip-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
+
+  <div class="pager candidate-pager-top" id="proxyip-pager-top" aria-label="ProxyIP 分页（顶部）"></div>
+  <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="ProxyIP 资源表格">
+  <table class="candidate-table">
+  <caption class="sr-only">Cloudflare ProxyIP 外部资源</caption>
+  <thead><tr><th>地址</th><th>来源标注地区</th><th>来源</th><th>专用验证</th></tr></thead>
+  <tbody id="proxyip-tbody"><tr><td colspan="4" class="empty">切换到本页后加载 ProxyIP 资源...</td></tr></tbody>
+  </table>
+  </div>
+  <div class="pager" id="proxyip-pager"></div>
 </div>
 
 <div id="tab-sources" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-sources">

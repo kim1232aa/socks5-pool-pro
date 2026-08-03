@@ -28,7 +28,7 @@ func TestDashboardUsesSeparateEmbeddedAssets(t *testing.T) {
 }
 
 func TestDashboardPaginationCountryControlsMatchScriptContract(t *testing.T) {
-	for _, id := range []string{"f-country", "cf-country"} {
+	for _, id := range []string{"f-country", "cf-country", "px-country"} {
 		if !strings.Contains(dashboardHTML, `id="`+id+`"`) {
 			t.Fatalf("dashboard template is missing pagination country state control %q", id)
 		}
@@ -40,6 +40,8 @@ func TestDashboardPaginationCountryControlsMatchScriptContract(t *testing.T) {
 		"function requiredControl(id)",
 		"Promise.resolve().then(function() { return fetchJSON(nodePageURL(), options); })",
 		"Promise.resolve().then(function() { return fetchJSON(candidatePageURL(), options); })",
+		"Promise.resolve().then(function() { return fetchJSON(failedPageURL(), options); })",
+		"Promise.resolve().then(function() { return fetchJSON(proxyIPPageURL(), options); })",
 	} {
 		if !strings.Contains(string(dashboardJS), want) {
 			t.Fatalf("dashboard script is missing diagnosable pagination request contract %q", want)
@@ -70,20 +72,37 @@ func TestDashboardExplainsHTTPSConnectWithoutChangingConsumerURL(t *testing.T) {
 	}
 }
 
-func TestDashboardCandidateSummaryCardsDriveServerFilters(t *testing.T) {
+func TestDashboardCandidatePageShowsOnlyPendingWithSimpleFilters(t *testing.T) {
 	for _, want := range []string{
-		`data-action="choose-candidate-summary" data-summary="total"`,
-		`data-action="choose-candidate-summary" data-summary="matching"`,
-		`data-action="choose-candidate-summary" data-summary="known"`,
-		`data-action="choose-candidate-summary" data-summary="deferred"`,
-		`data-action="choose-candidate-summary" data-summary="unknown-country"`,
-		`function chooseCandidateSummary(summary)`,
-		`case 'choose-candidate-summary':`,
-		`status.value = status.value === 'known' ? '' : 'known';`,
-		`country.value = country.value === '__unknown__' ? '' : '__unknown__';`,
+		`id="candidate-total"`,
+		`id="candidate-matching"`,
+		`id="cf-text"`,
+		`id="cf-source"`,
+		`id="cf-proto"`,
+		`id="cf-pagesize"`,
+		`正式检查失败的候选会移入失败节点页`,
 	} {
-		if !strings.Contains(dashboardClientSource(), want) {
-			t.Fatalf("dashboard is missing candidate summary filter contract %q", want)
+		if !strings.Contains(dashboardHTML, want) {
+			t.Fatalf("dashboard is missing pending-candidate filter contract %q", want)
+		}
+	}
+	for _, removed := range []string{
+		`id="cf-status"`,
+		`data-action="choose-candidate-summary"`,
+		`完整只读目录`,
+		`value="proxyip"`,
+	} {
+		if strings.Contains(dashboardHTML, removed) {
+			t.Fatalf("candidate page must not keep retired status/summary filter chrome %q", removed)
+		}
+	}
+	for _, removed := range []string{
+		`function chooseCandidateSummary(`,
+		`case 'choose-candidate-summary':`,
+		`function candidateStatusTotal(`,
+	} {
+		if strings.Contains(string(dashboardJS), removed) {
+			t.Fatalf("dashboard script still drives retired candidate summary/status filters %q", removed)
 		}
 	}
 }
@@ -147,7 +166,7 @@ func TestDashboardCandidatePageSizeIsResponsive(t *testing.T) {
 		"var nodePageSize = defaultNodePageSize();",
 		"var candidatePageSize = defaultCandidatePageSize();",
 		"candidatePageSize = Math.max(1, Math.min(100, candidatePageSize));",
-		"syncNodePageSizeSelect();\nsyncCandidatePageSizeSelect();\nsyncTabFromHash();",
+		"syncNodePageSizeSelect();\nsyncCandidatePageSizeSelect();\nsyncFailedPageSizeSelect();\nsyncProxyIPPageSizeSelect();\nsyncTabFromHash();",
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing responsive candidate page-size contract %q", want)
@@ -257,6 +276,8 @@ func TestDashboardHasVisibleAsyncAndErrorStates(t *testing.T) {
 	for _, want := range []string{
 		`id="node-notice"`,
 		`id="candidate-notice"`,
+		`id="failed-notice"`,
+		`id="proxyip-notice"`,
 		`function setListNotice(id, tone, message)`,
 		`正在获取代理池分页数据`,
 		`正在查询完整候选快照`,
@@ -294,8 +315,12 @@ func TestDashboardKeepsLargePoolPaginationOnStableSnapshots(t *testing.T) {
 	for _, want := range []string{
 		`var nodeSnapshotID = '';`,
 		`var candidateSnapshotID = '';`,
+		`var failedSnapshotID = '';`,
+		`var proxyipSnapshotID = '';`,
 		`q.push('snapshot_id=' + encodeURIComponent(nodeSnapshotID))`,
 		`q.push('snapshot_id=' + encodeURIComponent(candidateSnapshotID))`,
+		`q.push('snapshot_id=' + encodeURIComponent(failedSnapshotID))`,
+		`q.push('snapshot_id=' + encodeURIComponent(proxyipSnapshotID))`,
 		`err.code === 'snapshot_changed'`,
 		`代理池已更新，正在从新快照第一页继续浏览`,
 		`候选目录已生成新快照，正在从第一页继续浏览`,
@@ -375,10 +400,23 @@ func TestDashboardUsesTaskScopedResourceWorkflow(t *testing.T) {
 		`仅取纯 IP`,
 		`不是 <code>host&amp;port=1080&amp;user=...&amp;pass=...</code>`,
 		`.task-metrics-candidate`,
+		`href="#failed-candidates"`,
+		`href="#proxyip"`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing task-scoped resource workflow %q", want)
 		}
+	}
+	for _, removed := range []string{
+		`data-action="show-candidate-protocol"`,
+		`完整只读目录`,
+	} {
+		if strings.Contains(dashboardClientSource(), removed) {
+			t.Fatalf("dashboard still treats ProxyIP/failed nodes as candidate filters %q", removed)
+		}
+	}
+	if strings.Contains(string(dashboardJS), `function showCandidateProtocol(`) {
+		t.Fatal("ProxyIP must be reached through its own tab, not a candidate protocol shortcut")
 	}
 }
 
@@ -390,6 +428,8 @@ func TestDashboardProxyIPVerifyIsExplicitResourceOnlyAction(t *testing.T) {
 		`data-action="proxyip-verify"`,
 		`if (String(protocol || '').toLowerCase() !== 'proxyip')`,
 		`proxyIPVerifyCache[key].state === 'loading'`,
+		`document.querySelectorAll('#proxyip-tbody tr[data-key]')`,
+		`button.closest('#proxyip-tbody tr[data-key]')`,
 		`IPv4：`,
 		`IPv6：`,
 		`仅供 Cloudflare Worker ProxyIP 参考 · 资源/代理池状态不变`,
@@ -401,22 +441,21 @@ func TestDashboardProxyIPVerifyIsExplicitResourceOnlyAction(t *testing.T) {
 	if got := strings.Count(dashboardClientSource(), "fetchJSON('/api/proxyip/verify'"); got != 1 {
 		t.Fatalf("ProxyIP verify endpoint call count = %d, want one explicit action path", got)
 	}
-	guard := strings.Index(dashboardClientSource(), "if (String(protocol || '').toLowerCase() !== 'proxyip')")
-	button := strings.Index(dashboardClientSource(), `data-action="proxyip-verify"`)
-	if guard < 0 || button < 0 || guard > button {
-		t.Fatalf("ordinary candidates are not guarded before rendering the ProxyIP verify button")
+	if strings.Contains(string(dashboardJS), `proxyIPVerifyCellHTML(candidate.key, candidate.protocol)`) {
+		t.Fatal("ordinary candidate rows must not render ProxyIP verify cells; verify lives on the ProxyIP tab only")
 	}
 }
 
-func TestDashboardCandidateManagementKeepsEightColumnShape(t *testing.T) {
+func TestDashboardCandidateManagementKeepsPendingColumnShape(t *testing.T) {
 	for _, want := range []string{
 		`id="candidate-select-page"`,
+		`<th><input id="candidate-select-page" type="checkbox" data-action="candidate-select-page" aria-label="选择本页候选"></th><th>协议</th><th>候选地址</th>`,
 		`<th>测速结果</th><th>操作</th>`,
 		`data-action="candidate-speedtest-selected"`,
 		`data-action="candidate-delete-selected"`,
 		`fetchJSON('/api/candidates/speedtest'`,
 		`fetchJSON('/api/candidates/delete'`,
-		`人工测速不受冷却限制；成功后立即加入转发池，失败项仍留在候选库存。`,
+		`人工测速不受冷却限制；成功后立即加入转发池，正式检查失败的会移入失败节点页。`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing candidate management contract %q", want)
@@ -425,9 +464,13 @@ func TestDashboardCandidateManagementKeepsEightColumnShape(t *testing.T) {
 	// 用户名/密码 were dropped as separate columns: proxy_url already embeds
 	// credentials when present (see TestDashboardShowsUpstreamCredentialsInURL),
 	// so the dedicated columns were pure duplication that inflated the table
-	// past its available width on ordinary desktop viewports.
-	if got := strings.Count(dashboardClientSource(), `colspan="8"`); got != 3 {
-		t.Fatalf("candidate eight-column empty-state colspan count = %d, want 3", got)
+	// past its available width on ordinary desktop viewports. The 状态 column
+	// is gone too: this page only lists pending candidates by definition.
+	if got := strings.Count(dashboardClientSource(), `<td colspan="7" class="empty">`); got != 3 {
+		t.Fatalf("candidate seven-column empty-state colspan count = %d, want 3", got)
+	}
+	if strings.Contains(dashboardHTML, `<th>状态</th><th>协议</th><th>候选地址</th>`) {
+		t.Fatal("pending candidate table must not keep a per-row status column")
 	}
 }
 
@@ -587,6 +630,121 @@ func TestDashboardImportsLocalSourceWithoutLeakingFileMetadata(t *testing.T) {
 	for _, leakedField := range []string{"filename", "filepath", "path", "proxy_url", "username", "password"} {
 		if strings.Contains(string(dashboardJS), `result.`+leakedField) {
 			t.Fatalf("local source import result renders sensitive field %q", leakedField)
+		}
+	}
+}
+
+func TestDashboardSeparatesPendingFailedAndProxyIPTabs(t *testing.T) {
+	for _, want := range []string{
+		`id="tab-link-failed-candidates" href="#failed-candidates"`,
+		`id="tab-link-proxyip" href="#proxyip"`,
+		`id="tab-failed-candidates" class="tab-panel"`,
+		`id="tab-proxyip" class="tab-panel"`,
+		`var validTabs = ['nodes','candidates','failed-candidates','proxyip','sources','rules','groups','listeners'];`,
+		`'failed-candidates': ['失败节点'`,
+		`'proxyip': ['Cloudflare ProxyIP'`,
+		`if (validTabs.indexOf(requested) < 0)`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing separated pending/failed/proxyip tab contract %q", want)
+		}
+	}
+}
+
+func TestDashboardCandidateBatchCheckUsesAsyncStatusAPI(t *testing.T) {
+	for _, want := range []string{
+		`id="candidate-batch-limit"`,
+		`data-action="candidate-batch-check"`,
+		`id="candidate-operation-status"`,
+		`fetchJSON('/api/candidates/batch-check', {`,
+		`body:JSON.stringify({limit:limit})`,
+		`function pollCandidateCheckOperation(`,
+		`case 'candidate-batch-check': startCandidateBatchCheck(actionElement); break;`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing candidate batch-check async contract %q", want)
+		}
+	}
+}
+
+func TestDashboardFailedPageFiltersSelectsAndRetries(t *testing.T) {
+	for _, want := range []string{
+		`id="failed-tbody"`,
+		`id="fc-text"`,
+		`id="fc-source"`,
+		`id="fc-proto"`,
+		`id="fc-failure-type"`,
+		`id="fc-pagesize"`,
+		`id="failed-select-page"`,
+		`data-action="failed-retry-selected"`,
+		`id="failed-operation-status"`,
+		`id="failed-notice"`,
+		`<th>错误摘要</th>`,
+		`失败节点不会自动重新检测`,
+		`function failedPageURL()`,
+		`return '/api/failed-candidates?' + q.join('&');`,
+		`fetchJSON('/api/failed-candidates/retry', {`,
+		`body:JSON.stringify({keys:keys})`,
+		`function retryFailedCandidates(`,
+		`case 'failed-retry-selected': retryFailedCandidates(); break;`,
+		`case 'failed-select': toggleFailedSelection(actionElement); return;`,
+		`case 'failed-select-page': toggleFailedPageSelection(actionElement); return;`,
+		`case 'goto-failed-page':`,
+		`populateCandidateFacetSelect('fc-failure-type', failedFacetList('failure_types'), '全部失败类型')`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing failed-candidate page contract %q", want)
+		}
+	}
+	if strings.Contains(dashboardClientSource(), `data-action="failed-auto-retry"`) {
+		t.Fatal("failed candidates must never get an automatic retry switch; retry is manual only")
+	}
+}
+
+func TestDashboardCandidateAndFailedTasksDisableDuplicateSubmission(t *testing.T) {
+	for _, want := range []string{
+		`err.status === 409 && err.code === 'candidate_check_busy'`,
+		`['complete','cancelled','superseded','failed'].indexOf(operation.status) >= 0`,
+		`function setCandidateCheckButtonsDisabled(`,
+		`setTimeout(checkCandidateCheckOperation, 1200)`,
+	} {
+		if !strings.Contains(string(dashboardJS), want) {
+			t.Fatalf("dashboard is missing duplicate-submission guard %q", want)
+		}
+	}
+}
+
+func TestDashboardProxyIPUsesDedicatedPageAPI(t *testing.T) {
+	for _, want := range []string{
+		`id="proxyip-tbody"`,
+		`id="px-country"`,
+		`data-action="open-proxyip-country-picker"`,
+		`function proxyIPPageURL()`,
+		`return '/api/proxyip/page?' + q.join('&');`,
+		`function requestProxyIPs(`,
+		`case 'open-proxyip-country-picker': openProxyIPCountryPicker(); break;`,
+		`countryPickerScope = 'proxyip'`,
+		`case 'goto-proxyip-page':`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing dedicated ProxyIP page contract %q", want)
+		}
+	}
+}
+
+func TestDashboardRefreshesAllThreeCountsAfterManualTask(t *testing.T) {
+	for _, want := range []string{
+		`function refreshAfterCandidateCheck()`,
+		`requestStatus();`,
+		`requestCandidates(true);`,
+		`requestFailedCandidates(true);`,
+		`requestProxyIPs(true);`,
+		`typeof d.failed_candidate_total === 'number'`,
+		`setText('tab-link-failed-candidates', '失败节点 (' + formatCount(failedTotal) + ')');`,
+		`setText('tab-link-proxyip', 'ProxyIP (' + formatCount(proxyIPTotal) + ')');`,
+	} {
+		if !strings.Contains(string(dashboardJS), want) {
+			t.Fatalf("dashboard is missing post-task three-count refresh %q", want)
 		}
 	}
 }

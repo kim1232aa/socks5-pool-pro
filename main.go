@@ -319,6 +319,14 @@ func main() {
 		}
 	})
 
+	// Manual candidate and failed-retry operations run on their own worker so a
+	// slow source download cannot delay an administrator-triggered check. The
+	// coordinator health-cycle lock still serializes their pool publication with
+	// every automatic health workflow.
+	background.Go(func(ctx context.Context) {
+		runCandidateCheckWorker(ctx, cfg, store, pool, coordinator)
+	})
+
 	// Background: random rotation of the default (ANY) group every 3-6 minutes.
 	background.Go(func(ctx context.Context) {
 		for {
@@ -602,9 +610,6 @@ func reCheckNodesLockedContext(parent context.Context, cfg *Config, store *Confi
 	sem := make(chan struct{}, maxConcurrent)
 	baseline := BaselineExitIP()
 	var outcomeMu sync.Mutex
-	checked := make([]Proxy, 0, len(nodes))
-	reachableKeys := make(map[string]bool, len(nodes))
-	policyFiltered := make(map[string]bool)
 	fullObservations := make([]fullHealthObservation, 0, len(nodes))
 checkLoop:
 	for _, px := range nodes {
@@ -643,18 +648,11 @@ checkLoop:
 
 			if exhaustive {
 				outcomeMu.Lock()
-				checked = append(checked, px)
 				fullObservations = append(fullObservations, fullHealthObservation{
 					Key: px.Key(), Verified: verified, CredentialsVerified: reachable,
 					Reachable: reachable, PolicyAllowed: policyAllowed, LatencyMs: latency.Milliseconds(),
 					ExitIP: exitIP, IPChanged: ipChanged, IPChangeKnown: ipChangeKnown,
 				})
-				if reachable {
-					reachableKeys[px.Key()] = true
-				}
-				if reachable && !policyAllowed {
-					policyFiltered[px.Key()] = true
-				}
 				outcomeMu.Unlock()
 				coordinator.recordHealthRecheckOutcome(operationID, reachable, reachable && !policyAllowed)
 				return
@@ -669,15 +667,6 @@ checkLoop:
 			if exitIP != "" {
 				pool.UpdateGeoAtGeneration(px.Key(), exitIP, "", "", "", ipChanged, ipChangeKnown, healthGeneration)
 			}
-			outcomeMu.Lock()
-			checked = append(checked, px)
-			if reachable {
-				reachableKeys[px.Key()] = true
-			}
-			if reachable && !policyAllowed {
-				policyFiltered[px.Key()] = true
-			}
-			outcomeMu.Unlock()
 			coordinator.recordHealthRecheckOutcome(operationID, reachable, reachable && !policyAllowed)
 		}(px)
 	}
@@ -698,7 +687,6 @@ checkLoop:
 		}
 		removedNodes = len(result.RemovedKeys)
 	}
-	pool.candidates.ApplyHealthOutcomes(checked, reachableKeys, policyFiltered)
 	if exhaustive {
 		log.Printf("[%s] re-probed %d/%d retained nodes against %s; removed %d after three full-check failures", logLabel, len(nodes), knownTotal, safeSourceURL(testURL), removedNodes)
 	} else {
@@ -820,17 +808,12 @@ sendJobs:
 	// scarce forwarding health-check slots or enter the routable pool.
 	healthInventory, resourceCount := splitHealthInventory(deduped)
 	deduped = nil
-	// Automatic refreshes share the same durable admission rule as periodic
-	// rechecks. Filter before sampling so a cooled or terminal known node cannot
-	// consume a scarce slot that should discover an unseen candidate.
-	healthInventory = pool.FilterAutoRecheckCandidates(healthInventory)
+	knownIndex, _ := pool.candidateKnownSnapshot()
+	healthInventory = pool.candidates.FilterPendingCandidates(healthInventory, knownIndex)
 
-	// Some sources (e.g. large community-aggregated lists) return well
-	// over 100k raw entries. Checking all of them every cycle would make
-	// a refresh take hours and hammer auxiliary lookup services. Cap the
-	// checked set, but retain a small cursor state so repeated cycles walk
-	// deterministically through the entire source inventory instead of
-	// retrying the same failing prefix forever.
+	// Some sources (e.g. large community-aggregated lists) return well over 100k
+	// raw entries. Cap only the still-pending set, retaining the rotating sampler
+	// so scheduled cycles keep walking the full pending inventory fairly.
 	candidates := healthInventory
 	maxCandidates := store.MaxCandidates(cfg.MaxCandidates)
 	if len(candidates) > maxCandidates {
@@ -839,10 +822,17 @@ sendJobs:
 			known[px.Key()] = true
 		}
 		candidates = newCandidateSampler(cfg.DataDir).selectCandidates(healthInventory, known, maxCandidates)
-		log.Printf("[main] %d candidates exceed max-candidates=%d, selecting an unseen-first source/protocol-balanced rotating subset (rest deferred)",
+		log.Printf("[main] %d pending candidates exceed max-candidates=%d, selecting an unseen-first source/protocol-balanced rotating subset (rest deferred)",
 			len(healthInventory), maxCandidates)
 	}
 	healthInventory = nil
+	candidateKeys := make([]string, len(candidates))
+	for i := range candidates {
+		candidateKeys[i] = candidates[i].Key()
+	}
+	leases := pool.candidates.LeasePendingKeys(candidateKeys, knownIndex)
+	defer pool.candidates.ReleaseLeases(leases)
+	candidates = candidateLeasesToProxies(leases)
 
 	// unreachable (from CheckProxies) is addresses that were actually dialed
 	// and genuinely failed to connect - as opposed to ones that connected
@@ -859,10 +849,14 @@ sendJobs:
 	}
 	workContext, cancelWork := context.WithCancel(ctx)
 	stopHealthCancel := context.AfterFunc(healthContext, cancelWork)
-	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, store.CheckTimeout(cfg.CheckTimeout), store.MaxConcurrent(cfg.MaxConcurrent), store.RequireIPChange(cfg.RequireIPChange), testURL)
+	outcomes := checkCandidateBatchContext(workContext, candidates, candidateCheckOptions{
+		Timeout: store.CheckTimeout(cfg.CheckTimeout), MaxConcurrent: store.MaxConcurrent(cfg.MaxConcurrent),
+		RequireIPChange: store.RequireIPChange(cfg.RequireIPChange), TestURL: testURL, BaselineIP: BaselineExitIP(),
+	}, nil)
 	stopHealthCancel()
 	cancelWork()
 	finishHealthWork()
+	alive, unreachable, policyFiltered := splitCandidateCheckOutcomes(outcomes, leases)
 	if err := ctx.Err(); err != nil {
 		pool.candidates.complete(catalogRefresh, nil, nil, nil)
 		return refreshRunResult{Status: "cancelled", SourceErrors: sourceErrors, Error: err.Error()}
@@ -882,6 +876,11 @@ sendJobs:
 	alive = filterRefreshResultsBySources(alive, validSources)
 	unreachable = filterRefreshOutcomeKeys(unreachable, candidates)
 	policyFiltered = filterRefreshOutcomeKeys(policyFiltered, candidates)
+	validOutcomeKeys := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		validOutcomeKeys[candidate.Key()] = true
+	}
+	outcomes = filterCandidateCheckOutcomesByKeys(outcomes, validOutcomeKeys)
 	reconcileFullRefreshCatalog(pool.candidates, catalogRefresh, validSources, sourceErrors)
 	applied := pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration)
 	if !applied {
@@ -890,7 +889,12 @@ sendJobs:
 		log.Printf("[main] discarded health results because the check criterion changed during refresh")
 		return refreshRunResult{Status: "skipped", SourceErrors: sourceErrors, Error: "health criterion changed during refresh; exhaustive recheck queued"}
 	}
-	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
+	pool.candidates.complete(catalogRefresh, nil, nil, nil)
+	if err := pool.candidates.CommitLeaseOutcomes(leases, outcomes); err != nil {
+		coordinator.sourceLifecycleMu.Unlock()
+		return refreshRunResult{Status: "failed", SourceErrors: sourceErrors, Error: err.Error()}
+	}
+	leases = nil
 	coordinator.sourceLifecycleMu.Unlock()
 
 	coordinator.recordScrape(ScrapeInfo{
@@ -961,44 +965,38 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 		}
 	}
 
-	// Keep deduped untouched until it is published to CandidateCatalog: it holds
-	// stable Source.ID values and the full source inventory. Build only a bounded
-	// health-check work set, because the scheduled eligibility filter used to
-	// compact the catalog's backing slice in place.
-	excluded := map[string]bool(nil)
-	if trigger == "scheduled" {
-		excluded = pool.autoRecheckExcludedKeys()
+	// Publish the complete stable-ID inventory first. The catalog merge keeps
+	// failed keys isolated and exposes only still-pending forwarding candidates to
+	// the automatic checker.
+	coordinator.sourceLifecycleMu.Lock()
+	currentSource, exists := store.SourceByID(sourceID)
+	if !exists || !revision.matches(currentSource, trigger) {
+		coordinator.sourceLifecycleMu.Unlock()
+		return refreshRunResult{Status: "skipped", Error: "source was disabled, deleted, or changed before candidate publication"}
 	}
-	includeHealthCandidate := func(px Proxy) bool {
-		return isForwardingProtocol(px.Protocol) && !excluded[px.Key()]
-	}
-	healthCandidateTotal := 0
-	for _, px := range deduped {
-		if includeHealthCandidate(px) {
-			healthCandidateTotal++
-		}
-	}
+	catalogRefresh := pool.candidates.begin(deduped, labels, retained, 0)
+	coordinator.sourceLifecycleMu.Unlock()
+
+	captureCandidateSourceIDs(deduped)
+	restoreCandidateSourceLabels(deduped, labels)
+	knownIndex, _ := pool.candidateKnownSnapshot()
+	pending := pool.candidates.FilterPendingCandidates(deduped, knownIndex)
 	maxCandidates := store.MaxCandidates(cfg.MaxCandidates)
-	candidates := make([]Proxy, 0, min(healthCandidateTotal, maxCandidates))
-	if healthCandidateTotal <= maxCandidates {
-		for _, px := range deduped {
-			if includeHealthCandidate(px) {
-				candidates = append(candidates, px)
-			}
-		}
-	} else {
+	candidates := pending
+	if len(pending) > maxCandidates {
 		known := make(map[string]bool, pool.Size())
 		for _, px := range pool.All() {
 			known[px.Key()] = true
 		}
-		candidates = newCandidateSampler(cfg.DataDir).selectCandidatesWhere(deduped, known, maxCandidates, includeHealthCandidate)
+		candidates = newCandidateSampler(cfg.DataDir).selectCandidates(pending, known, maxCandidates)
 	}
-	// Only health-check candidates need user-facing source labels and copied
-	// provenance. Cloning this bounded work set prevents label conversion from
-	// mutating the stable-ID catalog input above.
-	candidates = cloneProxySlice(candidates)
-	captureCandidateSourceIDs(candidates)
-	restoreCandidateSourceLabels(candidates, labels)
+	candidateKeys := make([]string, len(candidates))
+	for i := range candidates {
+		candidateKeys[i] = candidates[i].Key()
+	}
+	leases := pool.candidates.LeasePendingKeys(candidateKeys, knownIndex)
+	defer pool.candidates.ReleaseLeases(leases)
+	candidates = candidateLeasesToProxies(leases)
 	coordinator.healthCycleMu.Lock()
 	defer coordinator.healthCycleMu.Unlock()
 	healthGeneration, testURL := currentHealthCriterion(pool, store)
@@ -1008,10 +1006,14 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 	}
 	workContext, cancelWork := context.WithCancel(ctx)
 	stopHealthCancel := context.AfterFunc(healthContext, cancelWork)
-	alive, unreachable, policyFiltered := checkProxiesDetailedContext(workContext, candidates, store.CheckTimeout(cfg.CheckTimeout), store.MaxConcurrent(cfg.MaxConcurrent), store.RequireIPChange(cfg.RequireIPChange), testURL)
+	outcomes := checkCandidateBatchContext(workContext, candidates, candidateCheckOptions{
+		Timeout: store.CheckTimeout(cfg.CheckTimeout), MaxConcurrent: store.MaxConcurrent(cfg.MaxConcurrent),
+		RequireIPChange: store.RequireIPChange(cfg.RequireIPChange), TestURL: testURL, BaselineIP: BaselineExitIP(),
+	}, nil)
 	stopHealthCancel()
 	cancelWork()
 	finishHealthWork()
+	alive, unreachable, policyFiltered := splitCandidateCheckOutcomes(outcomes, leases)
 	if err := ctx.Err(); err != nil {
 		return refreshRunResult{Status: "cancelled", Error: err.Error()}
 	}
@@ -1021,16 +1023,19 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 
 	coordinator.sourceLifecycleMu.Lock()
 	defer coordinator.sourceLifecycleMu.Unlock()
-	currentSource, exists := store.SourceByID(sourceID)
+	currentSource, exists = store.SourceByID(sourceID)
 	if !exists || !revision.matches(currentSource, trigger) {
 		return refreshRunResult{Status: "skipped", Error: "source was disabled, deleted, or changed during refresh"}
 	}
-	catalogRefresh := pool.candidates.begin(deduped, labels, retained, 0)
 	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
 		pool.candidates.complete(catalogRefresh, nil, nil, nil)
 		return refreshRunResult{Status: "skipped", Error: "health criterion changed during refresh"}
 	}
-	pool.candidates.complete(catalogRefresh, candidates, alive, policyFiltered)
+	pool.candidates.complete(catalogRefresh, nil, nil, nil)
+	if err := pool.candidates.CommitLeaseOutcomes(leases, outcomes); err != nil {
+		return refreshRunResult{Status: "failed", Error: err.Error()}
+	}
+	leases = nil
 	if err := pool.FlushCache(); err != nil {
 		log.Printf("[cache] source refresh flush failed: %v", err)
 	}
@@ -1128,6 +1133,51 @@ func filterRefreshOutcomeKeys(outcomes map[string]bool, candidates []Proxy) map[
 		}
 	}
 	return outcomes
+}
+
+func candidateLeasesToProxies(leases []CandidateLease) []Proxy {
+	proxies := make([]Proxy, len(leases))
+	for i := range leases {
+		proxies[i] = leases[i].Proxy
+	}
+	return proxies
+}
+
+func candidateLeaseKeys(leases []CandidateLease) map[string]bool {
+	keys := make(map[string]bool, len(leases))
+	for _, lease := range leases {
+		keys[lease.Key] = true
+	}
+	return keys
+}
+
+func filterCandidateCheckOutcomesByKeys(outcomes map[string]candidateCheckOutcome, allowed map[string]bool) map[string]candidateCheckOutcome {
+	for key := range outcomes {
+		if !allowed[key] {
+			delete(outcomes, key)
+		}
+	}
+	return outcomes
+}
+
+func splitCandidateCheckOutcomes(outcomes map[string]candidateCheckOutcome, ordered []CandidateLease) (alive []Proxy, unreachable, policyFiltered map[string]bool) {
+	unreachable = make(map[string]bool)
+	policyFiltered = make(map[string]bool)
+	for _, lease := range ordered {
+		outcome, exists := outcomes[lease.Key]
+		if !exists {
+			continue
+		}
+		switch outcome.Kind {
+		case candidateCheckAlive:
+			alive = append(alive, outcome.Proxy)
+		case candidateCheckUnreachable:
+			unreachable[lease.Key] = true
+		case candidateCheckPolicyFiltered:
+			policyFiltered[lease.Key] = true
+		}
+	}
+	return alive, unreachable, policyFiltered
 }
 
 // reconcileFullRefreshCatalog removes attributions whose source revision became
