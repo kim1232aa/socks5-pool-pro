@@ -203,6 +203,56 @@ func TestDashboardMobileCardsUseProgressiveDisclosure(t *testing.T) {
 	}
 }
 
+func TestDashboardScheduleControlsAndTimelineContract(t *testing.T) {
+	for _, want := range []string{
+		`id="opt-source-refresh-interval"`,
+		`id="opt-full-recheck-interval"`,
+		`id="timeline-source-last"`,
+		`id="timeline-source-next"`,
+		`id="timeline-full-last"`,
+		`id="timeline-full-next"`,
+		`source_refresh_interval_seconds: sourceRefreshSeconds`,
+		`full_recheck_interval_seconds: fullRecheckSeconds`,
+		`overrides.source_refresh_interval_seconds`,
+		`overrides.full_recheck_interval_seconds`,
+		`d.last_source_refresh_at`,
+		`d.next_source_refresh_at`,
+		`d.last_full_recheck_at`,
+		`d.next_full_recheck_at`,
+		`连续 3 次完整全检失败后移出转发池，候选库记录仍保留`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing schedule-control contract %q", want)
+		}
+	}
+}
+
+func TestDashboardScheduleRoundTripPreservesNinetySeconds(t *testing.T) {
+	for _, want := range []string{
+		`function secondsFromMinutes(id)`,
+		`return isFinite(minutes) ? Math.round(minutes * 60) : -1;`,
+		`var sourceRefreshSeconds = secondsFromMinutes('opt-source-refresh-interval');`,
+		`var fullRecheckSeconds = secondsFromMinutes('opt-full-recheck-interval');`,
+		`id="opt-source-refresh-interval" type="number" min="1" max="10080" step="0.1"`,
+		`id="opt-full-recheck-interval" type="number" min="1" max="10080" step="0.1"`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing lossless schedule conversion contract %q", want)
+		}
+	}
+}
+
+func TestDashboardExplainsBaselineAndAutomaticRecoveryAccurately(t *testing.T) {
+	for _, want := range []string{
+		`基线是本机直连出口 IP，用于与代理出口比较并判断是否真的换了 IP。`,
+		`不会继续进入轻量自动复检，但仍会参加周期性的完整全检。`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing health explanation %q", want)
+		}
+	}
+}
+
 func TestDashboardHasVisibleAsyncAndErrorStates(t *testing.T) {
 	for _, want := range []string{
 		`id="node-notice"`,
@@ -410,7 +460,8 @@ func TestDashboardManualVerifyShowsImmediateFailureFiltering(t *testing.T) {
 		`本次手动复检未能连通目标。`,
 		`内部最多尝试 3 次`,
 		`最终失败后节点已立即从可路由池过滤`,
-		`不会继续自动复检`,
+		`不会继续进入轻量自动复检`,
+		`仍会参加周期性的完整全检`,
 		`typeof result.attempts === 'number'`,
 		`typeof result.available === 'boolean'`,
 		`typeof result.consecutive_failures === 'number'`,

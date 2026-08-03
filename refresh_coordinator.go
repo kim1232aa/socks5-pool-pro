@@ -20,6 +20,10 @@ type RefreshCoordinator struct {
 	lastScrapeInfo ScrapeInfo
 	scrapeMu       sync.RWMutex
 
+	lastFullRecheckTime time.Time
+	nextFullRecheckTime time.Time
+	fullRecheckMu       sync.RWMutex
+
 	refreshChan       chan struct{}
 	recheckChan       chan struct{}
 	fullRecheckChan   chan struct{}
@@ -70,6 +74,32 @@ func (c *RefreshCoordinator) scrapeTimes() (last, next time.Time) {
 	c.scrapeMu.RLock()
 	defer c.scrapeMu.RUnlock()
 	return c.lastScrapeTime, c.nextScrapeTime
+}
+
+func (c *RefreshCoordinator) fullRecheckTimes() (last, next time.Time) {
+	c.fullRecheckMu.RLock()
+	defer c.fullRecheckMu.RUnlock()
+	return c.lastFullRecheckTime, c.nextFullRecheckTime
+}
+
+func (c *RefreshCoordinator) recordSourceRefresh(completedAt time.Time, interval time.Duration) {
+	c.scrapeMu.Lock()
+	c.lastScrapeTime = completedAt
+	c.nextScrapeTime = completedAt.Add(interval)
+	c.scrapeMu.Unlock()
+}
+
+func (c *RefreshCoordinator) recordFullRecheck(completedAt time.Time, interval time.Duration) {
+	c.fullRecheckMu.Lock()
+	c.lastFullRecheckTime = completedAt
+	c.nextFullRecheckTime = completedAt.Add(interval)
+	c.fullRecheckMu.Unlock()
+}
+
+func (c *RefreshCoordinator) scheduleFullRecheck(next time.Time) {
+	c.fullRecheckMu.Lock()
+	c.nextFullRecheckTime = next
+	c.fullRecheckMu.Unlock()
 }
 
 func (c *RefreshCoordinator) scrapeInfo() ScrapeInfo {
@@ -298,8 +328,36 @@ func (c *RefreshCoordinator) markSourcesRefreshed(sources []Source, at time.Time
 	}
 }
 
+// nextSourceRefreshTime reports the earliest real per-source deadline. Source
+// settings are supplied as a snapshot so configuration changes take effect in
+// status immediately without mutating coordinator state.
+func (c *RefreshCoordinator) nextSourceRefreshTime(sources []Source, globalInterval time.Duration, now time.Time) time.Time {
+	c.sourceRefreshMu.Lock()
+	defer c.sourceRefreshMu.Unlock()
+	var earliest time.Time
+	for _, source := range sources {
+		if !source.Enabled || !source.AutoRefreshEnabled {
+			continue
+		}
+		interval := globalInterval
+		if source.RefreshIntervalSeconds > 0 {
+			interval = time.Duration(source.RefreshIntervalSeconds) * time.Second
+		}
+		last := c.sourceRefreshLast[source.ID]
+		due := now
+		if !last.IsZero() {
+			due = last.Add(interval)
+		}
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
+		}
+	}
+	return earliest
+}
+
 func (c *RefreshCoordinator) queueDueSourceRefreshes(store *ConfigStore, globalInterval time.Duration, now time.Time) int {
 	queued := 0
+	globalInterval = store.SourceRefreshInterval(globalInterval)
 	for _, source := range store.Sources() {
 		if !source.Enabled || !source.AutoRefreshEnabled {
 			continue
@@ -378,27 +436,58 @@ func (c *RefreshCoordinator) triggerFullRecheck(pool *ProxyPool) (HealthRecheckO
 	return operation, true
 }
 
-func (c *RefreshCoordinator) beginHealthRecheckOperation(pool *ProxyPool, total int) HealthRecheckOperation {
+// claimHealthRecheckOperation treats fullRecheckChan as a wake-up hint only.
+// A signal wake must claim a real pending operation; only a timer wake may
+// synthesize a scheduled operation when no manual/criterion trigger is pending.
+func (c *RefreshCoordinator) claimHealthRecheckOperation(pool *ProxyPool, total int, timerWake bool) (HealthRecheckOperation, bool) {
+	generation, checkURL := pool.HealthCriterion()
 	c.healthRecheckOpMu.Lock()
 	defer c.healthRecheckOpMu.Unlock()
 	if c.shuttingDown.Load() {
-		generation, checkURL := pool.HealthCriterion()
 		now := time.Now().UTC()
-		return HealthRecheckOperation{Status: "cancelled", Generation: generation, CheckURL: checkURL, RequestedAt: now.Format(time.RFC3339Nano), CompletedAt: now.Format(time.RFC3339Nano)}
+		return HealthRecheckOperation{Status: "cancelled", Generation: generation, CheckURL: checkURL, RequestedAt: now.Format(time.RFC3339Nano), CompletedAt: now.Format(time.RFC3339Nano)}, false
+	}
+	if c.healthRecheckActive != nil {
+		return *c.healthRecheckActive, false
 	}
 	job := c.healthRecheckPending
-	c.healthRecheckPending = nil
+	if job != nil && job.Generation != generation {
+		superseded := *job
+		superseded.Status = "superseded"
+		superseded.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		c.healthRecheckLast = &superseded
+		c.healthRecheckPending = nil
+		job = nil
+	}
+	if job == nil && !timerWake {
+		return HealthRecheckOperation{}, false
+	}
 	if job == nil {
-		generation, checkURL := pool.HealthCriterion()
 		c.healthRecheckOpSeq++
 		now := time.Now().UTC()
-		job = &HealthRecheckOperation{ID: fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), c.healthRecheckOpSeq), Status: "queued", Generation: generation, CheckURL: checkURL, RequestedAt: now.Format(time.RFC3339Nano)}
+		job = &HealthRecheckOperation{
+			ID: fmt.Sprintf("health-recheck-%d-%d", now.UnixNano(), c.healthRecheckOpSeq), Status: "queued",
+			Generation: generation, CheckURL: checkURL, RequestedAt: now.Format(time.RFC3339Nano),
+		}
 	}
+	c.healthRecheckPending = nil
 	job.Status = "running"
 	job.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	job.Total = total
 	c.healthRecheckActive = job
-	return *job
+	return *job, true
+}
+
+// beginHealthRecheckOperation retains the direct/scheduled test helper API.
+func (c *RefreshCoordinator) beginHealthRecheckOperation(pool *ProxyPool, total int) HealthRecheckOperation {
+	operation, _ := c.claimHealthRecheckOperation(pool, total, true)
+	return operation
+}
+
+func (c *RefreshCoordinator) hasPendingHealthRecheck() bool {
+	c.healthRecheckOpMu.RLock()
+	defer c.healthRecheckOpMu.RUnlock()
+	return c.healthRecheckPending != nil
 }
 
 func (c *RefreshCoordinator) recordHealthRecheckOutcome(id string, reachable, policyFiltered bool) {

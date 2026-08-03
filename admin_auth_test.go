@@ -122,13 +122,14 @@ func TestStatusServerHealthzIsTheOnlyUnauthenticatedPath(t *testing.T) {
 
 func TestConfigValidateRequiresCompleteAdminCredentialPair(t *testing.T) {
 	base := Config{
-		ListenAddr:     "127.0.0.1:1080",
-		StatusAddr:     "127.0.0.1:8080",
-		DataDir:        ".",
-		ScrapeInterval: time.Minute,
-		CheckTimeout:   time.Second,
-		MaxConcurrent:  1,
-		MaxCandidates:  1,
+		ListenAddr:          "127.0.0.1:1080",
+		StatusAddr:          "127.0.0.1:8080",
+		DataDir:             ".",
+		ScrapeInterval:      time.Minute,
+		FullRecheckInterval: time.Minute,
+		CheckTimeout:        time.Second,
+		MaxConcurrent:       1,
+		MaxCandidates:       1,
 	}
 	for _, tt := range []struct {
 		name     string

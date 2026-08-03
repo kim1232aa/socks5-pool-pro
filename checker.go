@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	publicIPLookupURL   = "https://api.ipify.org/"
 	publicIPMaxBytes    = int64(64)
 	defaultGeoLookupURL = "https://ipwho.is/"
 	geoResponseMaxBytes = int64(64 << 10)
@@ -26,6 +25,12 @@ const (
 	geoCacheTTL         = 24 * time.Hour
 	geoCacheMaxEntries  = 20_000
 )
+
+var publicIPLookupURLs = []string{
+	"https://api64.ipify.org/",
+	"https://checkip.amazonaws.com/",
+	"https://ident.me/",
+}
 
 type geoCacheEntry struct {
 	country   string
@@ -339,7 +344,7 @@ func probeExitIPContext(parent context.Context, px Proxy, timeout time.Duration)
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicIPLookupURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicIPLookupURLs[0], nil)
 	if err != nil {
 		return ""
 	}
@@ -380,7 +385,7 @@ func RefreshBaselineExitWithChange(timeout time.Duration) (success, changed bool
 }
 
 func RefreshBaselineExitWithChangeContext(parent context.Context, timeout time.Duration) (success, changed bool) {
-	return refreshBaselineExitWithURLChangeContext(parent, publicIPLookupURL, timeout)
+	return refreshBaselineExitWithURLsChangeContext(parent, publicIPLookupURLs, timeout)
 }
 
 func refreshBaselineExitWithURL(endpoint string, timeout time.Duration) bool {
@@ -393,44 +398,72 @@ func refreshBaselineExitWithURLChange(endpoint string, timeout time.Duration) (s
 }
 
 func refreshBaselineExitWithURLChangeContext(parent context.Context, endpoint string, timeout time.Duration) (success, changed bool) {
+	return refreshBaselineExitWithURLsChangeContext(parent, []string{endpoint}, timeout)
+}
+
+// refreshBaselineExitWithURLsChangeContext races independent direct-IP
+// services under one shared deadline. The first valid public IP wins; all
+// remaining requests are canceled. Every client explicitly bypasses
+// HTTP_PROXY/HTTPS_PROXY so the result describes this process' direct egress.
+func refreshBaselineExitWithURLsChangeContext(parent context.Context, endpoints []string, timeout time.Duration) (success, changed bool) {
 	if parent == nil {
 		parent = context.Background()
 	}
-	client := newDirectHTTPClient(timeout)
-	transport, _ := client.Transport.(*http.Transport)
-	if transport != nil {
-		defer transport.CloseIdleConnections()
+	if timeout <= 0 || len(endpoints) == 0 {
+		return false, false
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		log.Printf("[baseline] direct egress probe failed; IP-change state is unknown and will be retried: %v", err)
-		return false, false
+
+	results := make(chan string, len(endpoints))
+	for _, endpoint := range endpoints {
+		go func() {
+			client := newDirectHTTPClient(timeout)
+			transport, _ := client.Transport.(*http.Transport)
+			if transport != nil {
+				defer transport.CloseIdleConnections()
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if err != nil {
+				results <- ""
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				results <- ""
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				results <- ""
+				return
+			}
+			results <- readPublicIP(resp.Body)
+		}()
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[baseline] direct egress probe failed; IP-change state is unknown and will be retried: %v", err)
-		return false, false
+
+	for range endpoints {
+		select {
+		case ip := <-results:
+			if ip == "" {
+				continue
+			}
+			cancel()
+			baselineExitMu.Lock()
+			changed = baselineExitIP != ip
+			baselineExitIP = ip
+			baselineExitMu.Unlock()
+			if changed {
+				log.Printf("[baseline] our direct egress IP = %s (proxies exiting from this IP are transparent)", ip)
+			}
+			return true, changed
+		case <-ctx.Done():
+			log.Printf("[baseline] direct egress probes failed; IP-change state is unknown and will be retried: %v", ctx.Err())
+			return false, false
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[baseline] direct egress probe returned %s; will retry", resp.Status)
-		return false, false
-	}
-	ip := readPublicIP(resp.Body)
-	if ip == "" {
-		log.Printf("[baseline] direct egress probe returned an invalid IP; will retry")
-		return false, false
-	}
-	baselineExitMu.Lock()
-	changed = baselineExitIP != ip
-	baselineExitIP = ip
-	baselineExitMu.Unlock()
-	if changed {
-		log.Printf("[baseline] our direct egress IP = %s (proxies exiting from this IP are transparent)", ip)
-	}
-	return true, changed
+	log.Printf("[baseline] direct egress probes returned no valid IP; will retry")
+	return false, false
 }
 
 // newDirectHTTPClient deliberately has no Proxy callback. In particular it

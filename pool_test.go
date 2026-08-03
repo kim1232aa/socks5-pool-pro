@@ -225,6 +225,203 @@ func TestHealthOutcomeTerminalFailureAndManualRecovery(t *testing.T) {
 	}
 }
 
+func TestFullRecheckCandidatesIncludeTerminalUnavailableAndSkipRetired(t *testing.T) {
+	p := NewProxyPool()
+	healthy := testProxy("http", "192.0.2.240", "8080", true)
+	terminal := testProxy("socks5", "192.0.2.241", "1080", false)
+	terminal.HealthInvalidated = true
+	retired := testProxy("socks5", "192.0.2.242", "1080", false)
+	retired.SourceRetired = true
+	p.Prime([]Proxy{healthy, terminal, retired}, nil)
+	p.stats[terminal.Key()] = &nodeStats{HealthFailureTerminal: true, ConsecutiveHealthFailures: 1}
+
+	got := p.FullRecheckCandidates()
+	keys := make(map[string]bool, len(got))
+	for _, px := range got {
+		keys[px.Key()] = true
+	}
+	if !keys[healthy.Key()] || !keys[terminal.Key()] || keys[retired.Key()] {
+		t.Fatalf("full recheck candidates = %v; want healthy+terminal, not retired", keys)
+	}
+}
+
+func TestFullHealthOutcomeRecoversTerminalNodeAndResetsFailures(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.243", "1080", false)
+	px.HealthInvalidated = true
+	p.Prime([]Proxy{px}, nil)
+	p.stats[px.Key()] = &nodeStats{
+		HealthFailureTerminal:          true,
+		ConsecutiveHealthFailures:      2,
+		ConsecutiveFullRecheckFailures: 2,
+	}
+
+	observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), true, true, 47, p.HealthGeneration())
+	if !observed || removed {
+		t.Fatalf("full success = observed %v removed %v", observed, removed)
+	}
+	got, ok := p.Find(px.Key())
+	stats := p.stats[px.Key()]
+	if !ok || !got.Available || got.HealthInvalidated || got.PolicyExcluded || got.LatencyMs != 47 {
+		t.Fatalf("recovered proxy = %+v found=%v", got, ok)
+	}
+	if stats.HealthFailureTerminal || stats.ConsecutiveHealthFailures != 0 || stats.ConsecutiveFullRecheckFailures != 0 || stats.LastHealthSuccessAt.IsZero() {
+		t.Fatalf("recovered stats = %+v", stats)
+	}
+}
+
+func TestFullHealthOutcomeThirdConsecutiveFailureRemovesPoolStateOnly(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "192.0.2.244", "1080", true)
+	px.SourceName = "source-a"
+	px.SourceIDs = []string{"source-a"}
+	p.Prime([]Proxy{px}, nil)
+	refresh := p.candidates.begin([]Proxy{px}, map[string]string{"source-a": "Source A"}, nil, 0)
+	p.candidates.complete(refresh, []Proxy{px}, []Proxy{px}, nil)
+	generation := p.HealthGeneration()
+
+	for failure := 1; failure <= 2; failure++ {
+		observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation)
+		if !observed || removed {
+			t.Fatalf("full failure %d = observed %v removed %v", failure, observed, removed)
+		}
+		if _, ok := p.Find(px.Key()); !ok {
+			t.Fatalf("node removed after full failure %d", failure)
+		}
+		if got := p.stats[px.Key()].ConsecutiveFullRecheckFailures; got != failure {
+			t.Fatalf("full failure streak = %d, want %d", got, failure)
+		}
+	}
+
+	observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation)
+	if !observed || !removed {
+		t.Fatalf("third full failure = observed %v removed %v", observed, removed)
+	}
+	if _, ok := p.Find(px.Key()); ok {
+		t.Fatal("third full failure retained forwarding node")
+	}
+	if _, ok := p.stats[px.Key()]; ok {
+		t.Fatal("third full failure retained node stats")
+	}
+	if _, ok := p.candidates.FindByKey(px.Key()); !ok {
+		t.Fatal("forwarding removal deleted candidate-catalog membership")
+	}
+	assertProxyIndexInvariant(t, p)
+}
+
+func TestFullHealthOutcomeSuccessResetsRemovalStreakAndStaleGenerationDoesNotCount(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("http", "192.0.2.245", "8080", true)
+	p.Prime([]Proxy{px}, nil)
+	generation := p.HealthGeneration()
+
+	for i := 0; i < 2; i++ {
+		if observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation); !observed || removed {
+			t.Fatalf("initial full failure %d = observed %v removed %v", i+1, observed, removed)
+		}
+	}
+	if observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), true, true, 25, generation); !observed || removed {
+		t.Fatalf("resetting full success = observed %v removed %v", observed, removed)
+	}
+	if observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation); !observed || removed {
+		t.Fatalf("post-success full failure = observed %v removed %v", observed, removed)
+	}
+	if got := p.stats[px.Key()].ConsecutiveFullRecheckFailures; got != 1 {
+		t.Fatalf("post-success full failure streak = %d, want 1", got)
+	}
+
+	p.InvalidateHealth("https://example.test/new-health")
+	if observed, removed := p.ObserveFullHealthOutcomeAtGeneration(px.Key(), false, true, 0, generation); observed || removed {
+		t.Fatalf("stale full outcome = observed %v removed %v", observed, removed)
+	}
+	if got := p.stats[px.Key()].ConsecutiveFullRecheckFailures; got != 0 {
+		t.Fatalf("stale generation changed reset streak to %d", got)
+	}
+	if _, ok := p.Find(px.Key()); !ok {
+		t.Fatal("stale generation removed node")
+	}
+}
+
+func TestCommitFullHealthRecheckBatchesThirdFailureRemovals(t *testing.T) {
+	p := NewProxyPool()
+	nodes := []Proxy{
+		testProxy("socks5", "8.8.8.101", "1080", true),
+		testProxy("http", "8.8.4.101", "8080", true),
+	}
+	for i := range nodes {
+		nodes[i].SourceName = "source-a"
+		nodes[i].SourceIDs = []string{"source-a"}
+	}
+	p.Prime(nodes, nil)
+	refresh := p.candidates.begin(nodes, map[string]string{"source-a": "Source A"}, nil, 0)
+	p.candidates.complete(refresh, nodes, nodes, nil)
+	for _, px := range nodes {
+		p.stats[px.Key()] = &nodeStats{
+			HealthFailureTerminal:          true,
+			ConsecutiveHealthFailures:      2,
+			ConsecutiveFullRecheckFailures: 2,
+		}
+	}
+	p.SetCache(newPoolCache(t.TempDir()))
+	var persistCalls int
+	p.beforeDeletePersist = func() { persistCalls++ }
+
+	observations := make([]fullHealthObservation, 0, len(nodes))
+	for _, px := range nodes {
+		observations = append(observations, fullHealthObservation{Key: px.Key(), Reachable: false, PolicyAllowed: true})
+	}
+	result, err := p.CommitFullHealthRecheckAtGeneration(observations, p.HealthGeneration())
+	if err != nil {
+		t.Fatalf("CommitFullHealthRecheckAtGeneration: %v", err)
+	}
+	if !result.Applied {
+		t.Fatal("completed full recheck was not applied")
+	}
+	if persistCalls != 1 {
+		t.Fatalf("full recheck persisted %d delete plans, want one batch", persistCalls)
+	}
+	if got := len(result.RemovedKeys); got != len(nodes) {
+		t.Fatalf("removed keys = %v, want both nodes", result.RemovedKeys)
+	}
+	if p.Size() != 0 {
+		t.Fatalf("third failures left %d forwarding nodes", p.Size())
+	}
+	for _, px := range nodes {
+		if _, ok := p.stats[px.Key()]; ok {
+			t.Fatalf("third failure retained stats for %s", px.Key())
+		}
+		if _, ok := p.candidates.FindByKey(px.Key()); !ok {
+			t.Fatalf("third failure deleted candidate catalog entry %s", px.Key())
+		}
+	}
+	assertProxyIndexInvariant(t, p)
+}
+
+func TestCommitFullHealthRecheckWithNoMatchingObservationsIsNoOp(t *testing.T) {
+	p := NewProxyPool()
+	px := testProxy("socks5", "8.8.8.102", "1080", true)
+	p.Prime([]Proxy{px}, nil)
+	p.SetCache(newPoolCache(t.TempDir()))
+	var persistCalls int
+	p.beforeDeletePersist = func() { persistCalls++ }
+
+	result, err := p.CommitFullHealthRecheckAtGeneration([]fullHealthObservation{{
+		Key: "socks5://203.0.113.99:1080", Reachable: false, PolicyAllowed: true,
+	}}, p.HealthGeneration())
+	if err != nil {
+		t.Fatalf("CommitFullHealthRecheckAtGeneration: %v", err)
+	}
+	if !result.Applied || result.Observed != 0 || len(result.RemovedKeys) != 0 {
+		t.Fatalf("no-match result = %+v, want applied no-op", result)
+	}
+	if persistCalls != 0 {
+		t.Fatalf("no-match full recheck persisted %d times, want zero", persistCalls)
+	}
+	if got, ok := p.Find(px.Key()); !ok || got.Key() != px.Key() {
+		t.Fatalf("no-match full recheck changed live pool: %+v found=%v", got, ok)
+	}
+}
+
 func TestUpdatePreservesDurableMeasurementsOnPartialProbe(t *testing.T) {
 	p := NewProxyPool()
 	old := testProxy("socks5", "192.0.2.10", "1080", true)

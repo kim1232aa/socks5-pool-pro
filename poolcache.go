@@ -709,7 +709,7 @@ func validatePoolCacheFile(f *poolCacheFile) error {
 		if len(key) > maxSourceProxyURLBytes || hasLogControlCharacters(key) {
 			return fmt.Errorf("invalid stats key")
 		}
-		if stats.Successes < 0 || stats.Failures < 0 || stats.LastLatencyMs < 0 || stats.ConsecutiveHealthFailures < 0 {
+		if stats.Successes < 0 || stats.Failures < 0 || stats.LastLatencyMs < 0 || stats.ConsecutiveHealthFailures < 0 || stats.ConsecutiveFullRecheckFailures < 0 {
 			return fmt.Errorf("stats %q contains invalid negative values", key)
 		}
 	}

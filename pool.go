@@ -34,12 +34,13 @@ const (
 // not share the forwarding success/failure counters: a real routed request is
 // not an automatic health observation.
 type nodeStats struct {
-	Successes                 int       `json:"successes"`
-	Failures                  int       `json:"failures"`
-	LastLatencyMs             int64     `json:"last_latency_ms"`
-	ConsecutiveHealthFailures int       `json:"consecutive_health_failures,omitempty"`
-	LastHealthSuccessAt       time.Time `json:"last_health_success_at,omitempty"`
-	HealthFailureTerminal     bool      `json:"health_failure_terminal,omitempty"`
+	Successes                      int       `json:"successes"`
+	Failures                       int       `json:"failures"`
+	LastLatencyMs                  int64     `json:"last_latency_ms"`
+	ConsecutiveHealthFailures      int       `json:"consecutive_health_failures,omitempty"`
+	ConsecutiveFullRecheckFailures int       `json:"consecutive_full_recheck_failures,omitempty"`
+	LastHealthSuccessAt            time.Time `json:"last_health_success_at,omitempty"`
+	HealthFailureTerminal          bool      `json:"health_failure_terminal,omitempty"`
 }
 
 const automaticHealthSuccessCooldown = 24 * time.Hour
@@ -192,9 +193,9 @@ func (p *ProxyPool) eligibleForAutoRecheckLocked(px Proxy, now time.Time) bool {
 	return !px.SourceRetired && statsEligibleForAutoRecheck(p.stats[px.Key()], now)
 }
 
-// EligibleForAutoRecheck exposes the pool's automatic-health admission rule
-// for periodic and exhaustive workers. Manual verification intentionally
-// bypasses this method so operators can explicitly retest a terminal node.
+// EligibleForAutoRecheck exposes the bounded automatic-health admission rule.
+// Exhaustive full rechecks and manual verification intentionally bypass it so
+// unavailable terminal nodes can be retested.
 func (p *ProxyPool) EligibleForAutoRecheck(px Proxy) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -240,18 +241,274 @@ func (p *ProxyPool) ObserveHealthResultAtGeneration(key string, ok bool, latency
 	return p.observeHealthOutcome(key, ok, ok, latencyMs, &generation, false)
 }
 
-// ObserveHealthOutcomeAtGeneration applies an automatic health observation.
-// Automatic workers cannot recover a terminal failure; eligibility filtering
-// prevents that state from entering them in the first place.
+// ObserveHealthOutcomeAtGeneration applies a bounded automatic health
+// observation. This path cannot recover a terminal failure; its eligibility
+// filter prevents that state from entering the bounded worker.
 func (p *ProxyPool) ObserveHealthOutcomeAtGeneration(key string, reachable, policyAllowed bool, latencyMs int64, generation uint64) bool {
 	return p.observeHealthOutcome(key, reachable, policyAllowed, latencyMs, &generation, false)
 }
 
 // ObserveManualHealthOutcomeAtGeneration applies an explicit operator health
-// observation. A usable manual success is the sole recovery path from a
-// terminal failure and starts a fresh 24-hour automatic cooldown.
+// observation. A usable manual success recovers a terminal failure immediately
+// and starts a fresh 24-hour bounded-automatic cooldown.
 func (p *ProxyPool) ObserveManualHealthOutcomeAtGeneration(key string, reachable, policyAllowed bool, latencyMs int64, generation uint64) bool {
 	return p.observeHealthOutcome(key, reachable, policyAllowed, latencyMs, &generation, true)
+}
+
+const fullRecheckFailureRemovalThreshold = 3
+
+// fullHealthObservation is detached worker output. Exhaustive workers collect
+// these values without mutating the pool; a completed, current generation is
+// published as one transaction after every worker has returned.
+type fullHealthObservation struct {
+	Key                 string
+	Verified            Proxy
+	CredentialsVerified bool
+	Reachable           bool
+	PolicyAllowed       bool
+	LatencyMs           int64
+	ExitIP              string
+	Country             string
+	City                string
+	Continent           string
+	IPChanged           bool
+	IPChangeKnown       bool
+}
+
+type fullHealthCommitResult struct {
+	Applied     bool
+	Observed    int
+	RemovedKeys []string
+}
+
+// ObserveFullHealthOutcomeAtGeneration preserves the single-observation API for
+// focused callers and tests. The exhaustive worker uses the batch commit below
+// so cancellation cannot publish a partial cycle.
+func (p *ProxyPool) ObserveFullHealthOutcomeAtGeneration(key string, reachable, policyAllowed bool, latencyMs int64, generation uint64) (observed, removed bool) {
+	result, err := p.CommitFullHealthRecheckAtGeneration([]fullHealthObservation{{
+		Key: key, Reachable: reachable, PolicyAllowed: policyAllowed, LatencyMs: latencyMs,
+	}}, generation)
+	if err != nil {
+		log.Printf("[cache] full-recheck outcome for %s failed: %v", redactProxyKey(key), err)
+		return false, false
+	}
+	return result.Observed == 1, len(result.RemovedKeys) == 1
+}
+
+// CommitFullHealthRecheckAtGeneration applies a complete exhaustive cycle as
+// one persist-then-publish transaction. A stale generation, cancelled caller,
+// or persistence failure leaves live proxy, stats, and candidate state intact.
+func (p *ProxyPool) CommitFullHealthRecheckAtGeneration(observations []fullHealthObservation, healthGeneration uint64) (fullHealthCommitResult, error) {
+	return p.commitFullHealthRecheckContext(context.Background(), observations, healthGeneration)
+}
+
+func (p *ProxyPool) commitFullHealthRecheckContext(ctx context.Context, observations []fullHealthObservation, healthGeneration uint64) (fullHealthCommitResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.deleteMu.Lock()
+	defer p.deleteMu.Unlock()
+	dirtyCaches := make(map[*poolCache]struct{})
+	restoreLive := func(label string) error {
+		if err := p.restoreLiveStateToCaches(dirtyCaches); err != nil {
+			return fmt.Errorf("restore live pool after %s: %w", label, err)
+		}
+		return nil
+	}
+
+	for attempt := 0; attempt < maxPoolDeletePersistAttempts; attempt++ {
+		p.mu.Lock()
+		if ctx.Err() != nil || p.healthGeneration != healthGeneration {
+			p.mu.Unlock()
+			return fullHealthCommitResult{}, restoreLive("cancelled or stale full recheck")
+		}
+		plan, observed := p.buildFullHealthCommitPlanLocked(observations)
+		if observed == 0 {
+			if ctx.Err() != nil {
+				p.mu.Unlock()
+				return fullHealthCommitResult{}, nil
+			}
+			p.mu.Unlock()
+			return fullHealthCommitResult{Applied: true}, nil
+		}
+		if plan.cache == nil {
+			if ctx.Err() != nil {
+				p.mu.Unlock()
+				return fullHealthCommitResult{}, nil
+			}
+			p.publishDeletePlanLocked(plan)
+			p.mu.Unlock()
+			return fullHealthCommitResult{Applied: true, Observed: observed, RemovedKeys: append([]string(nil), plan.removed...)}, nil
+		}
+		p.mu.Unlock()
+
+		if plan.beforePersist != nil {
+			plan.beforePersist()
+		}
+		if ctx.Err() != nil {
+			p.requeuePersistenceAfterDeleteFailure(plan.generation)
+			return fullHealthCommitResult{}, restoreLive("cancelled full recheck")
+		}
+		dirtyCaches[plan.cache] = struct{}{}
+		if err := plan.cache.saveWithHealthState(plan.generation, plan.proxies, plan.proxyIPNodes, plan.snapshotStats, plan.healthCheckURL, plan.healthPolicy, plan.healthRecheckPending); err != nil {
+			p.requeuePersistenceAfterDeleteFailure(plan.generation)
+			if restoreErr := restoreLive("failed full recheck persistence"); restoreErr != nil {
+				err = fmt.Errorf("%w; %v", err, restoreErr)
+			}
+			return fullHealthCommitResult{}, err
+		}
+
+		p.mu.Lock()
+		if ctx.Err() == nil && p.cache == plan.cache && p.cacheGeneration == plan.generation && p.healthGeneration == healthGeneration {
+			p.publishDeletePlanLocked(plan)
+			p.mu.Unlock()
+			return fullHealthCommitResult{Applied: true, Observed: observed, RemovedKeys: append([]string(nil), plan.removed...)}, nil
+		}
+		cancelled := ctx.Err() != nil
+		p.mu.Unlock()
+		if cancelled {
+			return fullHealthCommitResult{}, restoreLive("cancelled full recheck")
+		}
+	}
+
+	err := fmt.Errorf("pool changed during %d full-recheck commit attempts", maxPoolDeletePersistAttempts)
+	if restoreErr := restoreLive("concurrent full recheck changes"); restoreErr != nil {
+		err = fmt.Errorf("%w; %v", err, restoreErr)
+	}
+	return fullHealthCommitResult{}, err
+}
+
+// buildFullHealthCommitPlanLocked applies observations to detached copies and
+// reserves one cache generation for the whole cycle. Caller holds p.mu.
+func (p *ProxyPool) buildFullHealthCommitPlanLocked(observations []fullHealthObservation) (poolDeletePlan, int) {
+	plan := poolDeletePlan{
+		cache:                p.cache,
+		beforePersist:        p.beforeDeletePersist,
+		proxies:              cloneProxySlice(p.proxies),
+		proxyIPNodes:         cloneProxySlice(p.proxyIPNodes),
+		stats:                make(map[string]*nodeStats, len(p.stats)),
+		groupState:           cloneGroupState(p.groupState),
+		healthCheckURL:       p.healthCheckURL,
+		healthPolicy:         p.healthPolicyFingerprint,
+		healthRecheckPending: p.healthRecheckPending,
+	}
+	for key, value := range p.stats {
+		if value == nil {
+			continue
+		}
+		copy := *value
+		plan.stats[key] = &copy
+	}
+	index := make(map[string]int, len(plan.proxies))
+	for i := range plan.proxies {
+		index[plan.proxies[i].Key()] = i
+	}
+
+	observed := 0
+	seen := make(map[string]bool, len(observations))
+	remove := make(map[string]bool)
+	succeededAt := time.Now().UTC()
+	for _, observation := range observations {
+		if seen[observation.Key] {
+			continue
+		}
+		i, ok := index[observation.Key]
+		if !ok {
+			continue
+		}
+		seen[observation.Key] = true
+		observed++
+		px := &plan.proxies[i]
+		stats := plan.stats[observation.Key]
+		if stats == nil {
+			stats = &nodeStats{}
+			plan.stats[observation.Key] = stats
+		}
+		if observation.CredentialsVerified {
+			px.Username = observation.Verified.Username
+			px.Password = observation.Verified.Password
+			px.CredentialAlternates = append([]ProxyCredential(nil), observation.Verified.CredentialAlternates...)
+		}
+		if observation.ExitIP != "" {
+			px.ExitIP = observation.ExitIP
+			px.IPChanged = observation.IPChanged
+			px.IPChangeKnown = observation.IPChangeKnown
+			if observation.Country != "" {
+				px.Country = observation.Country
+				px.City = observation.City
+				px.Continent = observation.Continent
+			}
+		}
+		if observation.Reachable {
+			stats.ConsecutiveHealthFailures = 0
+			stats.ConsecutiveFullRecheckFailures = 0
+			stats.LastHealthSuccessAt = succeededAt
+			stats.HealthFailureTerminal = false
+			if observation.LatencyMs > 0 {
+				stats.LastLatencyMs = observation.LatencyMs
+			}
+			px.HealthInvalidated = false
+			px.PolicyExcluded = !observation.PolicyAllowed
+			px.Available = observation.PolicyAllowed && !px.SourceRetired
+			px.LatencyMs = observation.LatencyMs
+			continue
+		}
+
+		stats.ConsecutiveHealthFailures++
+		stats.ConsecutiveFullRecheckFailures++
+		stats.HealthFailureTerminal = true
+		px.HealthInvalidated = true
+		px.Available = false
+		px.PolicyExcluded = false
+		if stats.ConsecutiveFullRecheckFailures >= fullRecheckFailureRemovalThreshold {
+			remove[observation.Key] = true
+		}
+	}
+	if observed == 0 {
+		return plan, 0
+	}
+
+	if len(remove) > 0 {
+		retained := make([]Proxy, 0, len(plan.proxies)-len(remove))
+		for _, px := range plan.proxies {
+			if remove[px.Key()] {
+				plan.removed = append(plan.removed, px.Key())
+				delete(plan.stats, px.Key())
+				continue
+			}
+			retained = append(retained, px)
+		}
+		plan.proxies = retained
+		liveKeys := make(map[string]bool, len(plan.proxies))
+		for _, px := range plan.proxies {
+			liveKeys[px.Key()] = true
+		}
+		plan.groupState = cleanedGroupState(plan.groupState, liveKeys)
+	}
+	plan.snapshotStats = make(map[string]nodeStats, len(plan.stats))
+	for key, value := range plan.stats {
+		if value != nil {
+			plan.snapshotStats[key] = *value
+		}
+	}
+	if plan.cache != nil {
+		p.cancelScheduledPersistenceLocked()
+		p.cacheGeneration++
+		plan.generation = p.cacheGeneration
+	}
+	return plan, observed
+}
+
+func cloneGroupState(current map[string]*groupCursor) map[string]*groupCursor {
+	cloned := make(map[string]*groupCursor, len(current))
+	for name, cursor := range current {
+		if cursor == nil {
+			continue
+		}
+		copy := *cursor
+		cloned[name] = &copy
+	}
+	return cloned
 }
 
 func (p *ProxyPool) observeHealthOutcome(key string, reachable, policyAllowed bool, latencyMs int64, expectedGeneration *uint64, manual bool) bool {
@@ -448,8 +705,8 @@ func proxyHardRoutable(px Proxy) bool {
 }
 
 // SetAvailable flips a node's soft availability. It deliberately does not
-// alter automatic health cooldown or terminal state; only a successful manual
-// health observation may recover a terminal failure.
+// alter automatic health cooldown or terminal state; recovery belongs to a
+// successful exhaustive full recheck or explicit manual health observation.
 func (p *ProxyPool) SetAvailable(key string, available bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -513,6 +770,7 @@ func (p *ProxyPool) InvalidateHealth(checkURL ...string) int {
 		}
 		if st := p.stats[p.proxies[i].Key()]; st != nil {
 			st.ConsecutiveHealthFailures = 0
+			st.ConsecutiveFullRecheckFailures = 0
 			st.LastHealthSuccessAt = time.Time{}
 		}
 	}
@@ -1408,6 +1666,21 @@ func (p *ProxyPool) All() []Proxy {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return cloneProxySlice(p.proxies)
+}
+
+// FullRecheckCandidates returns every retained forwarding node still owned by
+// an enabled source. Availability, cooldown, and terminal state are ignored so
+// exhaustive cycles can recover nodes that bounded automatic checks skip.
+func (p *ProxyPool) FullRecheckCandidates() []Proxy {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]Proxy, 0, len(p.proxies))
+	for _, px := range p.proxies {
+		if !px.SourceRetired {
+			out = append(out, cloneProxy(px))
+		}
+	}
+	return out
 }
 
 // RecheckCandidates returns a bounded, rotating slice of nodes eligible for an

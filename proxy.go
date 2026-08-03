@@ -98,9 +98,9 @@ type Proxy struct {
 	Anonymity string
 
 	// Available reflects the most recent accepted health result for this node.
-	// A complete automatic or manual check that ultimately fails makes the node
-	// terminally unavailable. Automatic checks cannot recover that state; only a
-	// later successful explicit manual verification can make it available again.
+	// A failed bounded automatic or manual check makes the node terminally
+	// unavailable. A later exhaustive full recheck or explicit manual verification
+	// can recover it after a successful observation.
 	Available bool `json:"available"`
 }
 

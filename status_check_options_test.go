@@ -139,6 +139,101 @@ func TestCheckOptionsRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestCheckOptionsScheduleSettingsRoundTripWithoutHealthInvalidation(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCheckOptions(50, 15*time.Second, 500, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	pool := NewProxyPool()
+	pool.SetHealthCriterion("https://example.test/health")
+	pool.Prime([]Proxy{testProxy("socks5", "192.0.2.18", "1080", true)}, nil)
+	coordinator := newRefreshCoordinator()
+	server := NewStatusServerWithCoordinator(pool, store, coordinator)
+	server.SetCheckDefaults(10*time.Second, 20, 3000, false)
+	server.SetScheduleDefaults(20*time.Minute, 30*time.Minute)
+	handler := server.handler()
+	generation := pool.HealthGeneration()
+
+	get := func() map[string]interface{} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, localTestRequest(http.MethodGet, "/api/settings/check-options", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET schedules = %d %s", recorder.Code, recorder.Body.String())
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		request := localTestRequest(http.MethodPost, "/api/settings/check-options", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	initial := get()
+	if initial["source_refresh_interval_seconds"] != float64(1200) || initial["full_recheck_interval_seconds"] != float64(1800) {
+		t.Fatalf("initial effective schedules = %#v", initial)
+	}
+
+	recorder := post(`{"source_refresh_interval_seconds":600,"full_recheck_interval_seconds":900}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST schedules = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if pool.HealthGeneration() != generation || coordinator.drainFullRecheckSignalForTest() {
+		t.Fatal("schedule-only update invalidated health or queued a full recheck")
+	}
+	if store.MaxConcurrent(20) != 50 || store.CheckTimeout(10*time.Second) != 15*time.Second || store.MaxCandidates(3000) != 500 {
+		t.Fatal("schedule-only update changed existing health option overrides")
+	}
+	if store.SourceRefreshInterval(20*time.Minute) != 10*time.Minute || store.FullRecheckInterval(30*time.Minute) != 15*time.Minute {
+		t.Fatalf("stored schedules = source %s full %s", store.SourceRefreshInterval(0), store.FullRecheckInterval(0))
+	}
+
+	got := get()
+	overrides, ok := got["overrides"].(map[string]interface{})
+	if !ok || got["source_refresh_interval_seconds"] != float64(600) || got["full_recheck_interval_seconds"] != float64(900) || overrides["source_refresh_interval_seconds"] != float64(600) || overrides["full_recheck_interval_seconds"] != float64(900) {
+		t.Fatalf("GET saved schedules = %#v", got)
+	}
+
+	for _, body := range []string{
+		`{"source_refresh_interval_seconds":59}`,
+		`{"source_refresh_interval_seconds":604801}`,
+		`{"full_recheck_interval_seconds":59}`,
+		`{"full_recheck_interval_seconds":604801}`,
+	} {
+		if recorder := post(body); recorder.Code != http.StatusBadRequest {
+			t.Fatalf("POST %s = %d, want 400", body, recorder.Code)
+		}
+	}
+	if store.SourceRefreshInterval(0) != 10*time.Minute || store.FullRecheckInterval(0) != 15*time.Minute {
+		t.Fatal("invalid schedule update partially changed persisted values")
+	}
+
+	recorder = post(`{"source_refresh_interval_seconds":0,"full_recheck_interval_seconds":0}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST schedule reset = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if store.SourceRefreshInterval(20*time.Minute) != 20*time.Minute || store.FullRecheckInterval(30*time.Minute) != 30*time.Minute {
+		t.Fatal("zero schedule values did not restore CLI defaults")
+	}
+
+	reloaded, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.SourceRefreshInterval(20*time.Minute) != 20*time.Minute || reloaded.FullRecheckInterval(30*time.Minute) != 30*time.Minute {
+		t.Fatal("schedule reset did not persist across restart")
+	}
+}
+
 func TestCheckOptionsRequireIPChangeFlipInvalidatesAndRechecks(t *testing.T) {
 	resetRefreshOperationsForTest(t)
 	store, err := NewConfigStore(t.TempDir())

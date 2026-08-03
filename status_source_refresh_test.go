@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -69,6 +70,118 @@ func TestQueueDueSourceRefreshesSkipsDisabledAutoUpdate(t *testing.T) {
 	}
 	if got := <-coordinator.sourceRefreshChan; got != "due" {
 		t.Fatalf("queued source %q, want due", got)
+	}
+}
+
+func TestIndependentSourceAndFullRecheckScheduleTimes(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	sourceCompleted := time.Date(2026, time.August, 2, 10, 0, 0, 0, time.UTC)
+	fullCompleted := sourceCompleted.Add(5 * time.Minute)
+
+	coordinator.recordSourceRefresh(sourceCompleted, 20*time.Minute)
+	coordinator.recordFullRecheck(fullCompleted, 30*time.Minute)
+
+	sourceLast, sourceNext := coordinator.scrapeTimes()
+	fullLast, fullNext := coordinator.fullRecheckTimes()
+	if !sourceLast.Equal(sourceCompleted) || !sourceNext.Equal(sourceCompleted.Add(20*time.Minute)) {
+		t.Fatalf("source schedule = (%s, %s)", sourceLast, sourceNext)
+	}
+	if !fullLast.Equal(fullCompleted) || !fullNext.Equal(fullCompleted.Add(30*time.Minute)) {
+		t.Fatalf("full recheck schedule = (%s, %s)", fullLast, fullNext)
+	}
+}
+
+func TestCompletedFullRecheckUsesCurrentRuntimeInterval(t *testing.T) {
+	store := &ConfigStore{cfg: PoolConfig{FullRecheckIntervalSeconds: 60}}
+	coordinator := newRefreshCoordinator()
+	first := time.Date(2026, time.August, 2, 11, 0, 0, 0, time.UTC)
+	recordCompletedFullRecheck(coordinator, store, 30*time.Minute, first)
+	_, next := coordinator.fullRecheckTimes()
+	if want := first.Add(time.Minute); !next.Equal(want) {
+		t.Fatalf("first next full recheck = %s, want %s", next, want)
+	}
+
+	store.mu.Lock()
+	store.cfg.FullRecheckIntervalSeconds = 120
+	store.mu.Unlock()
+	second := first.Add(10 * time.Minute)
+	recordCompletedFullRecheck(coordinator, store, 30*time.Minute, second)
+	_, next = coordinator.fullRecheckTimes()
+	if want := second.Add(2 * time.Minute); !next.Equal(want) {
+		t.Fatalf("updated next full recheck = %s, want %s", next, want)
+	}
+}
+
+func TestQueueDueSourceRefreshesUsesRuntimeGlobalOverride(t *testing.T) {
+	store := &ConfigStore{cfg: PoolConfig{
+		Sources:                      []Source{{ID: "source-a", Name: "A", Enabled: true, AutoRefreshEnabled: true}},
+		SourceRefreshIntervalSeconds: 3600,
+	}}
+	coordinator := newRefreshCoordinator()
+	now := time.Now()
+	coordinator.markSourcesRefreshed(store.Sources(), now.Add(-30*time.Minute))
+	if got := coordinator.queueDueSourceRefreshes(store, 10*time.Minute, now); got != 0 {
+		t.Fatalf("queued %d sources under one-hour override, want 0", got)
+	}
+
+	store.mu.Lock()
+	store.cfg.SourceRefreshIntervalSeconds = 60
+	store.mu.Unlock()
+	if got := coordinator.queueDueSourceRefreshes(store, 10*time.Minute, now); got != 1 {
+		t.Fatalf("queued %d sources after runtime override, want 1", got)
+	}
+}
+
+func TestSignalWakeWithoutPendingDoesNotSynthesizeFullRecheck(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	pool := NewProxyPool()
+	pool.SetHealthCriterion(defaultCheckURL)
+
+	if operation, claimed := coordinator.claimHealthRecheckOperation(pool, 3, false); claimed || operation.ID != "" {
+		t.Fatalf("signal wake without pending operation claimed %#v", operation)
+	}
+	if state := coordinator.healthRecheckOperationStatus(); state.State != "idle" || state.Active != nil {
+		t.Fatalf("phantom signal created active operation: %#v", state)
+	}
+
+	operation, claimed := coordinator.claimHealthRecheckOperation(pool, 3, true)
+	if !claimed || operation.ID == "" || operation.Status != "running" {
+		t.Fatalf("timer wake did not synthesize scheduled operation: %#v claimed=%v", operation, claimed)
+	}
+}
+
+func TestNextSourceRefreshTimeUsesEarliestPerSourceDeadline(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	origin := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	sources := []Source{
+		{ID: "global", Name: "Global", Enabled: true, AutoRefreshEnabled: true},
+		{ID: "fast", Name: "Fast", Enabled: true, AutoRefreshEnabled: true, RefreshIntervalSeconds: 90},
+		{ID: "manual", Name: "Manual", Enabled: true, AutoRefreshEnabled: false, RefreshIntervalSeconds: 60},
+		{ID: "disabled", Name: "Disabled", Enabled: false, AutoRefreshEnabled: true, RefreshIntervalSeconds: 60},
+	}
+	coordinator.markSourcesRefreshed([]Source{sources[0]}, origin)
+	coordinator.markSourcesRefreshed([]Source{sources[1]}, origin.Add(5*time.Minute))
+	coordinator.markSourcesRefreshed([]Source{sources[2], sources[3]}, origin.Add(-time.Hour))
+
+	got := coordinator.nextSourceRefreshTime(sources, 20*time.Minute, origin.Add(5*time.Minute))
+	want := origin.Add(6*time.Minute + 30*time.Second)
+	if !got.Equal(want) {
+		t.Fatalf("next source refresh = %s, want earliest enabled automatic deadline %s", got, want)
+	}
+}
+
+func TestCancelledBackgroundFullRecheckDoesNotRecordSchedule(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	coordinator := newRefreshCoordinator()
+	cfg := &Config{FullRecheckInterval: 30 * time.Minute}
+	store := &ConfigStore{}
+	if runFullRecheckCycle(ctx, cfg, store, NewProxyPool(), coordinator) {
+		t.Fatal("cancelled full recheck reported completion")
+	}
+	last, next := coordinator.fullRecheckTimes()
+	if !last.IsZero() || !next.IsZero() {
+		t.Fatalf("cancelled full recheck recorded schedule = (%s, %s)", last, next)
 	}
 }
 

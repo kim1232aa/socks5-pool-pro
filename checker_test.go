@@ -536,6 +536,72 @@ func TestLookupGeoDoesNotCacheFailures(t *testing.T) {
 	}
 }
 
+func TestRefreshBaselineExitRacesEndpointsAndUsesFirstValidIP(t *testing.T) {
+	baselineExitMu.Lock()
+	oldBaseline := baselineExitIP
+	baselineExitIP = ""
+	baselineExitMu.Unlock()
+	t.Cleanup(func() {
+		baselineExitMu.Lock()
+		baselineExitIP = oldBaseline
+		baselineExitMu.Unlock()
+	})
+
+	blocked := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-blocked
+		_, _ = io.WriteString(w, "198.51.100.20")
+	}))
+	defer slow.Close()
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "198.51.100.21")
+	}))
+	defer fast.Close()
+
+	started := time.Now()
+	success, changed := refreshBaselineExitWithURLsChangeContext(context.Background(), []string{slow.URL, fast.URL}, time.Second)
+	close(blocked)
+	if !success || !changed || BaselineExitIP() != "198.51.100.21" {
+		t.Fatalf("raced baseline = %q success=%v changed=%v", BaselineExitIP(), success, changed)
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("baseline race waited for slow endpoint: %s", elapsed)
+	}
+}
+
+func TestRefreshBaselineExitAllFailuresRetainPreviousValue(t *testing.T) {
+	baselineExitMu.Lock()
+	oldBaseline := baselineExitIP
+	baselineExitIP = "198.51.100.30"
+	baselineExitMu.Unlock()
+	t.Cleanup(func() {
+		baselineExitMu.Lock()
+		baselineExitIP = oldBaseline
+		baselineExitMu.Unlock()
+	})
+
+	invalid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "not-an-ip")
+	}))
+	defer invalid.Close()
+	unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+	}))
+	defer unavailable.Close()
+
+	success, changed := refreshBaselineExitWithURLsChangeContext(
+		context.Background(),
+		[]string{invalid.URL, unavailable.URL},
+		time.Second,
+	)
+	if success || changed {
+		t.Fatalf("all-fail refresh success=%v changed=%v", success, changed)
+	}
+	if got := BaselineExitIP(); got != "198.51.100.30" {
+		t.Fatalf("baseline after all failures = %q, want previous value", got)
+	}
+}
+
 func TestRefreshBaselineExitUsesDirectClientAndRefreshesValue(t *testing.T) {
 	client := newDirectHTTPClient(time.Second)
 	transport, ok := client.Transport.(*http.Transport)

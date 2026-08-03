@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeRawSourceConfig(t *testing.T, dir, sourceFields string) string {
@@ -94,6 +95,50 @@ func TestSetSourceAutoRefreshRejectsUnknownIDAndInvalidIntervals(t *testing.T) {
 		if err := store.SetSourceAutoRefresh(id, true, interval); err != nil {
 			t.Errorf("interval %d rejected: %v", interval, err)
 		}
+	}
+}
+
+func TestScheduleIntervalsPersistFallbackAndValidate(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.SourceRefreshInterval(20 * time.Minute); got != 20*time.Minute {
+		t.Fatalf("default source refresh interval = %s", got)
+	}
+	if got := store.FullRecheckInterval(30 * time.Minute); got != 30*time.Minute {
+		t.Fatalf("default full recheck interval = %s", got)
+	}
+
+	if err := store.SetScheduleIntervals(90, 120); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.SourceRefreshInterval(time.Hour); got != 90*time.Second {
+		t.Fatalf("source refresh override = %s", got)
+	}
+	if got := store.FullRecheckInterval(time.Hour); got != 2*time.Minute {
+		t.Fatalf("full recheck override = %s", got)
+	}
+
+	restarted, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.SourceRefreshInterval(time.Hour) != 90*time.Second || restarted.FullRecheckInterval(time.Hour) != 2*time.Minute {
+		t.Fatalf("restarted schedule = source %s full %s", restarted.SourceRefreshInterval(time.Hour), restarted.FullRecheckInterval(time.Hour))
+	}
+
+	for _, intervals := range [][2]int{{-1, 120}, {59, 120}, {604801, 120}, {90, -1}, {90, 59}, {90, 604801}} {
+		if err := store.SetScheduleIntervals(intervals[0], intervals[1]); err == nil {
+			t.Errorf("schedule intervals %v were accepted", intervals)
+		}
+	}
+	if err := store.SetScheduleIntervals(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if store.SourceRefreshInterval(20*time.Minute) != 20*time.Minute || store.FullRecheckInterval(30*time.Minute) != 30*time.Minute {
+		t.Fatal("zero schedule overrides did not restore CLI fallbacks")
 	}
 }
 

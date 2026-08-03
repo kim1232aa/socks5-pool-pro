@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -8,6 +10,37 @@ import (
 	"testing"
 	"time"
 )
+
+func parseConfigArgsForTest(t *testing.T, args ...string) *Config {
+	t.Helper()
+	previousFlags := flag.CommandLine
+	previousArgs := os.Args
+	flag.CommandLine = flag.NewFlagSet("socks5-pool-test", flag.ContinueOnError)
+	flag.CommandLine.SetOutput(io.Discard)
+	os.Args = append([]string{"socks5-pool-test"}, args...)
+	defer func() {
+		flag.CommandLine = previousFlags
+		os.Args = previousArgs
+	}()
+	return ParseConfig()
+}
+
+func TestParseConfigScheduleDefaultsAndOverrides(t *testing.T) {
+	unsetCredentialTestEnv(t,
+		"SOCKS_USER", "SOCKS_USER_FILE", "SOCKS_PASS", "SOCKS_PASS_FILE",
+		"ADMIN_USER", "ADMIN_USER_FILE", "ADMIN_PASS", "ADMIN_PASS_FILE", "PORT",
+	)
+
+	defaults := parseConfigArgsForTest(t)
+	if defaults.ScrapeInterval != 20*time.Minute || defaults.FullRecheckInterval != 30*time.Minute {
+		t.Fatalf("schedule defaults = source %s full %s", defaults.ScrapeInterval, defaults.FullRecheckInterval)
+	}
+
+	overrides := parseConfigArgsForTest(t, "-scrape-interval=45m", "-full-recheck-interval=2h")
+	if overrides.ScrapeInterval != 45*time.Minute || overrides.FullRecheckInterval != 2*time.Hour {
+		t.Fatalf("schedule overrides = source %s full %s", overrides.ScrapeInterval, overrides.FullRecheckInterval)
+	}
+}
 
 func unsetCredentialTestEnv(t *testing.T, names ...string) {
 	t.Helper()
@@ -130,13 +163,14 @@ func TestTrustedManagementProxyFlagRejectsNonExactAddresses(t *testing.T) {
 
 func TestConfigValidateConnectionLimitAndTrustedProxyIPs(t *testing.T) {
 	base := Config{
-		ListenAddr:     "127.0.0.1:1080",
-		StatusAddr:     "127.0.0.1:8080",
-		DataDir:        ".",
-		ScrapeInterval: time.Minute,
-		CheckTimeout:   time.Second,
-		MaxConcurrent:  1,
-		MaxCandidates:  1,
+		ListenAddr:          "127.0.0.1:1080",
+		StatusAddr:          "127.0.0.1:8080",
+		DataDir:             ".",
+		ScrapeInterval:      time.Minute,
+		FullRecheckInterval: time.Minute,
+		CheckTimeout:        time.Second,
+		MaxConcurrent:       1,
+		MaxCandidates:       1,
 	}
 
 	valid := base

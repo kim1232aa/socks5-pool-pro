@@ -74,22 +74,26 @@
       <label class="small" for="opt-maxconcurrent">并发</label><input id="opt-maxconcurrent" type="number" min="1" max="512" step="1" inputmode="numeric">
       <label class="small" for="opt-checktimeout">超时(秒)</label><input id="opt-checktimeout" type="number" min="2" max="120" step="1" inputmode="numeric">
       <label class="small" for="opt-maxcandidates">每轮抽样</label><input id="opt-maxcandidates" type="number" min="100" max="100000" step="100" inputmode="numeric">
+      <label class="small" for="opt-source-refresh-interval">来源刷新(分钟)</label><input id="opt-source-refresh-interval" type="number" min="1" max="10080" step="0.1" inputmode="decimal">
+      <label class="small" for="opt-full-recheck-interval">全池复检(分钟)</label><input id="opt-full-recheck-interval" type="number" min="1" max="10080" step="0.1" inputmode="decimal">
       <label class="chk"><input type="checkbox" id="opt-require-ip-change"> 要求改IP（出口IP必须不同于入口）</label>
       <label class="chk"><input type="checkbox" id="opt-require-ip-change-default" onchange="syncRequireIPChangeDefault()" checked> 跟随命令行默认</label>
       <button id="check-options-save" type="button" class="btn-sm" data-action="save-check-options">保存检测选项</button>
-      <span class="checkurl-hint">留空/0 表示跟随命令行默认值；保存后下一轮检测生效，要求改IP 变更会立即失效旧健康结果并全池复检。</span>
+      <span class="checkurl-hint">留空/0 表示跟随命令行默认值；来源刷新与全池复检独立调度。完整全检可恢复不可用节点；连续 3 次完整全检失败后移出转发池，候选库记录仍保留。要求改IP 变更会立即失效旧健康结果并全池复检。</span>
       <span id="check-options-status" class="small" role="status" aria-live="polite"></span>
     </div>
     <div class="checkurl-bar baseline-bar">
       <div class="field-copy"><span class="step-number">基线出口</span><label class="checkurl-label" for="baseline-exit-ip">改IP 判定参照的基线出口 IP</label></div>
       <span id="baseline-exit-ip" class="mono">加载中…</span>
       <button id="baseline-refresh" type="button" class="btn-sm" data-action="refresh-baseline">刷新基线</button>
-      <span class="checkurl-hint">基线是当前节点的实测出口 IP，用于判断轮换后是否真的换了 IP。</span>
+      <span class="checkurl-hint">基线是本机直连出口 IP，用于与代理出口比较并判断是否真的换了 IP。</span>
       <span id="baseline-exit-status" class="small" role="status" aria-live="polite"></span>
     </div>
     <div class="refresh-timeline" aria-label="刷新时间">
-      <div class="timeline-item">最近完成<strong id="timeline-last">{{if .LastScrape}}{{.LastScrape}}{{else}}尚未刷新{{end}}</strong></div>
-      <div class="timeline-item">下次计划<strong id="timeline-next">{{if .NextScrape}}{{.NextScrape}}{{else}}等待调度{{end}}</strong></div>
+      <div class="timeline-item">来源刷新 · 最近<strong id="timeline-source-last">{{if .LastSourceRefresh}}{{.LastSourceRefresh}}{{else}}尚未刷新{{end}}</strong></div>
+      <div class="timeline-item">来源刷新 · 下次<strong id="timeline-source-next">{{if .NextSourceRefresh}}{{.NextSourceRefresh}}{{else}}等待调度{{end}}</strong></div>
+      <div class="timeline-item">全池复检 · 最近<strong id="timeline-full-last">{{if .LastFullRecheck}}{{.LastFullRecheck}}{{else}}尚未全检{{end}}</strong></div>
+      <div class="timeline-item">全池复检 · 下次<strong id="timeline-full-next">{{if .NextFullRecheck}}{{.NextFullRecheck}}{{else}}等待调度{{end}}</strong></div>
     </div>
   </section>
 
@@ -99,7 +103,7 @@
 
   <div id="group-cards-container" class="group-cards"></div>
 
-  <p class="inline-guidance"><b>出口国家</b>来自穿过节点的实测；自动检测成功后 24 小时内不重复检测，最终失败立即从路由过滤，只有显式人工验证成功才能恢复。</p>
+  <p class="inline-guidance"><b>出口国家</b>来自穿过节点的实测；轻量自动检测成功后 24 小时内不重复检测，失败会立即从路由过滤；完整全检或显式人工验证成功可恢复。</p>
   <div id="scrape-flow" class="scrape-flow" aria-label="最近一轮节点处理链路" hidden>
     <span class="scrape-step">来源原始 <strong id="scrape-raw">0</strong></span><span class="scrape-arrow">→</span>
     <span class="scrape-step">去重候选 <strong id="scrape-candidates">0</strong></span><span class="scrape-arrow">→</span>

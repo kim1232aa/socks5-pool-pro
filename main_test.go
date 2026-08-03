@@ -252,6 +252,87 @@ func poolHasKey(pool *ProxyPool, key string) bool {
 	return ok
 }
 
+func TestFullRecheckRecoversTerminalUnavailableProxy(t *testing.T) {
+	proxyServer, tunnels := newTestConnectProxy(t)
+	proxyURL, err := url.Parse(proxyServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	px := Proxy{IP: proxyURL.Hostname(), Port: proxyURL.Port(), Protocol: "http", Available: false, HealthInvalidated: true}
+	store := &ConfigStore{cfg: PoolConfig{CheckURL: "http://health.test/check"}}
+	pool := NewProxyPool()
+	pool.SetHealthCriterion(store.CheckURL())
+	pool.Prime([]Proxy{px}, nil)
+	pool.stats[px.Key()] = &nodeStats{HealthFailureTerminal: true, ConsecutiveHealthFailures: 1, ConsecutiveFullRecheckFailures: 1}
+	cfg := &Config{CheckTimeout: time.Second, MaxConcurrent: 1, MaxCandidates: 1}
+
+	if !reCheckAllAliveContext(context.Background(), cfg, store, pool, newRefreshCoordinator()) {
+		t.Fatal("full recheck did not complete")
+	}
+	got, ok := pool.Find(px.Key())
+	if !ok || !got.Available || got.HealthInvalidated || tunnels.Load() == 0 {
+		t.Fatalf("full recheck recovery = proxy %+v found=%v tunnels=%d", got, ok, tunnels.Load())
+	}
+}
+
+func TestCancelledFullRecheckDiscardsCompletedNodeOutcomes(t *testing.T) {
+	fast := testProxy("http", "192.0.2.246", "8080", true)
+	slow := testProxy("socks5", "192.0.2.247", "1080", true)
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{fast, slow}, nil)
+	store := &ConfigStore{cfg: PoolConfig{CheckURL: "https://health.test/check"}}
+	pool.SetHealthCriterion(store.CheckURL())
+	coordinator := newRefreshCoordinator()
+	cfg := &Config{CheckTimeout: time.Minute, MaxConcurrent: 2, MaxCandidates: 2}
+
+	previousCheck := recheckCheckCredentialCandidates
+	fastReturned := make(chan struct{})
+	slowStarted := make(chan struct{})
+	recheckCheckCredentialCandidates = func(ctx context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, time.Duration) {
+		if px.Key() == fast.Key() {
+			close(fastReturned)
+			return px, false, 0
+		}
+		close(slowStarted)
+		<-ctx.Done()
+		return px, false, 0
+	}
+	t.Cleanup(func() { recheckCheckCredentialCandidates = previousCheck })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- reCheckAllAliveContext(ctx, cfg, store, pool, coordinator) }()
+	<-fastReturned
+	<-slowStarted
+	deadline := time.After(2 * time.Second)
+	for {
+		status := coordinator.healthRecheckOperationStatus()
+		if status.Active != nil && status.Active.Completed == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("fast full-recheck result was not observed before cancellation")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	if completed := <-done; completed {
+		t.Fatal("cancelled full recheck reported complete")
+	}
+
+	for _, px := range []Proxy{fast, slow} {
+		got, ok := pool.Find(px.Key())
+		if !ok || !got.Available || got.HealthInvalidated {
+			t.Fatalf("cancelled full recheck published proxy state for %s: %+v found=%v", px.Key(), got, ok)
+		}
+		if stats := pool.stats[px.Key()]; stats != nil && (stats.ConsecutiveHealthFailures != 0 || stats.ConsecutiveFullRecheckFailures != 0 || stats.HealthFailureTerminal) {
+			t.Fatalf("cancelled full recheck published stats for %s: %+v", px.Key(), stats)
+		}
+	}
+}
+
 func TestPeriodicRecheckDoesNotReviveTransparentProxy(t *testing.T) {
 	proxyServer, _ := newTestConnectProxy(t)
 	proxyURL, err := url.Parse(proxyServer.URL)

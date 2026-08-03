@@ -87,6 +87,10 @@ func (s *StatusServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			Total: summary.Total, ProxyIPTotal: summary.ProxyIPTotal,
 			LastScrape: summary.LastScrape, NextScrape: summary.NextScrape,
 			LastScrapeAt: summary.LastScrapeAt, NextScrapeAt: summary.NextScrapeAt,
+			LastSourceRefresh: summary.LastSourceRefresh, NextSourceRefresh: summary.NextSourceRefresh,
+			LastSourceRefreshAt: summary.LastSourceRefreshAt, NextSourceRefreshAt: summary.NextSourceRefreshAt,
+			LastFullRecheck: summary.LastFullRecheck, NextFullRecheck: summary.NextFullRecheck,
+			LastFullRecheckAt: summary.LastFullRecheckAt, NextFullRecheckAt: summary.NextFullRecheckAt,
 			Groups: summary.Groups, ActiveProxy: summary.ActiveProxy,
 			AvailableTotal: summary.AvailableTotal, UnavailableTotal: summary.UnavailableTotal,
 			HealthRecheckPending: summary.HealthRecheckPending,
@@ -313,8 +317,8 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	policyAllowed := policy.PolicyAllowed
 
 	// The transport retries form one explicit health observation. A final
-	// failure becomes terminal immediately; only a later explicit manual
-	// success may recover that terminal state.
+	// failure becomes terminal immediately; a later exhaustive full recheck or
+	// explicit manual success may recover that terminal state.
 	if !s.pool.ObserveManualHealthOutcomeAtGeneration(in.Key, reachable, policyAllowed, latencyMs, healthGeneration) {
 		if s.pool.HealthGeneration() != healthGeneration {
 			writeErrCode(w, http.StatusConflict, "health_criterion_changed", fmt.Errorf("检测标准已改变，结果未应用"))

@@ -255,6 +255,61 @@ func TestStatusAddsRFC3339UTCTimestampsWithoutRemovingLegacyFields(t *testing.T)
 	}
 }
 
+func TestCompactStatusReportsIndependentSourceAndFullRecheckSchedules(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	sourceLast := time.Date(2026, time.July, 12, 5, 1, 2, 0, time.UTC)
+	fullLast := time.Date(2026, time.July, 12, 5, 6, 2, 0, time.UTC)
+	coordinator.recordSourceRefresh(sourceLast, 20*time.Minute)
+	coordinator.recordFullRecheck(fullLast, 30*time.Minute)
+	store := &ConfigStore{cfg: PoolConfig{Sources: []Source{{
+		ID: "source-a", Name: "Source A", Enabled: true, AutoRefreshEnabled: true,
+	}}}}
+	coordinator.markSourcesRefreshed(store.Sources(), sourceLast)
+
+	recorder := httptest.NewRecorder()
+	server := NewStatusServerWithCoordinator(NewProxyPool(), store, coordinator)
+	server.SetScheduleDefaults(20*time.Minute, 30*time.Minute)
+	server.handler().ServeHTTP(recorder, localTestRequest(http.MethodGet, "/api/status?compact=1", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("compact status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body compactStatusSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.LastSourceRefreshAt != "2026-07-12T05:01:02Z" || body.NextSourceRefreshAt != "2026-07-12T05:21:02Z" {
+		t.Fatalf("source schedule = %q %q", body.LastSourceRefreshAt, body.NextSourceRefreshAt)
+	}
+	if body.LastFullRecheckAt != "2026-07-12T05:06:02Z" || body.NextFullRecheckAt != "2026-07-12T05:36:02Z" {
+		t.Fatalf("full recheck schedule = %q %q", body.LastFullRecheckAt, body.NextFullRecheckAt)
+	}
+	if body.LastScrapeAt != body.LastSourceRefreshAt || body.NextScrapeAt != body.NextSourceRefreshAt || body.LastScrape == "" || body.NextScrape == "" {
+		t.Fatalf("legacy source aliases = %#v", body)
+	}
+}
+
+func TestCompactStatusUsesEarliestPerSourceRefreshDeadline(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	origin := time.Date(2026, time.July, 12, 5, 0, 0, 0, time.UTC)
+	store := &ConfigStore{cfg: PoolConfig{Sources: []Source{
+		{ID: "global", Name: "Global", Enabled: true, AutoRefreshEnabled: true},
+		{ID: "fast", Name: "Fast", Enabled: true, AutoRefreshEnabled: true, RefreshIntervalSeconds: 90},
+	}}}
+	coordinator.recordSourceRefresh(origin.Add(5*time.Minute), 20*time.Minute)
+	coordinator.markSourcesRefreshed([]Source{store.cfg.Sources[0]}, origin)
+	coordinator.markSourcesRefreshed([]Source{store.cfg.Sources[1]}, origin.Add(5*time.Minute))
+
+	server := NewStatusServerWithCoordinator(NewProxyPool(), store, coordinator)
+	server.SetScheduleDefaults(20*time.Minute, 30*time.Minute)
+	summary := server.buildSummaryWithProxies(false)
+	if got, want := summary.NextSourceRefreshAt, "2026-07-12T05:06:30Z"; got != want {
+		t.Fatalf("next source refresh = %q, want per-source earliest %q", got, want)
+	}
+	if summary.NextScrapeAt != summary.NextSourceRefreshAt {
+		t.Fatalf("legacy next_scrape_at = %q, want source alias %q", summary.NextScrapeAt, summary.NextSourceRefreshAt)
+	}
+}
+
 func TestV1HealthyProxyPageAndPickContract(t *testing.T) {
 	pool := NewProxyPool()
 	pool.Prime([]Proxy{

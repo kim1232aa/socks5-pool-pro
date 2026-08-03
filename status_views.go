@@ -84,13 +84,21 @@ type GroupView struct {
 }
 
 type StatusSummary struct {
-	Total        int         `json:"total"`
-	ProxyIPTotal int         `json:"proxyip_total"`
-	LastScrape   string      `json:"last_scrape"`
-	NextScrape   string      `json:"next_scrape"`
-	LastScrapeAt string      `json:"last_scrape_at,omitempty"`
-	NextScrapeAt string      `json:"next_scrape_at,omitempty"`
-	Groups       []GroupView `json:"groups"`
+	Total               int         `json:"total"`
+	ProxyIPTotal        int         `json:"proxyip_total"`
+	LastScrape          string      `json:"last_scrape"`
+	NextScrape          string      `json:"next_scrape"`
+	LastScrapeAt        string      `json:"last_scrape_at,omitempty"`
+	NextScrapeAt        string      `json:"next_scrape_at,omitempty"`
+	LastSourceRefresh   string      `json:"last_source_refresh"`
+	NextSourceRefresh   string      `json:"next_source_refresh"`
+	LastSourceRefreshAt string      `json:"last_source_refresh_at,omitempty"`
+	NextSourceRefreshAt string      `json:"next_source_refresh_at,omitempty"`
+	LastFullRecheck     string      `json:"last_full_recheck"`
+	NextFullRecheck     string      `json:"next_full_recheck"`
+	LastFullRecheckAt   string      `json:"last_full_recheck_at,omitempty"`
+	NextFullRecheckAt   string      `json:"next_full_recheck_at,omitempty"`
+	Groups              []GroupView `json:"groups"`
 	// Keep active_proxy present even when the pool has no healthy selection.
 	// Registration clients depend on a stable top-level extraction shape.
 	ActiveProxy          string         `json:"active_proxy"`
@@ -227,15 +235,22 @@ func (s *StatusServer) buildSummary() StatusSummary {
 func (s *StatusServer) buildSummaryWithProxies(includeProxies bool) StatusSummary {
 	scrapeState := s.coordinator.scrapeStatusSnapshot()
 	last, next := scrapeState.Last, scrapeState.Next
+	if s.store != nil {
+		sourceRefreshInterval, _ := s.effectiveScheduleIntervals()
+		if sourceNext := s.coordinator.nextSourceRefreshTime(s.store.Sources(), sourceRefreshInterval, time.Now()); !sourceNext.IsZero() {
+			next = sourceNext
+		}
+	}
+	fullLast, fullNext := s.coordinator.fullRecheckTimes()
 	beijingLoc := time.FixedZone("CST", 8*3600)
-
-	var lastStr, nextStr string
-	if !last.IsZero() {
-		lastStr = last.In(beijingLoc).Format("2006-01-02 15:04:05")
+	formatDisplayTime := func(value time.Time) string {
+		if value.IsZero() {
+			return ""
+		}
+		return value.In(beijingLoc).Format("2006-01-02 15:04:05")
 	}
-	if !next.IsZero() {
-		nextStr = next.In(beijingLoc).Format("2006-01-02 15:04:05")
-	}
+	lastStr, nextStr := formatDisplayTime(last), formatDisplayTime(next)
+	fullLastStr, fullNextStr := formatDisplayTime(fullLast), formatDisplayTime(fullNext)
 
 	groups := s.store.Groups()
 	if !includeProxies {
@@ -255,6 +270,14 @@ func (s *StatusServer) buildSummaryWithProxies(includeProxies bool) StatusSummar
 			NextScrape:           nextStr,
 			LastScrapeAt:         formatRFC3339UTC(last),
 			NextScrapeAt:         formatRFC3339UTC(next),
+			LastSourceRefresh:    lastStr,
+			NextSourceRefresh:    nextStr,
+			LastSourceRefreshAt:  formatRFC3339UTC(last),
+			NextSourceRefreshAt:  formatRFC3339UTC(next),
+			LastFullRecheck:      fullLastStr,
+			NextFullRecheck:      fullNextStr,
+			LastFullRecheckAt:    formatRFC3339UTC(fullLast),
+			NextFullRecheckAt:    formatRFC3339UTC(fullNext),
 			Groups:               poolState.Groups,
 			ActiveProxy:          activeProxy,
 			AvailableTotal:       poolState.AvailableTotal,
@@ -293,6 +316,14 @@ func (s *StatusServer) buildSummaryWithProxies(includeProxies bool) StatusSummar
 		NextScrape:           nextStr,
 		LastScrapeAt:         formatRFC3339UTC(last),
 		NextScrapeAt:         formatRFC3339UTC(next),
+		LastSourceRefresh:    lastStr,
+		NextSourceRefresh:    nextStr,
+		LastSourceRefreshAt:  formatRFC3339UTC(last),
+		NextSourceRefreshAt:  formatRFC3339UTC(next),
+		LastFullRecheck:      fullLastStr,
+		NextFullRecheck:      fullNextStr,
+		LastFullRecheckAt:    formatRFC3339UTC(fullLast),
+		NextFullRecheckAt:    formatRFC3339UTC(fullNext),
 		Groups:               buildGroupViewsFromSnapshot(poolState, groups),
 		ActiveProxy:          activeProxy,
 		Proxies:              proxies,

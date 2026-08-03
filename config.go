@@ -22,6 +22,7 @@ type Config struct {
 	AdminPass                string
 	DataDir                  string
 	ScrapeInterval           time.Duration
+	FullRecheckInterval      time.Duration
 	CheckTimeout             time.Duration
 	MaxConcurrent            int
 	MaxCandidates            int
@@ -96,7 +97,8 @@ func ParseConfig() *Config {
 	flag.StringVar(&cfg.AdminUser, "admin-user", adminUser, "username required by the dashboard/API (or ADMIN_USER/ADMIN_USER_FILE; also set its password)")
 	flag.StringVar(&cfg.AdminPass, "admin-pass", adminPass, "password required by the dashboard/API (or ADMIN_PASS/ADMIN_PASS_FILE; also set its username)")
 	flag.StringVar(&cfg.DataDir, "data-dir", "./data", "directory for persisted sources/rules/groups config")
-	flag.DurationVar(&cfg.ScrapeInterval, "scrape-interval", 20*time.Minute, "scrape interval")
+	flag.DurationVar(&cfg.ScrapeInterval, "scrape-interval", 20*time.Minute, "source refresh interval")
+	flag.DurationVar(&cfg.FullRecheckInterval, "full-recheck-interval", 30*time.Minute, "exhaustive forwarding-pool health recheck interval")
 	flag.DurationVar(&cfg.CheckTimeout, "check-timeout", 10*time.Second, "proxy check timeout")
 	flag.IntVar(&cfg.MaxConcurrent, "max-concurrent", 20, "max concurrent health checks")
 	flag.IntVar(&cfg.MaxCandidates, "max-candidates", 3000, "cap on total scraped candidates checked per refresh cycle (some sources return 100k+ entries; a random subset is sampled each cycle when over the cap)")
@@ -154,6 +156,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ScrapeInterval <= 0 {
 		return fmt.Errorf("scrape-interval must be positive")
+	}
+	if c.FullRecheckInterval <= 0 {
+		return fmt.Errorf("full-recheck-interval must be positive")
 	}
 	if c.CheckTimeout <= 0 {
 		return fmt.Errorf("check-timeout must be positive")

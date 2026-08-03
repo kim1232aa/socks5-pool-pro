@@ -1703,14 +1703,20 @@ function applyStatusSummary(d) {
 		clearHelp.textContent = '不可用节点默认只隐藏并会在恢复后重新出现。仅在确认不再保留历史节点时执行永久清理。';
 	}
   if (typeof d.proxyip_total === 'number') setText('stat-proxyip', d.proxyip_total);
-  var lastDisplay = localizedStatusTime(d.last_scrape_at, d.last_scrape, 'N/A');
-  var nextDisplay = localizedStatusTime(d.next_scrape_at, d.next_scrape, 'N/A');
+  var sourceLastAt = d.last_source_refresh_at || d.last_scrape_at;
+  var sourceNextAt = d.next_source_refresh_at || d.next_scrape_at;
+  var sourceLast = d.last_source_refresh || d.last_scrape;
+  var sourceNext = d.next_source_refresh || d.next_scrape;
+  var lastDisplay = localizedStatusTime(sourceLastAt, sourceLast, 'N/A');
+  var nextDisplay = localizedStatusTime(sourceNextAt, sourceNext, 'N/A');
   setText('stat-last', lastDisplay);
   setText('stat-next', nextDisplay);
-  setText('timeline-last', localizedStatusTime(d.last_scrape_at, d.last_scrape, '尚未刷新'));
-  setText('timeline-next', localizedStatusTime(d.next_scrape_at, d.next_scrape, '等待调度'));
-  lastKnownScrape = d.last_scrape_at || d.last_scrape || '';
-  lastKnownNextScrape = d.next_scrape_at || d.next_scrape || '';
+  setText('timeline-source-last', localizedStatusTime(d.last_source_refresh_at, sourceLast, '尚未刷新'));
+  setText('timeline-source-next', localizedStatusTime(d.next_source_refresh_at, sourceNext, '等待调度'));
+  setText('timeline-full-last', localizedStatusTime(d.last_full_recheck_at, d.last_full_recheck, '尚未全检'));
+  setText('timeline-full-next', localizedStatusTime(d.next_full_recheck_at, d.next_full_recheck, '等待调度'));
+  lastKnownScrape = sourceLastAt || sourceLast || '';
+  lastKnownNextScrape = sourceNextAt || sourceNext || '';
 
   if (typeof d.candidate_total === 'number') {
     var candidateTotal = Math.max(0, Number(d.candidate_total));
@@ -2113,11 +2119,21 @@ function loadCheckOptions() {
     var mc = document.getElementById('opt-maxconcurrent');
     var ct = document.getElementById('opt-checktimeout');
     var cand = document.getElementById('opt-maxcandidates');
+    var sourceRefresh = document.getElementById('opt-source-refresh-interval');
+    var fullRecheck = document.getElementById('opt-full-recheck-interval');
     var ric = document.getElementById('opt-require-ip-change');
     var ricDefault = document.getElementById('opt-require-ip-change-default');
     if (mc) { mc.value = Number(overrides.max_concurrent || 0) || ''; mc.placeholder = String(result.max_concurrent || ''); }
     if (ct) { ct.value = Number(overrides.check_timeout_seconds || 0) || ''; ct.placeholder = String(result.check_timeout_seconds || ''); }
     if (cand) { cand.value = Number(overrides.max_candidates || 0) || ''; cand.placeholder = String(result.max_candidates || ''); }
+    if (sourceRefresh) {
+      sourceRefresh.value = Number(overrides.source_refresh_interval_seconds || 0) ? String(Number(overrides.source_refresh_interval_seconds) / 60) : '';
+      sourceRefresh.placeholder = String(Number(result.source_refresh_interval_seconds || 0) / 60 || '');
+    }
+    if (fullRecheck) {
+      fullRecheck.value = Number(overrides.full_recheck_interval_seconds || 0) ? String(Number(overrides.full_recheck_interval_seconds) / 60) : '';
+      fullRecheck.placeholder = String(Number(result.full_recheck_interval_seconds || 0) / 60 || '');
+    }
     if (ric) ric.checked = !!result.require_ip_change;
     if (ricDefault) ricDefault.checked = overrides.require_ip_change === 'default' || overrides.require_ip_change == null;
     syncRequireIPChangeDefault();
@@ -2132,15 +2148,25 @@ function saveCheckOptions(button) {
     var n = Number(raw);
     return isFinite(n) ? Math.floor(n) : -1;
   }
+  function secondsFromMinutes(id) {
+    var raw = (document.getElementById(id).value || '').trim();
+    if (!raw) return 0;
+    var minutes = Number(raw);
+    return isFinite(minutes) ? Math.round(minutes * 60) : -1;
+  }
   var maxConcurrent = intOf('opt-maxconcurrent');
   var checkTimeout = intOf('opt-checktimeout');
   var maxCandidates = intOf('opt-maxcandidates');
-  if (maxConcurrent < 0 || checkTimeout < 0 || maxCandidates < 0) { notify('检测选项必须是数字', 'error'); return; }
+  var sourceRefreshSeconds = secondsFromMinutes('opt-source-refresh-interval');
+  var fullRecheckSeconds = secondsFromMinutes('opt-full-recheck-interval');
+  if (maxConcurrent < 0 || checkTimeout < 0 || maxCandidates < 0 || sourceRefreshSeconds < 0 || fullRecheckSeconds < 0) { notify('检测选项和周期必须是数字', 'error'); return; }
   var followDefault = !!(document.getElementById('opt-require-ip-change-default') || {}).checked;
   var payload = {
     max_concurrent: maxConcurrent,
     check_timeout_seconds: checkTimeout,
     max_candidates: maxCandidates,
+    source_refresh_interval_seconds: sourceRefreshSeconds,
+    full_recheck_interval_seconds: fullRecheckSeconds,
     require_ip_change: followDefault ? 'default' : !!(document.getElementById('opt-require-ip-change') || {}).checked
   };
   var original = button ? button.textContent : '';
@@ -2150,7 +2176,7 @@ function saveCheckOptions(button) {
       var recheck = result && result.health_recheck && result.health_recheck.id;
       var message = result && result.policy_changed
         ? '已保存；要求改IP 策略已变更，旧健康结果失效，正在全池复检。'
-        : '已保存；并发/超时/抽样从下一轮检测开始生效。';
+        : '已保存；并发/超时/抽样从下一轮检测开始生效，来源刷新与全池复检周期将在各自下一轮调度时应用。';
       if (result && result.baseline_refresh_attempted && !result.baseline_refreshed) {
         message += ' 基线刷新失败，暂保留旧基线；可稍后手动刷新。';
       }
@@ -2217,7 +2243,7 @@ function showNodeStats(key) {
   fetchJSON('/api/nodes/stats?key=' + encodeURIComponent(key)).then(function(stats) {
     var lines = [
       '累计转发成功/失败: ' + (stats.successes || 0) + ' / ' + (stats.failures || 0),
-      '连续健康失败: ' + (stats.consecutive_health_failures || 0) + (stats.health_failure_terminal ? '（已达终态，需人工验证恢复）' : ''),
+      '连续健康失败: ' + (stats.consecutive_health_failures || 0) + (stats.health_failure_terminal ? '（当前不可路由，可由完整全检或人工验证恢复）' : ''),
       '最近健康成功: ' + (stats.last_health_success_at || '从未'),
       '最近延迟: ' + (stats.last_latency_ms ? stats.last_latency_ms + 'ms' : '-'),
       '当前可用: ' + (stats.available ? '是' : '否')
@@ -2290,7 +2316,7 @@ function manualVerifyObservationSummary(result) {
   }
   var failures = Number(result && result.consecutive_failures);
   if (result && typeof result.consecutive_failures === 'number' && isFinite(failures) && failures >= 0) {
-    lines.push('健康失败观察：' + Math.round(failures) + (failures > 0 ? '（已终态过滤，需人工验证成功恢复）' : ''));
+    lines.push('健康失败观察：' + Math.round(failures) + (failures > 0 ? '（已终态过滤，可由完整全检或人工验证成功恢复）' : ''));
   }
   return lines;
 }
@@ -2306,7 +2332,7 @@ function runVerify(btn) {
       if (!j.reachable) {
         var failedMessage = '验证失败：本次手动复检未能连通目标。';
         if (observation.length) failedMessage += '\n' + observation.join('\n');
-        failedMessage += '\n本次手动请求内部最多尝试 3 次；最终失败后节点已立即从可路由池过滤，不会继续自动复检。';
+        failedMessage += '\n本次手动请求内部最多尝试 3 次；最终失败后节点已立即从可路由池过滤，不会继续进入轻量自动复检，但仍会参加周期性的完整全检。';
         showResultDialog('节点复检未通过', failedMessage);
         return;
       }

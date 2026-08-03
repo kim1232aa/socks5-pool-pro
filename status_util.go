@@ -479,6 +479,14 @@ type compactStatusSummary struct {
 	NextScrape            string      `json:"next_scrape"`
 	LastScrapeAt          string      `json:"last_scrape_at,omitempty"`
 	NextScrapeAt          string      `json:"next_scrape_at,omitempty"`
+	LastSourceRefresh     string      `json:"last_source_refresh"`
+	NextSourceRefresh     string      `json:"next_source_refresh"`
+	LastSourceRefreshAt   string      `json:"last_source_refresh_at,omitempty"`
+	NextSourceRefreshAt   string      `json:"next_source_refresh_at,omitempty"`
+	LastFullRecheck       string      `json:"last_full_recheck"`
+	NextFullRecheck       string      `json:"next_full_recheck"`
+	LastFullRecheckAt     string      `json:"last_full_recheck_at,omitempty"`
+	NextFullRecheckAt     string      `json:"next_full_recheck_at,omitempty"`
 	Groups                []GroupView `json:"groups"`
 	ActiveProxy           string      `json:"active_proxy"`
 	AvailableTotal        int         `json:"available_total"`

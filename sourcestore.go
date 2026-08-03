@@ -132,6 +132,10 @@ type PoolConfig struct {
 	MaxConcurrent       int `json:"max_concurrent,omitempty"`
 	CheckTimeoutSeconds int `json:"check_timeout_seconds,omitempty"`
 	MaxCandidates       int `json:"max_candidates,omitempty"`
+	// Schedule overrides are persisted independently. Zero follows the
+	// corresponding CLI default.
+	SourceRefreshIntervalSeconds int `json:"source_refresh_interval_seconds,omitempty"`
+	FullRecheckIntervalSeconds   int `json:"full_recheck_interval_seconds,omitempty"`
 	// RequireIPChange overrides the CLI -require-ip-change flag when set.
 	// nil means "follow the CLI startup flag".
 	RequireIPChange *bool `json:"require_ip_change,omitempty"`
@@ -181,6 +185,10 @@ func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
 			err = decoder.Decode(&out.CheckTimeoutSeconds)
 		case "max_candidates":
 			err = decoder.Decode(&out.MaxCandidates)
+		case "source_refresh_interval_seconds":
+			err = decoder.Decode(&out.SourceRefreshIntervalSeconds)
+		case "full_recheck_interval_seconds":
+			err = decoder.Decode(&out.FullRecheckIntervalSeconds)
 		case "require_ip_change":
 			err = decoder.Decode(&out.RequireIPChange)
 		default:
@@ -923,6 +931,114 @@ func (cs *ConfigStore) MaxCandidates(fallback int) int {
 	return fallback
 }
 
+// SourceRefreshInterval returns the persisted source schedule or its CLI default.
+func (cs *ConfigStore) SourceRefreshInterval(fallback time.Duration) time.Duration {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.SourceRefreshIntervalSeconds > 0 {
+		return time.Duration(cs.cfg.SourceRefreshIntervalSeconds) * time.Second
+	}
+	return fallback
+}
+
+// FullRecheckInterval returns the persisted exhaustive recheck schedule or its CLI default.
+func (cs *ConfigStore) FullRecheckInterval(fallback time.Duration) time.Duration {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.FullRecheckIntervalSeconds > 0 {
+		return time.Duration(cs.cfg.FullRecheckIntervalSeconds) * time.Second
+	}
+	return fallback
+}
+
+// ScheduleIntervalsOverride reports the persisted schedule values in seconds.
+// Zero means the corresponding CLI default remains effective.
+func (cs *ConfigStore) ScheduleIntervalsOverride() (sourceRefreshSeconds, fullRecheckSeconds int) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.cfg.SourceRefreshIntervalSeconds, cs.cfg.FullRecheckIntervalSeconds
+}
+
+// SetScheduleIntervals atomically persists the two independent schedule overrides.
+func (cs *ConfigStore) SetScheduleIntervals(sourceRefreshSeconds, fullRecheckSeconds int) error {
+	return cs.updateRuntimeOptions(runtimeOptionsUpdate{
+		sourceRefreshIntervalSeconds: &sourceRefreshSeconds,
+		fullRecheckIntervalSeconds:   &fullRecheckSeconds,
+	})
+}
+
+type runtimeOptionsUpdate struct {
+	maxConcurrent                *int
+	checkTimeoutSeconds          *int
+	maxCandidates                *int
+	sourceRefreshIntervalSeconds *int
+	fullRecheckIntervalSeconds   *int
+	requireIPChange              *bool
+	clearRequireIPChange         bool
+}
+
+func (cs *ConfigStore) updateRuntimeOptions(update runtimeOptionsUpdate) error {
+	if update.maxConcurrent != nil {
+		value := *update.maxConcurrent
+		if value < 0 || value > maxCheckConcurrent || value > 0 && value < minCheckConcurrent {
+			return fmt.Errorf("max_concurrent must be 0 (follow CLI) or between %d and %d", minCheckConcurrent, maxCheckConcurrent)
+		}
+	}
+	if update.checkTimeoutSeconds != nil {
+		value := *update.checkTimeoutSeconds
+		if value < 0 || value > int(maxCheckTimeout/time.Second) || value > 0 && value < int(minCheckTimeout/time.Second) {
+			return fmt.Errorf("check_timeout_seconds must be 0 (follow CLI) or between %d and %d", int(minCheckTimeout/time.Second), int(maxCheckTimeout/time.Second))
+		}
+	}
+	if update.maxCandidates != nil {
+		value := *update.maxCandidates
+		if value < 0 || value > maxCheckMaxCandidates || value > 0 && value < minCheckMaxCandidates {
+			return fmt.Errorf("max_candidates must be 0 (follow CLI) or between %d and %d", minCheckMaxCandidates, maxCheckMaxCandidates)
+		}
+	}
+	if update.sourceRefreshIntervalSeconds != nil {
+		if err := validateScheduleIntervalSeconds("source_refresh_interval_seconds", *update.sourceRefreshIntervalSeconds); err != nil {
+			return err
+		}
+	}
+	if update.fullRecheckIntervalSeconds != nil {
+		if err := validateScheduleIntervalSeconds("full_recheck_interval_seconds", *update.fullRecheckIntervalSeconds); err != nil {
+			return err
+		}
+	}
+	return cs.mutate(func(c *PoolConfig) error {
+		if update.maxConcurrent != nil {
+			c.MaxConcurrent = *update.maxConcurrent
+		}
+		if update.checkTimeoutSeconds != nil {
+			c.CheckTimeoutSeconds = *update.checkTimeoutSeconds
+		}
+		if update.maxCandidates != nil {
+			c.MaxCandidates = *update.maxCandidates
+		}
+		if update.sourceRefreshIntervalSeconds != nil {
+			c.SourceRefreshIntervalSeconds = *update.sourceRefreshIntervalSeconds
+		}
+		if update.fullRecheckIntervalSeconds != nil {
+			c.FullRecheckIntervalSeconds = *update.fullRecheckIntervalSeconds
+		}
+		if update.clearRequireIPChange {
+			c.RequireIPChange = nil
+		} else if update.requireIPChange != nil {
+			value := *update.requireIPChange
+			c.RequireIPChange = &value
+		}
+		return nil
+	})
+}
+
+func validateScheduleIntervalSeconds(name string, seconds int) error {
+	if seconds != 0 && (seconds < minSourceRefreshIntervalSeconds || seconds > maxSourceRefreshIntervalSeconds) {
+		return fmt.Errorf("%s must be 0 (follow CLI) or between %d and %d", name, minSourceRefreshIntervalSeconds, maxSourceRefreshIntervalSeconds)
+	}
+	return nil
+}
+
 // RequireIPChange returns the dashboard override or fallback (the CLI flag).
 func (cs *ConfigStore) RequireIPChange(fallback bool) bool {
 	cs.mu.RLock()
@@ -951,27 +1067,13 @@ func (cs *ConfigStore) CheckOptionsOverride() (maxConcurrent, checkTimeoutSecond
 // is true, which clears it back to the CLI flag. In-flight checks keep their
 // already-computed parameters.
 func (cs *ConfigStore) SetCheckOptions(maxConcurrent int, checkTimeout time.Duration, maxCandidates int, requireIPChange *bool, clearRequireIPChange bool) error {
-	if maxConcurrent < 0 || maxConcurrent > maxCheckConcurrent || maxConcurrent > 0 && maxConcurrent < minCheckConcurrent {
-		return fmt.Errorf("max_concurrent must be 0 (follow CLI) or between %d and %d", minCheckConcurrent, maxCheckConcurrent)
-	}
 	timeoutSeconds := int(checkTimeout / time.Second)
-	if checkTimeout != 0 && (checkTimeout < minCheckTimeout || checkTimeout > maxCheckTimeout) {
-		return fmt.Errorf("check_timeout must be 0 (follow CLI) or between %s and %s", minCheckTimeout, maxCheckTimeout)
-	}
-	if maxCandidates < 0 || maxCandidates > maxCheckMaxCandidates || maxCandidates > 0 && maxCandidates < minCheckMaxCandidates {
-		return fmt.Errorf("max_candidates must be 0 (follow CLI) or between %d and %d", minCheckMaxCandidates, maxCheckMaxCandidates)
-	}
-	return cs.mutate(func(c *PoolConfig) error {
-		c.MaxConcurrent = maxConcurrent
-		c.CheckTimeoutSeconds = timeoutSeconds
-		c.MaxCandidates = maxCandidates
-		if clearRequireIPChange {
-			c.RequireIPChange = nil
-		} else if requireIPChange != nil {
-			v := *requireIPChange
-			c.RequireIPChange = &v
-		}
-		return nil
+	return cs.updateRuntimeOptions(runtimeOptionsUpdate{
+		maxConcurrent:        &maxConcurrent,
+		checkTimeoutSeconds:  &timeoutSeconds,
+		maxCandidates:        &maxCandidates,
+		requireIPChange:      requireIPChange,
+		clearRequireIPChange: clearRequireIPChange,
 	})
 }
 
@@ -995,6 +1097,8 @@ func clonePoolConfig(cfg PoolConfig) PoolConfig {
 	out.MaxConcurrent = cfg.MaxConcurrent
 	out.CheckTimeoutSeconds = cfg.CheckTimeoutSeconds
 	out.MaxCandidates = cfg.MaxCandidates
+	out.SourceRefreshIntervalSeconds = cfg.SourceRefreshIntervalSeconds
+	out.FullRecheckIntervalSeconds = cfg.FullRecheckIntervalSeconds
 	if cfg.RequireIPChange != nil {
 		v := *cfg.RequireIPChange
 		out.RequireIPChange = &v
@@ -1016,6 +1120,12 @@ func cloneGroup(group Group) Group {
 func validatePersistedPoolConfig(cfg *PoolConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
+	}
+	if err := validateScheduleIntervalSeconds("source_refresh_interval_seconds", cfg.SourceRefreshIntervalSeconds); err != nil {
+		return err
+	}
+	if err := validateScheduleIntervalSeconds("full_recheck_interval_seconds", cfg.FullRecheckIntervalSeconds); err != nil {
+		return err
 	}
 	if len(cfg.Sources) > maxConfiguredSources {
 		return fmt.Errorf("source count %d exceeds limit %d", len(cfg.Sources), maxConfiguredSources)

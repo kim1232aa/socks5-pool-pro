@@ -46,10 +46,12 @@ type StatusServer struct {
 	trustedManagementProxies map[string]struct{}
 	// CLI fallbacks for the dashboard check options; set once from main via
 	// SetCheckDefaults. Zero values mean the config.go flag defaults.
-	checkTimeoutFallback    time.Duration
-	checkConcurrentFallback int
-	checkCandidatesFallback int
-	requireIPChangeFallback bool
+	checkTimeoutFallback          time.Duration
+	checkConcurrentFallback       int
+	checkCandidatesFallback       int
+	requireIPChangeFallback       bool
+	sourceRefreshIntervalFallback time.Duration
+	fullRecheckIntervalFallback   time.Duration
 }
 
 // SetCheckDefaults records the CLI flag values the dashboard check options
@@ -59,6 +61,26 @@ func (s *StatusServer) SetCheckDefaults(timeout time.Duration, maxConcurrent, ma
 	s.checkConcurrentFallback = maxConcurrent
 	s.checkCandidatesFallback = maxCandidates
 	s.requireIPChangeFallback = requireIPChange
+}
+
+func (s *StatusServer) SetScheduleDefaults(sourceRefresh, fullRecheck time.Duration) {
+	s.sourceRefreshIntervalFallback = sourceRefresh
+	s.fullRecheckIntervalFallback = fullRecheck
+}
+
+func (s *StatusServer) effectiveScheduleIntervals() (sourceRefresh, fullRecheck time.Duration) {
+	sourceRefresh = s.sourceRefreshIntervalFallback
+	fullRecheck = s.fullRecheckIntervalFallback
+	if sourceRefresh == 0 {
+		sourceRefresh = 20 * time.Minute
+	}
+	if fullRecheck == 0 {
+		fullRecheck = 30 * time.Minute
+	}
+	if s.store == nil {
+		return sourceRefresh, fullRecheck
+	}
+	return s.store.SourceRefreshInterval(sourceRefresh), s.store.FullRecheckInterval(fullRecheck)
 }
 
 // effectiveCheckOptions resolves store overrides over the CLI fallbacks.

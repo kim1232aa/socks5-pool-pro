@@ -15,10 +15,12 @@ var refreshBaselineForStatus = RefreshBaselineExitWithChangeContext
 // Numbers use 0 for "follow the CLI flag"; RequireIPChange uses "default" for
 // the same, or a boolean to set an explicit override.
 type checkOptionsPayload struct {
-	MaxConcurrent       int         `json:"max_concurrent"`
-	CheckTimeoutSeconds int         `json:"check_timeout_seconds"`
-	MaxCandidates       int         `json:"max_candidates"`
-	RequireIPChange     interface{} `json:"require_ip_change"`
+	MaxConcurrent                *int        `json:"max_concurrent"`
+	CheckTimeoutSeconds          *int        `json:"check_timeout_seconds"`
+	MaxCandidates                *int        `json:"max_candidates"`
+	SourceRefreshIntervalSeconds *int        `json:"source_refresh_interval_seconds"`
+	FullRecheckIntervalSeconds   *int        `json:"full_recheck_interval_seconds"`
+	RequireIPChange              interface{} `json:"require_ip_change"`
 }
 
 // handleCheckOptions reads or updates the dashboard-tunable health-check
@@ -31,24 +33,30 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		timeout, maxConcurrent, maxCandidates, requireIPChange := s.effectiveCheckOptions()
-		storedConcurrent, storedTimeoutSeconds, storedCandidates, storedRequire := 0, 0, 0, interface{}("default")
+		sourceRefreshInterval, fullRecheckInterval := s.effectiveScheduleIntervals()
+		storedConcurrent, storedTimeoutSeconds, storedCandidates, storedSourceRefresh, storedFullRecheck, storedRequire := 0, 0, 0, 0, 0, interface{}("default")
 		if s.store != nil {
 			var requireOverride *bool
 			storedConcurrent, storedTimeoutSeconds, storedCandidates, requireOverride = s.store.CheckOptionsOverride()
+			storedSourceRefresh, storedFullRecheck = s.store.ScheduleIntervalsOverride()
 			if requireOverride != nil {
 				storedRequire = *requireOverride
 			}
 		}
 		writeJSON(w, map[string]interface{}{
-			"max_concurrent":        maxConcurrent,
-			"check_timeout_seconds": int(timeout / time.Second),
-			"max_candidates":        maxCandidates,
-			"require_ip_change":     requireIPChange,
+			"max_concurrent":                  maxConcurrent,
+			"check_timeout_seconds":           int(timeout / time.Second),
+			"max_candidates":                  maxCandidates,
+			"source_refresh_interval_seconds": int(sourceRefreshInterval / time.Second),
+			"full_recheck_interval_seconds":   int(fullRecheckInterval / time.Second),
+			"require_ip_change":               requireIPChange,
 			"overrides": map[string]interface{}{
-				"max_concurrent":        storedConcurrent,
-				"check_timeout_seconds": storedTimeoutSeconds,
-				"max_candidates":        storedCandidates,
-				"require_ip_change":     storedRequire,
+				"max_concurrent":                  storedConcurrent,
+				"check_timeout_seconds":           storedTimeoutSeconds,
+				"max_candidates":                  storedCandidates,
+				"source_refresh_interval_seconds": storedSourceRefresh,
+				"full_recheck_interval_seconds":   storedFullRecheck,
+				"require_ip_change":               storedRequire,
 			},
 		})
 	case http.MethodPost:
@@ -57,7 +65,6 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		timeout := time.Duration(in.CheckTimeoutSeconds) * time.Second
 		var requireOverride *bool
 		clearRequireOverride := false
 		policySupplied := false
@@ -78,7 +85,15 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			writeErr(w, http.StatusBadRequest, fmt.Errorf("require_ip_change must be a boolean or \"default\""))
 			return
 		}
-		if err := s.store.SetCheckOptions(in.MaxConcurrent, timeout, in.MaxCandidates, requireOverride, clearRequireOverride); err != nil {
+		if err := s.store.updateRuntimeOptions(runtimeOptionsUpdate{
+			maxConcurrent:                in.MaxConcurrent,
+			checkTimeoutSeconds:          in.CheckTimeoutSeconds,
+			maxCandidates:                in.MaxCandidates,
+			sourceRefreshIntervalSeconds: in.SourceRefreshIntervalSeconds,
+			fullRecheckIntervalSeconds:   in.FullRecheckIntervalSeconds,
+			requireIPChange:              requireOverride,
+			clearRequireIPChange:         clearRequireOverride,
+		}); err != nil {
 			writeConfigStoreError(w, err)
 			return
 		}
@@ -109,19 +124,22 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			}
 		}
 		newTimeout, newConcurrent, newCandidates, newRequire := s.effectiveCheckOptions()
+		newSourceRefresh, newFullRecheck := s.effectiveScheduleIntervals()
 		writeJSON(w, map[string]interface{}{
-			"status":                     "ok",
-			"max_concurrent":             newConcurrent,
-			"check_timeout_seconds":      int(newTimeout / time.Second),
-			"max_candidates":             newCandidates,
-			"require_ip_change":          newRequire,
-			"policy_changed":             policyChanged,
-			"baseline_refresh_attempted": baselineRefreshAttempted,
-			"baseline_refreshed":         baselineRefreshed,
-			"baseline_changed":           baselineChanged,
-			"baseline_ip":                BaselineExitIP(),
-			"health_recheck":             recheck,
-			"accepted":                   accepted,
+			"status":                          "ok",
+			"max_concurrent":                  newConcurrent,
+			"check_timeout_seconds":           int(newTimeout / time.Second),
+			"max_candidates":                  newCandidates,
+			"source_refresh_interval_seconds": int(newSourceRefresh / time.Second),
+			"full_recheck_interval_seconds":   int(newFullRecheck / time.Second),
+			"require_ip_change":               newRequire,
+			"policy_changed":                  policyChanged,
+			"baseline_refresh_attempted":      baselineRefreshAttempted,
+			"baseline_refreshed":              baselineRefreshed,
+			"baseline_changed":                baselineChanged,
+			"baseline_ip":                     BaselineExitIP(),
+			"health_recheck":                  recheck,
+			"accepted":                        accepted,
 		})
 	default:
 		methodNotAllowed(w, http.MethodGet, http.MethodHead, http.MethodPost)
