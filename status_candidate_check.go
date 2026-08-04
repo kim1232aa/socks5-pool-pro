@@ -13,6 +13,9 @@ type candidateBatchCheckRequest struct {
 
 type failedCandidateRetryRequest struct {
 	Keys []string `json:"keys"`
+	// All asks the server to enumerate the whole failed catalog itself and
+	// walk it in one long operation. It is mutually exclusive with Keys.
+	All bool `json:"all"`
 }
 
 type candidateCheckStartResponse struct {
@@ -40,13 +43,31 @@ func (s *StatusServer) handleCandidateBatchCheck(w http.ResponseWriter, r *http.
 		return
 	}
 	statusURL := "/api/candidates/batch-check/status"
-	s.startCandidateCheck(w, candidateCheckOperationCandidateBatch, limit, nil, statusURL)
+	s.startCandidateCheck(w, candidateCheckOperationCandidateBatch, limit, nil, statusURL, false)
 }
 
 func (s *StatusServer) handleFailedCandidatesRetry(w http.ResponseWriter, r *http.Request) {
 	var request failedCandidateRetryRequest
 	if err := decodeJSON(r, &request); err != nil {
 		writeErrCode(w, http.StatusBadRequest, "invalid_candidate_check_request", err)
+		return
+	}
+	statusURL := "/api/failed-candidates/retry/status"
+	if request.All {
+		if len(request.Keys) > 0 {
+			writeErrCode(w, http.StatusBadRequest, "invalid_candidate_check_request", fmt.Errorf("all must not be combined with explicit keys"))
+			return
+		}
+		if s.pool == nil || s.pool.candidates == nil {
+			writeErrCode(w, http.StatusBadRequest, "failed_candidate_not_found", fmt.Errorf("failed candidate catalog is unavailable"))
+			return
+		}
+		keys := s.pool.candidates.FailedKeys()
+		if len(keys) == 0 {
+			writeErrCode(w, http.StatusBadRequest, "failed_candidate_not_found", fmt.Errorf("no failed candidates to retry"))
+			return
+		}
+		s.startCandidateCheck(w, candidateCheckOperationFailedRetry, 0, keys, statusURL, true)
 		return
 	}
 	keys, err := uniqueFailedCandidateRetryKeys(request.Keys)
@@ -67,12 +88,17 @@ func (s *StatusServer) handleFailedCandidatesRetry(w http.ResponseWriter, r *htt
 		writeErrCode(w, http.StatusBadRequest, "failed_candidate_not_found", fmt.Errorf("failed candidate keys not found: %v", missing))
 		return
 	}
-	statusURL := "/api/failed-candidates/retry/status"
-	s.startCandidateCheck(w, candidateCheckOperationFailedRetry, 0, keys, statusURL)
+	s.startCandidateCheck(w, candidateCheckOperationFailedRetry, 0, keys, statusURL, false)
 }
 
-func (s *StatusServer) startCandidateCheck(w http.ResponseWriter, kind string, limit int, keys []string, statusURL string) {
-	operation, err := s.coordinator.requestCandidateCheck(kind, limit, keys)
+func (s *StatusServer) startCandidateCheck(w http.ResponseWriter, kind string, limit int, keys []string, statusURL string, retryAll bool) {
+	var operation CandidateCheckOperation
+	var err error
+	if retryAll {
+		operation, err = s.coordinator.requestFailedRetryAll(keys)
+	} else {
+		operation, err = s.coordinator.requestCandidateCheck(kind, limit, keys)
+	}
 	response := candidateCheckStartResponse{
 		CandidateCheckOperation: operation,
 		Accepted:                err == nil,

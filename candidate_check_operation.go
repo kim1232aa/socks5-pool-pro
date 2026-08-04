@@ -31,6 +31,12 @@ type candidateCheckRequest struct {
 	kind  string
 	limit int
 	keys  []string
+	// retryAll walks the full administrator-supplied failed key list in
+	// max-candidates-sized chunks within one operation. tolerateMissing lets
+	// those chunks skip keys that stopped being failed between enumeration
+	// and lease instead of failing the whole operation.
+	retryAll        bool
+	tolerateMissing bool
 }
 
 type candidateCheckBusyError struct {
@@ -50,6 +56,29 @@ func (e *candidateCheckShutdownError) Error() string {
 }
 
 func (c *RefreshCoordinator) requestCandidateCheck(kind string, limit int, keys []string) (CandidateCheckOperation, error) {
+	return c.enqueueCandidateCheck(&candidateCheckRequest{kind: kind, limit: limit, keys: append([]string(nil), keys...)})
+}
+
+// requestFailedRetryAll queues the administrator-triggered walk over every
+// failed candidate. The key list is enumerated server-side; the worker
+// processes it in max-candidates-sized chunks inside this single operation.
+func (c *RefreshCoordinator) requestFailedRetryAll(keys []string) (CandidateCheckOperation, error) {
+	return c.enqueueCandidateCheck(&candidateCheckRequest{
+		kind: candidateCheckOperationFailedRetry, keys: append([]string(nil), keys...),
+		retryAll: true, tolerateMissing: true,
+	})
+}
+
+// candidateCheckWorkerBusy reports whether the shared manual candidate slot
+// is occupied, so the automatic rotation worker can yield instead of racing
+// an administrator operation for health-check resources.
+func (c *RefreshCoordinator) candidateCheckWorkerBusy() bool {
+	c.candidateCheckMu.Lock()
+	defer c.candidateCheckMu.Unlock()
+	return c.candidateCheckPending != nil || c.candidateCheckActive != nil
+}
+
+func (c *RefreshCoordinator) enqueueCandidateCheck(request *candidateCheckRequest) (CandidateCheckOperation, error) {
 	c.lifecycleMu.RLock()
 	defer c.lifecycleMu.RUnlock()
 	c.candidateCheckMu.Lock()
@@ -66,7 +95,7 @@ func (c *RefreshCoordinator) requestCandidateCheck(kind string, limit int, keys 
 	now := time.Now().UTC()
 	operation := &CandidateCheckOperation{
 		ID:   fmt.Sprintf("candidate-check-%d-%d", now.UnixNano(), c.candidateCheckSeq),
-		Kind: kind, Status: "queued", RequestedAt: now.Format(time.RFC3339Nano),
+		Kind: request.kind, Status: "queued", RequestedAt: now.Format(time.RFC3339Nano),
 	}
 	if c.shuttingDown.Load() {
 		operation.Status = "cancelled"
@@ -77,7 +106,7 @@ func (c *RefreshCoordinator) requestCandidateCheck(kind string, limit int, keys 
 	}
 
 	c.candidateCheckPending = operation
-	c.candidateCheckRequest = &candidateCheckRequest{kind: kind, limit: limit, keys: append([]string(nil), keys...)}
+	c.candidateCheckRequest = request
 	select {
 	case c.candidateCheckChan <- struct{}{}:
 		return *operation, nil
@@ -210,6 +239,54 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 		return
 	}
 
+	if !request.retryAll {
+		status, finishErr = runSingleCandidateBatch(parent, cfg, store, pool, coordinator, operation.ID, request, nil)
+		return
+	}
+
+	// Retry-all walks the full administrator-enumerated failure list in
+	// max-candidates-sized chunks inside this one operation. Each chunk is an
+	// independent lease/check/commit unit so a criterion or source change
+	// between chunks stops the walk cleanly instead of corrupting a batch.
+	coordinator.setCandidateCheckTotal(operation.ID, len(request.keys))
+	chunkSize := store.MaxCandidates(cfg.MaxCandidates)
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+	chunk := candidateCheckRequest{
+		kind: candidateCheckOperationFailedRetry, retryAll: true, tolerateMissing: true,
+	}
+	for start := 0; start < len(request.keys); start += chunkSize {
+		if err := parent.Err(); err != nil {
+			status, finishErr = "cancelled", err
+			return
+		}
+		end := start + chunkSize
+		if end > len(request.keys) {
+			end = len(request.keys)
+		}
+		chunk.keys = request.keys[start:end]
+		status, finishErr = runSingleCandidateBatch(parent, cfg, store, pool, coordinator, operation.ID, chunk, nil)
+		if status != "complete" {
+			if status == "failed" && finishErr == nil {
+				finishErr = fmt.Errorf("failed candidate retry-all stopped")
+			}
+			return
+		}
+	}
+	status = "complete"
+}
+
+// runSingleCandidateBatch leases, health-checks and publishes one bounded
+// candidate batch. It is shared by the manual candidate/failed-retry tasks,
+// each retry-all chunk, and the automatic rotation worker. The returned
+// status follows the operation vocabulary: complete, failed, cancelled or
+// superseded. observe, when non-nil, receives every outcome in addition to
+// the manual-operation progress tracking.
+func runSingleCandidateBatch(parent context.Context, cfg *Config, store *ConfigStore, pool *ProxyPool, coordinator *RefreshCoordinator, operationID string, request candidateCheckRequest, observe func(candidateCheckOutcome)) (string, error) {
+	if pool.candidates.snapshotPhaseRestored() {
+		return "superseded", fmt.Errorf("candidate catalog is still the startup cache restore; waiting for the first refresh")
+	}
 	coordinator.healthCycleMu.Lock()
 	defer coordinator.healthCycleMu.Unlock()
 
@@ -225,9 +302,28 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 		var missing []string
 		leases, missing = pool.candidates.LeaseFailed(request.keys)
 		if len(missing) > 0 {
-			coordinator.sourceLifecycleMu.RUnlock()
-			finishErr = fmt.Errorf("failed candidate keys are no longer available: %v", missing)
-			return
+			if !request.tolerateMissing {
+				coordinator.sourceLifecycleMu.RUnlock()
+				return "failed", fmt.Errorf("failed candidate keys are no longer available: %v", missing)
+			}
+			// Retry-all enumerates the catalog up front; keys can be
+			// re-tested or deleted before their chunk leases. Drop them and
+			// lease the remainder instead of failing the whole walk.
+			drop := make(map[string]bool, len(missing))
+			for _, key := range missing {
+				drop[key] = true
+			}
+			remaining := make([]string, 0, len(request.keys)-len(missing))
+			for _, key := range request.keys {
+				if !drop[key] {
+					remaining = append(remaining, key)
+				}
+			}
+			leases, missing = pool.candidates.LeaseFailed(remaining)
+			if len(missing) > 0 {
+				coordinator.sourceLifecycleMu.RUnlock()
+				return "failed", fmt.Errorf("failed candidate keys are no longer available: %v", missing)
+			}
 		}
 	} else {
 		known, _ := pool.candidateKnownSnapshot()
@@ -235,17 +331,19 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 	}
 	coordinator.sourceLifecycleMu.RUnlock()
 	defer pool.candidates.ReleaseLeases(leases)
-	coordinator.setCandidateCheckTotal(operation.ID, len(leases))
+	// Retry-all sets its own total up front; per-chunk resets would shrink
+	// the progress bar back to one chunk.
+	if !request.retryAll {
+		coordinator.setCandidateCheckTotal(operationID, len(leases))
+	}
 
 	if len(leases) == 0 {
-		status = "complete"
-		return
+		return "complete", nil
 	}
 
 	healthContext, finishHealthWork, current := pool.BeginHealthWork(healthGeneration)
 	if !current {
-		status, finishErr = "superseded", fmt.Errorf("health criterion changed before candidate check")
-		return
+		return "superseded", fmt.Errorf("health criterion changed before candidate check")
 	}
 	defer finishHealthWork()
 	workContext, cancelWork := context.WithCancel(healthContext)
@@ -259,39 +357,36 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 		Timeout: store.CheckTimeout(cfg.CheckTimeout), MaxConcurrent: store.MaxConcurrent(cfg.MaxConcurrent),
 		RequireIPChange: requireIPChange, TestURL: checkURL, BaselineIP: BaselineExitIP(),
 	}, func(outcome candidateCheckOutcome) {
-		coordinator.recordCandidateCheckOutcome(operation.ID, outcome)
+		coordinator.recordCandidateCheckOutcome(operationID, outcome)
+		if observe != nil {
+			observe(outcome)
+		}
 	})
 
 	if err := parent.Err(); err != nil {
-		status, finishErr = "cancelled", err
-		return
+		return "cancelled", err
 	}
 	if workContext.Err() != nil || pool.HealthGeneration() != healthGeneration {
-		status, finishErr = "superseded", fmt.Errorf("health criterion changed during candidate check")
-		return
+		return "superseded", fmt.Errorf("health criterion changed during candidate check")
 	}
 
 	coordinator.sourceLifecycleMu.Lock()
 	defer coordinator.sourceLifecycleMu.Unlock()
 	if !sameSourceRevisions(sourceSnapshot, store.Sources()) {
-		status, finishErr = "superseded", fmt.Errorf("source configuration changed during candidate check")
-		return
+		return "superseded", fmt.Errorf("source configuration changed during candidate check")
 	}
 	alive, unreachable, policyFiltered := splitCandidateCheckOutcomes(outcomes, leases)
 	if !pool.UpdateWithEnabledSourcesAndPolicy(alive, unreachable, policyFiltered, store.Sources(), healthGeneration) {
-		status, finishErr = "superseded", fmt.Errorf("health criterion changed during candidate publication")
-		return
+		return "superseded", fmt.Errorf("health criterion changed during candidate publication")
 	}
 	if err := pool.candidates.CommitLeaseOutcomes(leases, outcomes); err != nil {
-		finishErr = err
-		return
+		return "failed", err
 	}
 	leases = nil
 	if err := pool.FlushCache(); err != nil {
-		finishErr = fmt.Errorf("persist candidate check pool results: %w", err)
-		return
+		return "failed", fmt.Errorf("persist candidate check pool results: %w", err)
 	}
-	status = "complete"
+	return "complete", nil
 }
 
 func sameSourceRevisions(before, after []Source) bool {

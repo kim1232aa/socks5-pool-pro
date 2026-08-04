@@ -327,6 +327,14 @@ func main() {
 		runCandidateCheckWorker(ctx, cfg, store, pool, coordinator)
 	})
 
+	// Automatic candidate rotation keeps walking the pending catalog between
+	// source refreshes instead of checking only one batch per refresh cycle.
+	// It yields while the shared manual slot is busy and never leases failed
+	// candidates.
+	background.Go(func(ctx context.Context) {
+		runAutoCandidateCheckWorker(ctx, cfg, store, pool, coordinator)
+	})
+
 	// Background: random rotation of the default (ANY) group every 3-6 minutes.
 	background.Go(func(ctx context.Context) {
 		for {

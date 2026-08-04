@@ -677,6 +677,8 @@ func TestDashboardFailedPageFiltersSelectsAndRetries(t *testing.T) {
 		`id="fc-pagesize"`,
 		`id="failed-select-page"`,
 		`data-action="failed-retry-selected"`,
+		`id="failed-retry-all-button"`,
+		`data-action="failed-retry-all"`,
 		`id="failed-operation-status"`,
 		`id="failed-notice"`,
 		`<th>错误摘要</th>`,
@@ -685,8 +687,11 @@ func TestDashboardFailedPageFiltersSelectsAndRetries(t *testing.T) {
 		`return '/api/failed-candidates?' + q.join('&');`,
 		`fetchJSON('/api/failed-candidates/retry', {`,
 		`body:JSON.stringify({keys:keys})`,
+		`body: JSON.stringify({all: true})`,
 		`function retryFailedCandidates(`,
+		`function retryAllFailedCandidates(`,
 		`case 'failed-retry-selected': retryFailedCandidates(); break;`,
+		`case 'failed-retry-all': retryAllFailedCandidates(); break;`,
 		`case 'failed-select': toggleFailedSelection(actionElement); return;`,
 		`case 'failed-select-page': toggleFailedPageSelection(actionElement); return;`,
 		`case 'goto-failed-page':`,
@@ -698,6 +703,20 @@ func TestDashboardFailedPageFiltersSelectsAndRetries(t *testing.T) {
 	}
 	if strings.Contains(dashboardClientSource(), `data-action="failed-auto-retry"`) {
 		t.Fatal("failed candidates must never get an automatic retry switch; retry is manual only")
+	}
+}
+
+func TestDashboardExposesAutoCandidateCheckOptions(t *testing.T) {
+	for _, want := range []string{
+		`id="opt-auto-check"`,
+		`id="opt-auto-check-interval"`,
+		`auto_candidate_check:`,
+		`auto_check_interval_seconds: autoIntervalSeconds`,
+		`result.auto_candidate_check !== false`,
+	} {
+		if !strings.Contains(dashboardClientSource(), want) {
+			t.Fatalf("dashboard is missing automatic candidate check option contract %q", want)
+		}
 	}
 }
 

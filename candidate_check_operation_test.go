@@ -268,6 +268,80 @@ func TestCoordinatorShutdownCancelsCandidateOperationAndRejectsNewOne(t *testing
 	}
 }
 
+func TestFailedRetryAllWalksEveryFailureInChunks(t *testing.T) {
+	failed := make([]Proxy, 5)
+	for i := range failed {
+		failed[i] = Proxy{IP: fmt.Sprintf("198.51.100.%d", i+100), Port: "8080", Protocol: "http"}
+	}
+	pool := candidateOperationTestPool(nil, failed)
+	store := &ConfigStore{cfg: PoolConfig{CheckURL: "https://health.example/check"}}
+	cfg := &Config{CheckTimeout: time.Second, MaxConcurrent: 2, MaxCandidates: 2}
+	coordinator := newRefreshCoordinator()
+	var calls atomic.Int64
+	installCandidateCheckSeams(t,
+		func(_ context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, error) {
+			calls.Add(1)
+			if px.IP == failed[0].IP || px.IP == failed[1].IP {
+				return Proxy{}, false, errors.New("still down")
+			}
+			return px, true, nil
+		},
+		func(context.Context, Proxy, time.Duration) string { return "203.0.113.9" }, nil, nil,
+	)
+
+	keys := pool.candidates.FailedKeys()
+	if len(keys) != len(failed) {
+		t.Fatalf("FailedKeys = %v, want all %d failures", keys, len(failed))
+	}
+	operation, err := coordinator.requestFailedRetryAll(keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-coordinator.candidateCheckChan
+	runCandidateCheckCycle(context.Background(), cfg, store, pool, coordinator)
+
+	finished := coordinator.candidateCheckOperationStatus()
+	if finished.ID != operation.ID || finished.Status != "complete" || finished.Total != 5 || finished.Completed != 5 || finished.Alive != 3 || finished.Failed != 2 {
+		t.Fatalf("retry-all operation = %+v", finished)
+	}
+	if calls.Load() != int64(len(failed)) {
+		t.Fatalf("retry-all checked %d nodes, want every failure exactly once", calls.Load())
+	}
+	page := NewStatusServer(pool, store).buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
+	if page.FailedTotal != 2 {
+		t.Fatalf("failed total after retry-all = %d, want the 2 still-down nodes", page.FailedTotal)
+	}
+}
+
+func TestFailedRetryAllSkipsKeysNoLongerFailed(t *testing.T) {
+	failed := []Proxy{
+		{IP: "198.51.100.110", Port: "8080", Protocol: "http"},
+		{IP: "198.51.100.111", Port: "8080", Protocol: "http"},
+	}
+	pool := candidateOperationTestPool(nil, failed)
+	store := &ConfigStore{cfg: PoolConfig{CheckURL: "https://health.example/check"}}
+	cfg := &Config{CheckTimeout: time.Second, MaxConcurrent: 1, MaxCandidates: 10}
+	coordinator := newRefreshCoordinator()
+	installCandidateCheckSeams(t,
+		func(_ context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, error) {
+			return px, true, nil
+		},
+		func(context.Context, Proxy, time.Duration) string { return "203.0.113.9" }, nil, nil,
+	)
+
+	keys := append(pool.candidates.FailedKeys(), "http://203.0.113.250:9999")
+	if _, err := coordinator.requestFailedRetryAll(keys); err != nil {
+		t.Fatal(err)
+	}
+	<-coordinator.candidateCheckChan
+	runCandidateCheckCycle(context.Background(), cfg, store, pool, coordinator)
+
+	finished := coordinator.candidateCheckOperationStatus()
+	if finished.Status != "complete" || finished.Completed != 2 {
+		t.Fatalf("retry-all with vanished key = %+v, want complete with 2 checked", finished)
+	}
+}
+
 func TestAutomaticWorkersCannotLeaseFailedCandidates(t *testing.T) {
 	failed := Proxy{IP: "198.51.100.80", Port: "8080", Protocol: "http"}
 	pool := candidateOperationTestPool(nil, []Proxy{failed})

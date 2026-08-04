@@ -81,8 +81,10 @@
       <label class="small" for="opt-full-recheck-interval">全池复检(分钟)</label><input id="opt-full-recheck-interval" type="number" min="1" max="10080" step="0.1" inputmode="decimal">
       <label class="chk"><input type="checkbox" id="opt-require-ip-change"> 要求改IP（出口IP必须不同于入口）</label>
       <label class="chk"><input type="checkbox" id="opt-require-ip-change-default" onchange="syncRequireIPChangeDefault()" checked> 跟随命令行默认</label>
+      <label class="chk"><input type="checkbox" id="opt-auto-check" checked> 候选自动批检（持续轮转候选库）</label>
+      <label class="small" for="opt-auto-check-interval">批间暂停(秒)</label><input id="opt-auto-check-interval" type="number" min="0" max="3600" step="1" inputmode="numeric">
       <button id="check-options-save" type="button" class="btn-sm" data-action="save-check-options">保存检测选项</button>
-      <span class="checkurl-hint">留空/0 表示跟随命令行默认值；来源刷新与全池复检独立调度。完整全检可恢复不可用节点；连续 3 次完整全检失败后移出转发池，候选库记录仍保留。要求改IP 变更会立即失效旧健康结果并全池复检。</span>
+      <span class="checkurl-hint">留空/0 表示跟随命令行默认值；来源刷新与全池复检独立调度。完整全检可恢复不可用节点；连续 3 次完整全检失败后移出转发池，候选库记录仍保留。要求改IP 变更会立即失效旧健康结果并全池复检。候选自动批检默认开启，持续轮转待检候选（每批=每轮抽样规模）；批间暂停 0 表示连续检测，只影响候选批检，不会触碰失败节点。</span>
       <span id="check-options-status" class="small" role="status" aria-live="polite"></span>
     </div>
     <div class="checkurl-bar baseline-bar">
@@ -266,7 +268,8 @@
     <div class="candidate-batch-bar" aria-label="失败节点批量操作">
       <span id="failed-selected-count" role="status" aria-live="polite">已选 0</span>
       <button type="button" class="btn-sm" id="failed-retry-button" data-action="failed-retry-selected" disabled>手动重新检测已选</button>
-      <span class="candidate-speedtest-note">失败节点不会自动重新检测；勾选后手动提交，通过的回到转发池，仍失败的留在这里。</span>
+      <button type="button" class="btn-sm" id="failed-retry-all-button" data-action="failed-retry-all">一键重查全部失败节点</button>
+      <span class="candidate-speedtest-note">失败节点不会自动重新检测；勾选后手动提交，或一键重查全部（按抽样规模分批走完），通过的回到转发池，仍失败的留在这里。</span>
       <span id="failed-operation-status" class="small" role="status" aria-live="polite"></span>
     </div>
     <span class="candidate-filter-note">筛选和分页均在服务端执行。失败节点只能从这里手动重新检测，来源刷新和定时任务不会触碰它们。</span>

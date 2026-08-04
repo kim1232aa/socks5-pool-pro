@@ -139,6 +139,12 @@ type PoolConfig struct {
 	// RequireIPChange overrides the CLI -require-ip-change flag when set.
 	// nil means "follow the CLI startup flag".
 	RequireIPChange *bool `json:"require_ip_change,omitempty"`
+	// AutoCandidateCheck controls the continuous background rotation check
+	// of pending candidates. nil means the default (enabled).
+	AutoCandidateCheck *bool `json:"auto_candidate_check,omitempty"`
+	// AutoCheckIntervalSeconds pauses the automatic rotation worker between
+	// batches. 0 runs batches back-to-back.
+	AutoCheckIntervalSeconds int `json:"auto_check_interval_seconds,omitempty"`
 }
 
 // UnmarshalJSON bounds the top-level collections while they are decoded. A
@@ -191,6 +197,10 @@ func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
 			err = decoder.Decode(&out.FullRecheckIntervalSeconds)
 		case "require_ip_change":
 			err = decoder.Decode(&out.RequireIPChange)
+		case "auto_candidate_check":
+			err = decoder.Decode(&out.AutoCandidateCheck)
+		case "auto_check_interval_seconds":
+			err = decoder.Decode(&out.AutoCheckIntervalSeconds)
 		default:
 			err = skipJSONValue(decoder)
 		}
@@ -899,6 +909,9 @@ const (
 	maxCheckTimeout       = 120 * time.Second
 	minCheckMaxCandidates = 100
 	maxCheckMaxCandidates = 100000
+	// maxAutoCheckIntervalSeconds bounds the pause between automatic
+	// candidate check batches; 0 runs batches back-to-back.
+	maxAutoCheckIntervalSeconds = 3600
 )
 
 // MaxConcurrent returns the dashboard override or fallback (the CLI flag).
@@ -975,6 +988,9 @@ type runtimeOptionsUpdate struct {
 	fullRecheckIntervalSeconds   *int
 	requireIPChange              *bool
 	clearRequireIPChange         bool
+	autoCandidateCheck           *bool
+	clearAutoCandidateCheck      bool
+	autoCheckIntervalSeconds     *int
 }
 
 func (cs *ConfigStore) updateRuntimeOptions(update runtimeOptionsUpdate) error {
@@ -1006,6 +1022,12 @@ func (cs *ConfigStore) updateRuntimeOptions(update runtimeOptionsUpdate) error {
 			return err
 		}
 	}
+	if update.autoCheckIntervalSeconds != nil {
+		value := *update.autoCheckIntervalSeconds
+		if value < 0 || value > maxAutoCheckIntervalSeconds {
+			return fmt.Errorf("auto_check_interval_seconds must be between 0 and %d", maxAutoCheckIntervalSeconds)
+		}
+	}
 	return cs.mutate(func(c *PoolConfig) error {
 		if update.maxConcurrent != nil {
 			c.MaxConcurrent = *update.maxConcurrent
@@ -1028,6 +1050,15 @@ func (cs *ConfigStore) updateRuntimeOptions(update runtimeOptionsUpdate) error {
 			value := *update.requireIPChange
 			c.RequireIPChange = &value
 		}
+		if update.clearAutoCandidateCheck {
+			c.AutoCandidateCheck = nil
+		} else if update.autoCandidateCheck != nil {
+			value := *update.autoCandidateCheck
+			c.AutoCandidateCheck = &value
+		}
+		if update.autoCheckIntervalSeconds != nil {
+			c.AutoCheckIntervalSeconds = *update.autoCheckIntervalSeconds
+		}
 		return nil
 	})
 }
@@ -1047,6 +1078,37 @@ func (cs *ConfigStore) RequireIPChange(fallback bool) bool {
 		return *cs.cfg.RequireIPChange
 	}
 	return fallback
+}
+
+// AutoCandidateCheckEnabled reports whether the continuous automatic
+// candidate rotation check is on. An unset override means enabled.
+func (cs *ConfigStore) AutoCandidateCheckEnabled() bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.cfg.AutoCandidateCheck == nil || *cs.cfg.AutoCandidateCheck
+}
+
+// AutoCheckInterval returns the pause between automatic candidate check
+// batches. Zero runs batches back-to-back.
+func (cs *ConfigStore) AutoCheckInterval() time.Duration {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.AutoCheckIntervalSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cs.cfg.AutoCheckIntervalSeconds) * time.Second
+}
+
+// AutoCheckOptionsOverride reports the automatic-check overrides the
+// dashboard explicitly set (nil boolean means "follow the default").
+func (cs *ConfigStore) AutoCheckOptionsOverride() (autoCandidateCheck *bool, autoCheckIntervalSeconds int) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.cfg.AutoCandidateCheck != nil {
+		value := *cs.cfg.AutoCandidateCheck
+		autoCandidateCheck = &value
+	}
+	return autoCandidateCheck, cs.cfg.AutoCheckIntervalSeconds
 }
 
 // CheckOptionsOverride reports which check options the dashboard explicitly

@@ -493,3 +493,76 @@ func TestNodeStatsEndpoint(t *testing.T) {
 		t.Fatalf("unknown key = %d, want 404", recorder.Code)
 	}
 }
+
+func TestCheckOptionsAutoCandidateCheckRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewStatusServer(NewProxyPool(), store)
+	server.SetCheckDefaults(10*time.Second, 20, 3000, false)
+	handler := server.handler()
+
+	get := func() map[string]interface{} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, localTestRequest(http.MethodGet, "/api/settings/check-options", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET check options = %d %s", recorder.Code, recorder.Body.String())
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		request := localTestRequest(http.MethodPost, "/api/settings/check-options", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	defaults := get()
+	if defaults["auto_candidate_check"] != true || defaults["auto_check_interval_seconds"] != float64(0) {
+		t.Fatalf("default auto check options = %v", defaults)
+	}
+
+	if recorder := post(`{"auto_candidate_check":false,"auto_check_interval_seconds":30}`); recorder.Code != http.StatusOK {
+		t.Fatalf("POST auto check options = %d %s", recorder.Code, recorder.Body.String())
+	}
+	updated := get()
+	if updated["auto_candidate_check"] != false || updated["auto_check_interval_seconds"] != float64(30) {
+		t.Fatalf("updated auto check options = %v", updated)
+	}
+	if store.AutoCandidateCheckEnabled() || store.AutoCheckInterval() != 30*time.Second {
+		t.Fatalf("store accessors = enabled=%v interval=%s", store.AutoCandidateCheckEnabled(), store.AutoCheckInterval())
+	}
+
+	if recorder := post(`{"auto_check_interval_seconds":3601}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range interval = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := post(`{"auto_candidate_check":"bogus"}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid auto_candidate_check = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	reloaded, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.AutoCandidateCheckEnabled() || reloaded.AutoCheckInterval() != 30*time.Second {
+		t.Fatalf("persisted auto check options lost after reload: enabled=%v interval=%s", reloaded.AutoCandidateCheckEnabled(), reloaded.AutoCheckInterval())
+	}
+
+	if recorder := post(`{"auto_candidate_check":"default","auto_check_interval_seconds":0}`); recorder.Code != http.StatusOK {
+		t.Fatalf("clear auto check options = %d %s", recorder.Code, recorder.Body.String())
+	}
+	cleared := get()
+	if cleared["auto_candidate_check"] != true || cleared["auto_check_interval_seconds"] != float64(0) {
+		t.Fatalf("cleared auto check options = %v", cleared)
+	}
+	if !store.AutoCandidateCheckEnabled() || store.AutoCheckInterval() != 0 {
+		t.Fatalf("cleared override should fall back to enabled/continuous: enabled=%v interval=%s", store.AutoCandidateCheckEnabled(), store.AutoCheckInterval())
+	}
+}

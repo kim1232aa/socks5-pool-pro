@@ -1499,6 +1499,8 @@ function setCandidateCheckButtonsDisabled(disabled) {
   if (batchButton) batchButton.disabled = disabled;
   var retryButton = document.getElementById('failed-retry-button');
   if (retryButton) retryButton.disabled = disabled || !selectedFailedList().length;
+  var retryAllButton = document.getElementById('failed-retry-all-button');
+  if (retryAllButton) retryAllButton.disabled = disabled;
 }
 
 function renderCandidateCheckOperation(statusElId, operation) {
@@ -1587,6 +1589,26 @@ function startCandidateBatchCheck(button) {
     setCandidateCheckButtonsDisabled(false);
     setText('candidate-operation-status', '批量正式检测提交失败：' + String(err));
     notify('批量正式检测失败：' + String(err), 'error', 7000);
+  });
+}
+
+function retryAllFailedCandidates() {
+  if (candidateCheckActive) { notify('已有检测任务在进行，请等待完成', 'error'); return; }
+  setText('failed-operation-status', '正在提交一键重查全部失败节点…');
+  fetchJSON('/api/failed-candidates/retry', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({all: true})
+  }).then(function(result) {
+    pollCandidateCheckOperation(String(result && result.status_url || '/api/failed-candidates/retry/status'), String(result && result.id || ''));
+  }).catch(function(err) {
+    if (err.status === 409 && err.code === 'candidate_check_busy') {
+      setText('failed-operation-status', '已有检测任务在进行，转入状态跟踪…');
+      pollCandidateCheckOperation('/api/failed-candidates/retry/status', '');
+      return;
+    }
+    candidateCheckActive = false;
+    setCandidateCheckButtonsDisabled(false);
+    setText('failed-operation-status', '一键重查提交失败：' + String(err));
+    notify('一键重查失败节点失败：' + String(err), 'error', 7000);
   });
 }
 
@@ -2712,6 +2734,13 @@ function loadCheckOptions() {
     if (ric) ric.checked = !!result.require_ip_change;
     if (ricDefault) ricDefault.checked = overrides.require_ip_change === 'default' || overrides.require_ip_change == null;
     syncRequireIPChangeDefault();
+    var autoCheck = document.getElementById('opt-auto-check');
+    var autoInterval = document.getElementById('opt-auto-check-interval');
+    if (autoCheck) autoCheck.checked = result.auto_candidate_check !== false;
+    if (autoInterval) {
+      autoInterval.value = Number(overrides.auto_check_interval_seconds || 0) || '';
+      autoInterval.placeholder = String(result.auto_check_interval_seconds || 0);
+    }
   }).catch(function() {});
 }
 
@@ -2734,7 +2763,10 @@ function saveCheckOptions(button) {
   var maxCandidates = intOf('opt-maxcandidates');
   var sourceRefreshSeconds = secondsFromMinutes('opt-source-refresh-interval');
   var fullRecheckSeconds = secondsFromMinutes('opt-full-recheck-interval');
+  var autoIntervalRaw = ((document.getElementById('opt-auto-check-interval') || {}).value || '').trim();
+  var autoIntervalSeconds = autoIntervalRaw ? Math.floor(Number(autoIntervalRaw)) : 0;
   if (maxConcurrent < 0 || checkTimeout < 0 || maxCandidates < 0 || sourceRefreshSeconds < 0 || fullRecheckSeconds < 0) { notify('检测选项和周期必须是数字', 'error'); return; }
+  if (!isFinite(autoIntervalSeconds) || autoIntervalSeconds < 0 || autoIntervalSeconds > 3600) { notify('批间暂停必须是 0-3600 的秒数', 'error'); return; }
   var followDefault = !!(document.getElementById('opt-require-ip-change-default') || {}).checked;
   var payload = {
     max_concurrent: maxConcurrent,
@@ -2742,7 +2774,9 @@ function saveCheckOptions(button) {
     max_candidates: maxCandidates,
     source_refresh_interval_seconds: sourceRefreshSeconds,
     full_recheck_interval_seconds: fullRecheckSeconds,
-    require_ip_change: followDefault ? 'default' : !!(document.getElementById('opt-require-ip-change') || {}).checked
+    require_ip_change: followDefault ? 'default' : !!(document.getElementById('opt-require-ip-change') || {}).checked,
+    auto_candidate_check: !!(document.getElementById('opt-auto-check') || {}).checked,
+    auto_check_interval_seconds: autoIntervalSeconds
   };
   var original = button ? button.textContent : '';
   if (button) { button.disabled = true; button.textContent = '保存中…'; }
@@ -3229,6 +3263,7 @@ document.addEventListener('click', function(event) {
     case 'proxyip-verify': runProxyIPVerify(actionElement); break;
     case 'candidate-batch-check': startCandidateBatchCheck(actionElement); break;
     case 'failed-retry-selected': retryFailedCandidates(); break;
+    case 'failed-retry-all': retryAllFailedCandidates(); break;
     case 'failed-select': toggleFailedSelection(actionElement); return;
     case 'failed-select-page': toggleFailedPageSelection(actionElement); return;
     case 'goto-failed-page': gotoFailedPage(actionElement.getAttribute('data-page')); break;

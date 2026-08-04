@@ -124,6 +124,55 @@ func TestFailedRetryRejectsUnknownKeyBeforeStarting(t *testing.T) {
 	}
 }
 
+func TestFailedRetryAllEnumeratesCatalogAndRejectsMixedKeys(t *testing.T) {
+	failed := []Proxy{
+		{IP: "198.51.100.93", Port: "1080", Protocol: "socks5"},
+		{IP: "198.51.100.94", Port: "1080", Protocol: "socks5"},
+	}
+	pool := candidateOperationTestPool(nil, failed)
+	coordinator := newRefreshCoordinator()
+	server := NewStatusServerWithCoordinator(pool, &ConfigStore{}, coordinator)
+	server.SetCheckDefaults(time.Second, 2, 5, false)
+
+	for _, body := range []string{
+		`{"all":true,"keys":["` + failed[0].Key() + `"]}`,
+		`{"unexpected":true}`,
+	} {
+		recorder := httptest.NewRecorder()
+		server.handler().ServeHTTP(recorder, localTestRequest(http.MethodPost, "/api/failed-candidates/retry", strings.NewReader(body)))
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("failed retry-all body %s = %d %s", body, recorder.Code, recorder.Body.String())
+		}
+	}
+	if status := coordinator.candidateCheckOperationStatus(); status.Status != "idle" {
+		t.Fatalf("invalid retry-all bodies queued operation: %+v", status)
+	}
+
+	recorder := httptest.NewRecorder()
+	server.handler().ServeHTTP(recorder, localTestRequest(http.MethodPost, "/api/failed-candidates/retry", strings.NewReader(`{"all":true}`)))
+	if recorder.Code != http.StatusAccepted || recorder.Header().Get("Location") != "/api/failed-candidates/retry/status" {
+		t.Fatalf("retry-all accepted = %d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
+	}
+	coordinator.candidateCheckMu.RLock()
+	request := coordinator.candidateCheckRequest
+	coordinator.candidateCheckMu.RUnlock()
+	if request == nil || !request.retryAll || request.kind != candidateCheckOperationFailedRetry || len(request.keys) != len(failed) {
+		t.Fatalf("queued retry-all request = %+v", request)
+	}
+}
+
+func TestFailedRetryAllRejectsEmptyCatalog(t *testing.T) {
+	pool := candidateOperationTestPool([]Proxy{{IP: "198.51.100.95", Port: "1080", Protocol: "socks5"}}, nil)
+	coordinator := newRefreshCoordinator()
+	server := NewStatusServerWithCoordinator(pool, &ConfigStore{}, coordinator)
+	server.SetCheckDefaults(time.Second, 2, 5, false)
+	recorder := httptest.NewRecorder()
+	server.handler().ServeHTTP(recorder, localTestRequest(http.MethodPost, "/api/failed-candidates/retry", strings.NewReader(`{"all":true}`)))
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"failed_candidate_not_found"`) {
+		t.Fatalf("retry-all with empty failure catalog = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestFailedRetryReturnsAcceptedOperation(t *testing.T) {
 	failed := Proxy{IP: "198.51.100.92", Port: "1080", Protocol: "socks5"}
 	pool := candidateOperationTestPool(nil, []Proxy{failed})

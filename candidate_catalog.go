@@ -398,6 +398,39 @@ func (c *CandidateCatalog) LeasePendingKeys(keys []string, known candidateKnownI
 	return result
 }
 
+// snapshotPhaseRestored reports whether the catalog still holds the startup
+// cache restore without any refresh having republished it. Check batches
+// mutate and persist the snapshot, and the cache encoder only accepts
+// complete or partial phases, so check workflows must wait for the first
+// refresh instead of corrupting the persist path.
+func (c *CandidateCatalog) snapshotPhaseRestored() bool {
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return true
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	return snapshot.phase == "restored"
+}
+
+// FailedKeys enumerates every failed candidate key in catalog order. The
+// administrator-triggered retry-all operation uses it to build its own work
+// list instead of trusting a client-supplied list of tens of thousands of
+// keys. Automatic workflows never call this: failed leases stay manual-only.
+func (c *CandidateCatalog) FailedKeys() []string {
+	snapshot := c.snapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	keys := make([]string, 0, len(snapshot.failedRecords))
+	for _, failure := range snapshot.failedRecords {
+		keys = append(keys, snapshot.protocols[failure.protocolID]+"://"+failure.addr)
+	}
+	return keys
+}
+
 // FilterPendingCandidates compacts one source-derived work slice to the exact
 // entries still owned by the pending catalog. Failed records, ProxyIP resources,
 // and every key already owned by ProxyPool are removed before MaxCandidates is

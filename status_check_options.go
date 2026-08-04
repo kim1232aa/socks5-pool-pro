@@ -21,6 +21,11 @@ type checkOptionsPayload struct {
 	SourceRefreshIntervalSeconds *int        `json:"source_refresh_interval_seconds"`
 	FullRecheckIntervalSeconds   *int        `json:"full_recheck_interval_seconds"`
 	RequireIPChange              interface{} `json:"require_ip_change"`
+	// AutoCandidateCheck accepts a boolean or "default" (clears the override
+	// back to enabled). AutoCheckIntervalSeconds is the pause between
+	// automatic candidate check batches; 0 runs batches back-to-back.
+	AutoCandidateCheck       interface{} `json:"auto_candidate_check"`
+	AutoCheckIntervalSeconds *int        `json:"auto_check_interval_seconds"`
 }
 
 // handleCheckOptions reads or updates the dashboard-tunable health-check
@@ -34,7 +39,9 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 	case http.MethodGet, http.MethodHead:
 		timeout, maxConcurrent, maxCandidates, requireIPChange := s.effectiveCheckOptions()
 		sourceRefreshInterval, fullRecheckInterval := s.effectiveScheduleIntervals()
+		autoCandidateCheck, autoCheckInterval := true, 0
 		storedConcurrent, storedTimeoutSeconds, storedCandidates, storedSourceRefresh, storedFullRecheck, storedRequire := 0, 0, 0, 0, 0, interface{}("default")
+		storedAutoCheck, storedAutoInterval := interface{}("default"), 0
 		if s.store != nil {
 			var requireOverride *bool
 			storedConcurrent, storedTimeoutSeconds, storedCandidates, requireOverride = s.store.CheckOptionsOverride()
@@ -42,6 +49,13 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			if requireOverride != nil {
 				storedRequire = *requireOverride
 			}
+			autoCandidateCheck = s.store.AutoCandidateCheckEnabled()
+			autoCheckInterval = int(s.store.AutoCheckInterval() / time.Second)
+			autoOverride, autoIntervalOverride := s.store.AutoCheckOptionsOverride()
+			if autoOverride != nil {
+				storedAutoCheck = *autoOverride
+			}
+			storedAutoInterval = autoIntervalOverride
 		}
 		writeJSON(w, map[string]interface{}{
 			"max_concurrent":                  maxConcurrent,
@@ -50,6 +64,8 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			"source_refresh_interval_seconds": int(sourceRefreshInterval / time.Second),
 			"full_recheck_interval_seconds":   int(fullRecheckInterval / time.Second),
 			"require_ip_change":               requireIPChange,
+			"auto_candidate_check":            autoCandidateCheck,
+			"auto_check_interval_seconds":     autoCheckInterval,
 			"overrides": map[string]interface{}{
 				"max_concurrent":                  storedConcurrent,
 				"check_timeout_seconds":           storedTimeoutSeconds,
@@ -57,6 +73,8 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 				"source_refresh_interval_seconds": storedSourceRefresh,
 				"full_recheck_interval_seconds":   storedFullRecheck,
 				"require_ip_change":               storedRequire,
+				"auto_candidate_check":            storedAutoCheck,
+				"auto_check_interval_seconds":     storedAutoInterval,
 			},
 		})
 	case http.MethodPost:
@@ -85,6 +103,23 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			writeErr(w, http.StatusBadRequest, fmt.Errorf("require_ip_change must be a boolean or \"default\""))
 			return
 		}
+		var autoCheckOverride *bool
+		clearAutoCheckOverride := false
+		switch v := in.AutoCandidateCheck.(type) {
+		case nil:
+			// Key absent or explicit null: leave the stored override untouched.
+		case bool:
+			autoCheckOverride = &v
+		case string:
+			if !strings.EqualFold(strings.TrimSpace(v), "default") {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("auto_candidate_check must be a boolean or \"default\""))
+				return
+			}
+			clearAutoCheckOverride = true
+		default:
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("auto_candidate_check must be a boolean or \"default\""))
+			return
+		}
 		if err := s.store.updateRuntimeOptions(runtimeOptionsUpdate{
 			maxConcurrent:                in.MaxConcurrent,
 			checkTimeoutSeconds:          in.CheckTimeoutSeconds,
@@ -93,6 +128,9 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			fullRecheckIntervalSeconds:   in.FullRecheckIntervalSeconds,
 			requireIPChange:              requireOverride,
 			clearRequireIPChange:         clearRequireOverride,
+			autoCandidateCheck:           autoCheckOverride,
+			clearAutoCandidateCheck:      clearAutoCheckOverride,
+			autoCheckIntervalSeconds:     in.AutoCheckIntervalSeconds,
 		}); err != nil {
 			writeConfigStoreError(w, err)
 			return
