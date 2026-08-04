@@ -62,6 +62,10 @@ type RefreshCoordinator struct {
 	candidateCheckPending *CandidateCheckOperation
 	candidateCheckLast    *CandidateCheckOperation
 	candidateCheckRequest *candidateCheckRequest
+	// candidateCheckCancel aborts the operation the worker currently owns.
+	// A retry-all walk can span tens of thousands of nodes, so an operator
+	// needs a way out that does not require restarting the process.
+	candidateCheckCancel func()
 }
 
 func newRefreshCoordinator() *RefreshCoordinator {

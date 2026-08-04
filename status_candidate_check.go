@@ -129,6 +129,32 @@ func (s *StatusServer) startCandidateCheck(w http.ResponseWriter, kind string, l
 	writeErrCode(w, http.StatusServiceUnavailable, "candidate_check_unavailable", err)
 }
 
+// handleCandidateCheckCancel aborts the running or queued manual candidate
+// operation. Retry-all walks can span an hour, so an administrator needs a way
+// to release the shared task slot without restarting the process. Already
+// committed chunks stay committed; the aborted batch's leases are released and
+// its records keep their previous collection.
+func (s *StatusServer) handleCandidateCheckCancel(w http.ResponseWriter, _ *http.Request) {
+	operation, cancelled := s.coordinator.cancelCandidateCheck()
+	statusURL := "/api/candidates/batch-check/status"
+	if operation.Kind == candidateCheckOperationFailedRetry {
+		statusURL = "/api/failed-candidates/retry/status"
+	}
+	response := candidateCheckStartResponse{
+		CandidateCheckOperation: operation,
+		Accepted:                cancelled,
+		StatusURL:               statusURL,
+	}
+	if !cancelled {
+		response.Code = "candidate_check_not_running"
+		response.Error = "no manual candidate operation is running"
+		response.RequestID = requestIDFromContext(w)
+		writeJSONStatus(w, http.StatusConflict, response)
+		return
+	}
+	writeJSON(w, response)
+}
+
 func (s *StatusServer) handleCandidateCheckStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.coordinator.candidateCheckOperationStatus())
 }

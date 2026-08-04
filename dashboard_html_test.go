@@ -713,6 +713,11 @@ func TestDashboardExposesAutoCandidateCheckOptions(t *testing.T) {
 		`auto_candidate_check:`,
 		`auto_check_interval_seconds: autoIntervalSeconds`,
 		`result.auto_candidate_check !== false`,
+		`restoreInFlightCandidateCheck`,
+		`['queued', 'running'].indexOf(operation.status) < 0`,
+		`function cancelCandidateCheck()`,
+		`case 'cancel-candidate-check': cancelCandidateCheck(); break;`,
+		`task-panel-bar`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing automatic candidate check option contract %q", want)

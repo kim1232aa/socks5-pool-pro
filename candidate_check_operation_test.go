@@ -342,6 +342,95 @@ func TestFailedRetryAllSkipsKeysNoLongerFailed(t *testing.T) {
 	}
 }
 
+// TestCancelQueuedCandidateCheckReleasesSlot covers the administrator
+// cancelling a task the worker has not claimed yet: the shared manual slot must
+// be free immediately and the worker must not later run the abandoned request.
+func TestCancelQueuedCandidateCheckReleasesSlot(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	queued, err := coordinator.requestCandidateCheck(candidateCheckOperationCandidateBatch, 5, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, ok := coordinator.cancelCandidateCheck()
+	if !ok || cancelled.ID != queued.ID || cancelled.Status != "cancelled" || cancelled.CompletedAt == "" {
+		t.Fatalf("cancel queued task = (%+v, %v)", cancelled, ok)
+	}
+	if status := coordinator.candidateCheckOperationStatus(); status.Status != "cancelled" || status.ID != queued.ID {
+		t.Fatalf("status after cancelling queued task = %+v", status)
+	}
+	if _, _, claimed := coordinator.beginCandidateCheckOperation(); claimed {
+		t.Fatal("worker claimed a cancelled request")
+	}
+	if _, err := coordinator.requestCandidateCheck(candidateCheckOperationCandidateBatch, 1, nil); err != nil {
+		t.Fatalf("slot not released after cancelling queued task: %v", err)
+	}
+}
+
+// TestCancelRunningCandidateCheckStopsWorkAndReleasesLeases proves cancellation
+// interrupts in-flight dialing, ends the operation as cancelled, and leaves the
+// candidates leasable again.
+func TestCancelRunningCandidateCheckStopsWorkAndReleasesLeases(t *testing.T) {
+	pending := []Proxy{
+		{IP: "198.51.102.10", Port: "8080", Protocol: "http"},
+		{IP: "198.51.102.11", Port: "8080", Protocol: "http"},
+	}
+	pool := candidateOperationTestPool(pending, nil)
+	store := &ConfigStore{cfg: PoolConfig{CheckURL: "https://health.example/check", MaxConcurrent: 2}}
+	cfg := &Config{CheckTimeout: time.Minute, MaxConcurrent: 2, MaxCandidates: 10}
+	coordinator := newRefreshCoordinator()
+	started := make(chan struct{}, len(pending))
+	installCandidateCheckSeams(t,
+		func(ctx context.Context, px Proxy, _ string, _ time.Duration) (Proxy, bool, error) {
+			started <- struct{}{}
+			<-ctx.Done()
+			return px, false, ctx.Err()
+		}, nil, nil, nil,
+	)
+
+	if _, err := coordinator.requestCandidateCheck(candidateCheckOperationCandidateBatch, len(pending), nil); err != nil {
+		t.Fatal(err)
+	}
+	<-coordinator.candidateCheckChan
+	done := make(chan struct{})
+	go func() {
+		runCandidateCheckCycle(context.Background(), cfg, store, pool, coordinator)
+		close(done)
+	}()
+	for range pending {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("candidate check did not start")
+		}
+	}
+	if _, ok := coordinator.cancelCandidateCheck(); !ok {
+		t.Fatal("cancelling a running candidate task was rejected")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled candidate task did not stop")
+	}
+	if status := coordinator.candidateCheckOperationStatus(); status.Status != "cancelled" {
+		t.Fatalf("status after cancelling running task = %+v", status)
+	}
+	known, _ := pool.candidateKnownSnapshot()
+	leases := pool.candidates.LeasePending(len(pending), known)
+	if len(leases) != len(pending) {
+		t.Fatalf("pending leases after cancellation = %d, want %d", len(leases), len(pending))
+	}
+	pool.candidates.ReleaseLeases(leases)
+}
+
+// TestCancelWithoutRunningCandidateCheckIsRejected keeps the endpoint honest:
+// cancelling nothing must not fabricate a cancelled operation.
+func TestCancelWithoutRunningCandidateCheckIsRejected(t *testing.T) {
+	coordinator := newRefreshCoordinator()
+	if operation, ok := coordinator.cancelCandidateCheck(); ok || operation.Status != "idle" {
+		t.Fatalf("cancel with no task = (%+v, %v)", operation, ok)
+	}
+}
+
 func TestAutomaticWorkersCannotLeaseFailedCandidates(t *testing.T) {
 	failed := Proxy{IP: "198.51.100.80", Port: "8080", Protocol: "http"}
 	pool := candidateOperationTestPool(nil, []Proxy{failed})

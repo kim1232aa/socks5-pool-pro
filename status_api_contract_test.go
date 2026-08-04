@@ -48,6 +48,7 @@ func TestAPIRoutesMethodsErrorsAndSecurityHeaders(t *testing.T) {
 		{http.MethodPost, "/api/candidates/batch-check/status", "GET, HEAD"},
 		{http.MethodGet, "/api/failed-candidates/retry", http.MethodPost},
 		{http.MethodPost, "/api/failed-candidates/retry/status", "GET, HEAD"},
+		{http.MethodGet, "/api/candidates/check/cancel", http.MethodPost},
 	} {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, localTestRequest(route.method, route.path, nil))

@@ -182,6 +182,52 @@ func (c *RefreshCoordinator) finishCandidateCheckOperation(id, status string, er
 	}
 	c.candidateCheckLast = cloneCandidateCheckOperation(c.candidateCheckActive)
 	c.candidateCheckActive = nil
+	c.candidateCheckCancel = nil
+}
+
+// cancelCandidateCheck aborts a queued or running candidate operation. A
+// queued task is discarded immediately. A running task is interrupted via
+// the cancellation context the worker registered; the cycle exits as
+// "cancelled" and all leases are released. Returns ok=false when there is
+// nothing to cancel (idle).
+func (c *RefreshCoordinator) cancelCandidateCheck() (CandidateCheckOperation, bool) {
+	c.candidateCheckMu.Lock()
+	defer c.candidateCheckMu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if c.candidateCheckPending != nil {
+		op := c.candidateCheckPending
+		op.Status = "cancelled"
+		op.CompletedAt = now
+		c.candidateCheckPending = nil
+		c.candidateCheckRequest = nil
+		c.candidateCheckLast = cloneCandidateCheckOperation(op)
+		// Drain the channel so the worker does not wake to an empty pending slot.
+		select {
+		case <-c.candidateCheckChan:
+		default:
+		}
+		return *op, true
+	}
+	if c.candidateCheckActive != nil {
+		op := c.candidateCheckActive
+		if c.candidateCheckCancel != nil {
+			c.candidateCheckCancel()
+			c.candidateCheckCancel = nil
+		}
+		return *op, true
+	}
+	return CandidateCheckOperation{Status: "idle"}, false
+}
+
+// registerCandidateCheckCancel stores the cancel function so that an
+// administrator can interrupt the running operation before it completes.
+// The cancel is cleared automatically when finishCandidateCheckOperation runs.
+func (c *RefreshCoordinator) registerCandidateCheckCancel(id string, cancel func()) {
+	c.candidateCheckMu.Lock()
+	defer c.candidateCheckMu.Unlock()
+	if c.candidateCheckActive != nil && c.candidateCheckActive.ID == id {
+		c.candidateCheckCancel = cancel
+	}
 }
 
 func (c *RefreshCoordinator) candidateCheckOperationStatus() CandidateCheckOperation {
@@ -239,8 +285,15 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 		return
 	}
 
+	// Long retry-all walks can run for an hour; an administrator must be able
+	// to abort without restarting the process. The cancel is registered on the
+	// active operation and cleared when it finishes.
+	taskContext, cancelTask := context.WithCancel(parent)
+	defer cancelTask()
+	coordinator.registerCandidateCheckCancel(operation.ID, cancelTask)
+
 	if !request.retryAll {
-		status, finishErr = runSingleCandidateBatch(parent, cfg, store, pool, coordinator, operation.ID, request, nil)
+		status, finishErr = runSingleCandidateBatch(taskContext, cfg, store, pool, coordinator, operation.ID, request, nil)
 		return
 	}
 
@@ -257,7 +310,7 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 		kind: candidateCheckOperationFailedRetry, retryAll: true, tolerateMissing: true,
 	}
 	for start := 0; start < len(request.keys); start += chunkSize {
-		if err := parent.Err(); err != nil {
+		if err := taskContext.Err(); err != nil {
 			status, finishErr = "cancelled", err
 			return
 		}
@@ -266,7 +319,7 @@ func runCandidateCheckCycle(parent context.Context, cfg *Config, store *ConfigSt
 			end = len(request.keys)
 		}
 		chunk.keys = request.keys[start:end]
-		status, finishErr = runSingleCandidateBatch(parent, cfg, store, pool, coordinator, operation.ID, chunk, nil)
+		status, finishErr = runSingleCandidateBatch(taskContext, cfg, store, pool, coordinator, operation.ID, chunk, nil)
 		if status != "complete" {
 			if status == "failed" && finishErr == nil {
 				finishErr = fmt.Errorf("failed candidate retry-all stopped")

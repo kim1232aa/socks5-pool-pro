@@ -336,6 +336,7 @@ GET /api/v1/proxies/pick?protocol=socks5&country=JP
 | GET | `/api/failed-candidates` | 失败隔离候选分页 |
 | POST | `/api/failed-candidates/retry` | 手动重新检测选中的失败候选；`{"all":true}` 一键分批重查全部失败候选（`202`） |
 | GET | `/api/failed-candidates/retry/status` | 查看失败重测任务进度 |
+| POST | `/api/candidates/check/cancel` | 取消当前排队或运行中的人工检测任务（无任务时 `409`） |
 | GET | `/api/proxyip/page` | ProxyIP 资源分页 |
 | GET | `/api/nodes` | 旧版完整节点数组，已标记弃用 |
 | GET | `/api/nodes/stats` | 单节点累计转发、连续健康失败与恢复状态 |

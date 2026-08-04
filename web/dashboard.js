@@ -1504,12 +1504,40 @@ function setCandidateCheckButtonsDisabled(disabled) {
 }
 
 function renderCandidateCheckOperation(statusElId, operation) {
+  var el = document.getElementById(statusElId);
+  if (!el) return;
   var total = Math.max(0, Number(operation.total) || 0);
   var completed = Math.max(0, Number(operation.completed) || 0);
-  var text = operation.status === 'queued'
-    ? '检测任务已排队，等待当前任务结束…'
-    : '正式检测中：' + formatCount(completed) + ' / ' + formatCount(total) + '（通过 ' + formatCount(operation.alive || 0) + ' · 失败 ' + formatCount(operation.failed || 0) + (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '') + '）';
-  setText(statusElId, text);
+  var pct = total > 0 ? Math.round(completed / total * 100) : 0;
+  var kindLabel = operation.kind === 'failed_retry' ? '失败重查' : '候选批检';
+  if (operation.status === 'queued') kindLabel += '（排队中）';
+  var progressText = operation.status === 'queued'
+    ? '等待当前任务结束…'
+    : (total > 0 ? formatCount(completed) + ' / ' + formatCount(total) + ' (' + pct + '%)' : '正在准备…');
+  var countText = '通过 ' + formatCount(operation.alive || 0) + ' · 失败 ' + formatCount(operation.failed || 0) +
+    (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '');
+  var elapsed = '';
+  if (operation.started_at) {
+    var ms = Date.now() - new Date(operation.started_at).getTime();
+    if (ms > 0) {
+      var secs = Math.floor(ms / 1000);
+      elapsed = secs >= 60 ? Math.floor(secs / 60) + 'm' + (secs % 60) + 's' : secs + 's';
+    }
+  }
+  var bar = total > 0
+    ? '<span class="task-panel-bar"><span class="task-panel-fill" style="width:' + pct + '%"></span></span>'
+    : '';
+  var canCancel = operation.status === 'queued' || operation.status === 'running';
+  var cancelBtn = canCancel
+    ? '<button type="button" class="btn-cancel" data-action="cancel-candidate-check">取消</button>'
+    : '';
+  el.innerHTML =
+    '<span class="task-panel-title">' + escapeHtml(kindLabel) + '</span>' +
+    bar +
+    '<span class="task-panel-progress">' + escapeHtml(progressText) + '</span>' +
+    '<span class="task-panel-counts">' + escapeHtml(countText) + '</span>' +
+    (elapsed ? '<span class="task-panel-elapsed">已用 ' + escapeHtml(elapsed) + '</span>' : '') +
+    cancelBtn;
 }
 
 function refreshAfterCandidateCheck() {
@@ -1610,6 +1638,17 @@ function retryAllFailedCandidates() {
     setText('failed-operation-status', '一键重查提交失败：' + String(err));
     notify('一键重查失败节点失败：' + String(err), 'error', 7000);
   });
+}
+
+function cancelCandidateCheck() {
+  fetchJSON('/api/candidates/check/cancel', {method: 'POST'})
+    .then(function() {
+      notify('检测任务取消请求已发送', 'success', 3000);
+    })
+    .catch(function(err) {
+      if (err.status === 409) { notify('当前没有正在运行的检测任务', 'error', 4000); return; }
+      notify('取消失败：' + String(err), 'error', 5000);
+    });
 }
 
 function retryFailedCandidates() {
@@ -3264,6 +3303,7 @@ document.addEventListener('click', function(event) {
     case 'candidate-batch-check': startCandidateBatchCheck(actionElement); break;
     case 'failed-retry-selected': retryFailedCandidates(); break;
     case 'failed-retry-all': retryAllFailedCandidates(); break;
+    case 'cancel-candidate-check': cancelCandidateCheck(); break;
     case 'failed-select': toggleFailedSelection(actionElement); return;
     case 'failed-select-page': toggleFailedPageSelection(actionElement); return;
     case 'goto-failed-page': gotoFailedPage(actionElement.getAttribute('data-page')); break;
@@ -3313,6 +3353,18 @@ syncProxyIPPageSizeSelect();
 syncTabFromHash();
 loadCheckOptions();
 loadBaselineExit();
+// Restore any candidate check operation that was already queued or running
+// before this page load. Without this, a page reload loses visibility of
+// the in-flight task and the button appears disabled without explanation.
+(function restoreInFlightCandidateCheck() {
+  fetchJSON('/api/candidates/batch-check/status').then(function(operation) {
+    if (!operation || ['queued', 'running'].indexOf(operation.status) < 0) return;
+    var statusURL = operation.kind === 'failed_retry'
+      ? '/api/failed-candidates/retry/status'
+      : '/api/candidates/batch-check/status';
+    pollCandidateCheckOperation(statusURL, String(operation.id || ''));
+  }).catch(function() {});
+}());
 pollStatus(false);
 schedulePoll(15000);
 

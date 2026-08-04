@@ -220,7 +220,7 @@
       <input id="candidate-batch-limit" type="number" min="1" step="1" inputmode="numeric">
       <button type="button" class="btn-sm" id="candidate-batch-check-button" data-action="candidate-batch-check">开始批量正式检测</button>
       <span class="candidate-speedtest-note">按有效“每轮抽样”数量为上限；检测在后台运行，可同时浏览其他页面。</span>
-      <span id="candidate-operation-status" class="small" role="status" aria-live="polite"></span>
+      <div id="candidate-operation-status" class="task-panel-container" role="status" aria-live="polite"></div>
     </div>
     <span class="candidate-filter-note">筛选和分页均在服务端执行。正式检查失败的候选会移入失败节点页，只能在那里手动重新检测。</span>
   </div>
@@ -270,7 +270,7 @@
       <button type="button" class="btn-sm" id="failed-retry-button" data-action="failed-retry-selected" disabled>手动重新检测已选</button>
       <button type="button" class="btn-sm" id="failed-retry-all-button" data-action="failed-retry-all">一键重查全部失败节点</button>
       <span class="candidate-speedtest-note">失败节点不会自动重新检测；勾选后手动提交，或一键重查全部（按抽样规模分批走完），通过的回到转发池，仍失败的留在这里。</span>
-      <span id="failed-operation-status" class="small" role="status" aria-live="polite"></span>
+      <div id="failed-operation-status" class="task-panel-container" role="status" aria-live="polite"></div>
     </div>
     <span class="candidate-filter-note">筛选和分页均在服务端执行。失败节点只能从这里手动重新检测，来源刷新和定时任务不会触碰它们。</span>
   </div>

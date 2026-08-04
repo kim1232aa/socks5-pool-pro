@@ -235,6 +235,7 @@ func (s *StatusServer) handler() http.Handler {
 	mux.HandleFunc("/api/failed-candidates", requireGet(s.handleFailedCandidatesPage))
 	mux.HandleFunc("/api/failed-candidates/retry", requirePost(s.handleFailedCandidatesRetry))
 	mux.HandleFunc("/api/failed-candidates/retry/status", requireGet(s.handleCandidateCheckStatus))
+	mux.HandleFunc("/api/candidates/check/cancel", requirePost(s.handleCandidateCheckCancel))
 	mux.HandleFunc("/api/proxyip/page", requireGet(s.handleProxyIPPage))
 	mux.HandleFunc("/api/candidates/speedtest", requirePost(s.handleCandidateSpeedtest))
 	mux.HandleFunc("/api/candidates/delete", requirePost(s.handleCandidatesDelete))
