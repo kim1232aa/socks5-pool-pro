@@ -1514,8 +1514,13 @@ function renderCandidateCheckOperation(statusElId, operation) {
   var progressText = operation.status === 'queued'
     ? '等待当前任务结束…'
     : (total > 0 ? formatCount(completed) + ' / ' + formatCount(total) + ' (' + pct + '%)' : '正在准备…');
-  var countText = '通过 ' + formatCount(operation.alive || 0) + ' · 失败 ' + formatCount(operation.failed || 0) +
-    (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '');
+  var alive = Number(operation.alive || 0);
+  var failed = Number(operation.failed || 0);
+  var policy = Number(operation.policy_filtered || 0);
+  var countHtml =
+    '<span class="tc-alive">通过 ' + formatCount(alive) + '</span>' +
+    ' · <span class="tc-failed">失败 ' + formatCount(failed) + '</span>' +
+    (policy ? ' · <span class="tc-policy">策略排除 ' + formatCount(policy) + '</span>' : '');
   var elapsed = '';
   if (operation.started_at) {
     var ms = Date.now() - new Date(operation.started_at).getTime();
@@ -1524,20 +1529,22 @@ function renderCandidateCheckOperation(statusElId, operation) {
       elapsed = secs >= 60 ? Math.floor(secs / 60) + 'm' + (secs % 60) + 's' : secs + 's';
     }
   }
-  var bar = total > 0
-    ? '<span class="task-panel-bar"><span class="task-panel-fill" style="width:' + pct + '%"></span></span>'
-    : '';
+  var bar = '<div class="task-panel-bar"><span class="task-panel-fill" style="width:' + pct + '%"></span></div>';
   var canCancel = operation.status === 'queued' || operation.status === 'running';
   var cancelBtn = canCancel
     ? '<button type="button" class="btn-cancel" data-action="cancel-candidate-check">取消</button>'
     : '';
   el.innerHTML =
-    '<span class="task-panel-title">' + escapeHtml(kindLabel) + '</span>' +
+    '<div class="task-panel-header">' +
+      '<span class="task-panel-title">' + escapeHtml(kindLabel) + '</span>' +
+      cancelBtn +
+    '</div>' +
     bar +
-    '<span class="task-panel-progress">' + escapeHtml(progressText) + '</span>' +
-    '<span class="task-panel-counts">' + escapeHtml(countText) + '</span>' +
-    (elapsed ? '<span class="task-panel-elapsed">已用 ' + escapeHtml(elapsed) + '</span>' : '') +
-    cancelBtn;
+    '<div class="task-panel-footer">' +
+      '<span class="task-panel-progress">' + escapeHtml(progressText) + '</span>' +
+      '<span class="task-panel-counts">' + countHtml + '</span>' +
+      (elapsed ? '<span class="task-panel-elapsed">已用 ' + escapeHtml(elapsed) + '</span>' : '') +
+    '</div>';
 }
 
 function refreshAfterCandidateCheck() {
