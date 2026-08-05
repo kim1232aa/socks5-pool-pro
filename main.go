@@ -495,7 +495,7 @@ func refreshBaselineBeforeRecheck(ctx context.Context, cfg *Config, store *Confi
 		return true, false
 	}
 	pool.InvalidateHealth(store.CheckURL())
-	pool.candidates.ResetHealthOutcomes()
+	pool.candidates.ResetHealthOutcomesSoft()
 	if err := pool.FlushCache(); err != nil {
 		log.Printf("[cache] baseline change flush failed: %v", err)
 	}

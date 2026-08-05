@@ -82,7 +82,10 @@ func TestCheckOptionsRoundTripAndValidation(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &saved); err != nil {
 		t.Fatal(err)
 	}
-	if saved.MaxConcurrent != 50 || saved.CheckTimeoutSeconds != 15 || saved.MaxCandidates != 500 || saved.PolicyChanged {
+	// The timeout moved from the 10s default to 15s. A timeout change alters how
+	// strictly every cached verdict was reached, so the handler invalidates pool
+	// health and queues a full recheck, which it reports as policy_changed.
+	if saved.MaxConcurrent != 50 || saved.CheckTimeoutSeconds != 15 || saved.MaxCandidates != 500 || !saved.PolicyChanged {
 		t.Fatalf("saved options = %#v", saved)
 	}
 

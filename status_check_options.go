@@ -120,6 +120,9 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			writeErr(w, http.StatusBadRequest, fmt.Errorf("auto_candidate_check must be a boolean or \"default\""))
 			return
 		}
+		// Capture the effective timeout before the store update so we can detect
+		// a real change and invalidate stale cached results afterwards.
+		oldTimeout, _, _, _ := s.effectiveCheckOptions()
 		if err := s.store.updateRuntimeOptions(runtimeOptionsUpdate{
 			maxConcurrent:                in.MaxConcurrent,
 			checkTimeoutSeconds:          in.CheckTimeoutSeconds,
@@ -135,10 +138,6 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			writeConfigStoreError(w, err)
 			return
 		}
-		// A timeout change affects how strictly past health verdicts were
-		// reached; capture the old value before the store update so we can
-		// detect a real change and invalidate stale cached results.
-		oldTimeout, _, _, _ := s.effectiveCheckOptions()
 		// Numeric options (concurrency, max-candidates, intervals) need no
 		// invalidation; only a timeout change can make old verdicts wrong.
 		policyChanged := false
@@ -157,7 +156,7 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			if s.pool.SetRequireIPChangePolicy(effectiveRequire) {
 				policyChanged = true
 				s.pool.InvalidateHealth(s.store.CheckURL())
-				s.pool.candidates.ResetHealthOutcomes()
+				s.pool.candidates.ResetHealthOutcomesSoft()
 				if err := s.pool.FlushCache(); err != nil {
 					writeErrCode(w, http.StatusInternalServerError, "check_options_not_durable", fmt.Errorf("check options change was not persisted: %w", err))
 					return
@@ -168,9 +167,12 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 		// If the effective check timeout changed, cached verdicts under the old
 		// (more or less generous) deadline may no longer be accurate.
 		newTimeout, newConcurrent, newCandidates, newRequire := s.effectiveCheckOptions()
+		// Timeout change: invalidate pool nodes so they are re-tested under the
+		// new deadline. No need to reset candidate health outcomes – pending
+		// candidates are not yet verdict-tagged, and resetting would arm the
+		// snapshotPhaseRestored guard and block all batch-check operations.
 		if !policyChanged && newTimeout != oldTimeout {
 			s.pool.InvalidateHealth(s.store.CheckURL())
-			s.pool.candidates.ResetHealthOutcomes()
 			if flushErr := s.pool.FlushCache(); flushErr == nil {
 				recheck, accepted = s.coordinator.triggerFullRecheck(s.pool)
 				policyChanged = true
@@ -217,7 +219,7 @@ func (s *StatusServer) handleBaselineExit(w http.ResponseWriter, r *http.Request
 				checkURL = s.store.CheckURL()
 			}
 			s.pool.InvalidateHealth(checkURL)
-			s.pool.candidates.ResetHealthOutcomes()
+			s.pool.candidates.ResetHealthOutcomesSoft()
 			if err := s.pool.FlushCache(); err != nil {
 				writeErrCode(w, http.StatusInternalServerError, "baseline_not_durable", fmt.Errorf("baseline policy change was not persisted: %w", err))
 				return

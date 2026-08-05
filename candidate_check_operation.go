@@ -450,6 +450,12 @@ func runSingleCandidateBatch(parent context.Context, cfg *Config, store *ConfigS
 
 	coordinator.sourceLifecycleMu.Lock()
 	defer coordinator.sourceLifecycleMu.Unlock()
+	// Waiting for sourceLifecycleMu can take a while when a source toggle holds
+	// it. An operator cancel that lands in that window must still stop the
+	// publication; the generation check above only catches criterion changes.
+	if err := parent.Err(); err != nil {
+		return "cancelled", err
+	}
 	if !sameSourceRevisions(sourceSnapshot, store.Sources()) {
 		return "superseded", fmt.Errorf("source configuration changed during candidate check")
 	}

@@ -880,10 +880,29 @@ func (c *CandidateCatalog) RemoveKeys(keys []string) (removed, notFound []string
 // ResetHealthOutcomes invalidates criterion-dependent candidate annotations
 // while retaining the full source inventory. Candidate cache format v1 did not
 // persist the CheckURL, so cached checked_failed/policy_filtered labels cannot
-// be trusted after a restart; the same reset is used immediately when an
-// operator changes the URL. Live pool membership is still overlaid at read
+// be trusted after a restart; the same reset is used immediately after loading
+// a startup cache to arm the snapshotPhaseRestored guard (which blocks checks
+// on an unvalidated cache). Live pool membership is still overlaid at read
 // time, and later checks repopulate these annotations under the new standard.
+//
+// IMPORTANT: This sets snapshot.phase to "restored", which causes
+// snapshotPhaseRestored() to return true and block all batch-check operations
+// until the next source-refresh cycle. It must ONLY be called at startup (after
+// loading the disk cache). For runtime criterion changes, use
+// ResetHealthOutcomesSoft() instead.
 func (c *CandidateCatalog) ResetHealthOutcomes() int {
+	return c.resetHealthOutcomes(true)
+}
+
+// ResetHealthOutcomesSoft resets the same criterion-dependent annotations as
+// ResetHealthOutcomes but does NOT change snapshot.phase. Use this at runtime
+// (URL change, policy flip, etc.) so the snapshotPhaseRestored guard stays
+// disarmed and batch-check operations can continue immediately.
+func (c *CandidateCatalog) ResetHealthOutcomesSoft() int {
+	return c.resetHealthOutcomes(false)
+}
+
+func (c *CandidateCatalog) resetHealthOutcomes(markStartupRestore bool) int {
 	c.publicationMu.RLock()
 	defer c.publicationMu.RUnlock()
 	snapshot := c.snapshot.Load()
@@ -903,8 +922,13 @@ func (c *CandidateCatalog) ResetHealthOutcomes() int {
 			changed++
 		}
 	}
-	if changed > 0 || snapshot.phase != "restored" {
-		snapshot.phase = "restored"
+	if markStartupRestore {
+		if changed > 0 || snapshot.phase != "restored" {
+			snapshot.phase = "restored"
+			snapshot.completedAt = time.Time{}
+			snapshot.revision++
+		}
+	} else if changed > 0 {
 		snapshot.completedAt = time.Time{}
 		snapshot.revision++
 	}

@@ -840,7 +840,11 @@ func TestCheckURLDurabilityUncertainConvergesRuntimeBeforeReturningError(t *test
 	}
 	statusServer := NewStatusServer(pool, store)
 	candidatePage := statusServer.buildCandidatePage(localTestRequest(http.MethodGet, "/api/candidates/page?page_size=100", nil))
-	if candidatePage.CandidateTotal != 0 || len(candidatePage.Candidates) != 0 || candidatePage.Phase != "restored" {
+	// After a runtime criterion change, ResetHealthOutcomesSoft is used to avoid
+	// arming the snapshotPhaseRestored guard that blocks batch-check operations.
+	// The phase stays at "complete" (from the preceding pool.candidates.complete()
+	// call) rather than flipping to "restored" as it did with the old hard reset.
+	if candidatePage.CandidateTotal != 0 || len(candidatePage.Candidates) != 0 || candidatePage.Phase != "complete" {
 		t.Fatalf("failed candidate returned to pending after criterion change: %#v", candidatePage)
 	}
 	failedPage := statusServer.buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates?page_size=100", nil))

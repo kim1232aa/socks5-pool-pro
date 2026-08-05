@@ -163,7 +163,7 @@ func (s *StatusServer) handleCheckURL(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		invalidated := s.pool.InvalidateHealth(s.store.Snapshot().CheckURL)
-		candidateOutcomesReset := s.pool.candidates.ResetHealthOutcomes()
+		candidateOutcomesReset := s.pool.candidates.ResetHealthOutcomesSoft()
 		flushErr := s.pool.FlushCache()
 		if storeErr != nil {
 			s.coordinator.triggerFullRecheck(s.pool)
