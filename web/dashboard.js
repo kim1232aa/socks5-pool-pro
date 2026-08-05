@@ -1601,6 +1601,8 @@ function startCandidateBatchCheck(button) {
   var limit = raw ? parseInt(raw, 10) : candidateBatchLimitDefault();
   if (!isFinite(limit) || limit < 1) { notify('检测数量必须是正整数', 'error'); return; }
   if (input && !raw) input.value = String(limit);
+  candidateCheckActive = true;
+  setCandidateCheckButtonsDisabled(true);
   setText('candidate-operation-status', '正在提交批量正式检测…');
   fetchJSON('/api/candidates/batch-check', {
     method:'POST', headers:{'Content-Type':'application/json'},
@@ -1622,6 +1624,8 @@ function startCandidateBatchCheck(button) {
 
 function retryAllFailedCandidates() {
   if (candidateCheckActive) { notify('已有检测任务在进行，请等待完成', 'error'); return; }
+  candidateCheckActive = true;
+  setCandidateCheckButtonsDisabled(true);
   setText('failed-operation-status', '正在提交一键重查全部失败节点…');
   fetchJSON('/api/failed-candidates/retry', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({all: true})
@@ -1642,7 +1646,13 @@ function retryAllFailedCandidates() {
 
 function cancelCandidateCheck() {
   fetchJSON('/api/candidates/check/cancel', {method: 'POST'})
-    .then(function() {
+    .then(function(result) {
+      // If the backend already finished the operation, restore UI immediately
+      // without waiting for the next poll tick (up to 1200 ms).
+      if (result && (result.status === 'cancelled' || result.status === 'complete')) {
+        var elId = result.kind === 'failed_retry' ? 'failed-operation-status' : 'candidate-operation-status';
+        finishCandidateCheckOperation(elId, result);
+      }
       notify('检测任务取消请求已发送', 'success', 3000);
     })
     .catch(function(err) {
@@ -2081,6 +2091,7 @@ function exportNodes(fmt) {
   if (document.getElementById('f-ipchanged').checked) q += '&only_changed=1';
   if (document.getElementById('f-hide-unavail').checked) q += '&available=1';
   var text = (document.getElementById('f-text').value || '').trim(); if (text) q += '&search=' + encodeURIComponent(text);
+  var anon = (document.getElementById('f-anonymity') || {}).value || ''; if (anon) q += '&anonymity=' + encodeURIComponent(anon);
   var a = document.createElement('a');
   a.href = '/api/nodes/export?' + q;
   document.body.appendChild(a); a.click(); a.remove();
@@ -2740,6 +2751,12 @@ function saveCheckURL(button) {
     });
 }
 
+function syncAutoCheckDefault() {
+  var followDefault = document.getElementById('opt-auto-check-default');
+  var autoCheck = document.getElementById('opt-auto-check');
+  if (followDefault && autoCheck) autoCheck.disabled = followDefault.checked;
+}
+
 function syncRequireIPChangeDefault() {
   var followDefault = document.getElementById('opt-require-ip-change-default');
   var requireIPChange = document.getElementById('opt-require-ip-change');
@@ -2775,7 +2792,11 @@ function loadCheckOptions() {
     syncRequireIPChangeDefault();
     var autoCheck = document.getElementById('opt-auto-check');
     var autoInterval = document.getElementById('opt-auto-check-interval');
+    var autoCheckDefault = document.getElementById('opt-auto-check-default');
+    var isAutoCheckOverridden = overrides.auto_candidate_check != null && overrides.auto_candidate_check !== 'default';
+    if (autoCheckDefault) autoCheckDefault.checked = !isAutoCheckOverridden;
     if (autoCheck) autoCheck.checked = result.auto_candidate_check !== false;
+    syncAutoCheckDefault();
     if (autoInterval) {
       autoInterval.value = Number(overrides.auto_check_interval_seconds || 0) || '';
       autoInterval.placeholder = String(result.auto_check_interval_seconds || 0);
@@ -2814,7 +2835,11 @@ function saveCheckOptions(button) {
     source_refresh_interval_seconds: sourceRefreshSeconds,
     full_recheck_interval_seconds: fullRecheckSeconds,
     require_ip_change: followDefault ? 'default' : !!(document.getElementById('opt-require-ip-change') || {}).checked,
-    auto_candidate_check: !!(document.getElementById('opt-auto-check') || {}).checked,
+    auto_candidate_check: (function() {
+      var follow = document.getElementById('opt-auto-check-default');
+      if (follow && follow.checked) return 'default';
+      return !!(document.getElementById('opt-auto-check') || {}).checked;
+    }()),
     auto_check_interval_seconds: autoIntervalSeconds
   };
   var original = button ? button.textContent : '';
@@ -2823,8 +2848,8 @@ function saveCheckOptions(button) {
     .then(function(result) {
       var recheck = result && result.health_recheck && result.health_recheck.id;
       var message = result && result.policy_changed
-        ? '已保存；要求改IP 策略已变更，旧健康结果失效，正在全池复检。'
-        : '已保存；并发/超时/抽样从下一轮检测开始生效，来源刷新与全池复检周期将在各自下一轮调度时应用。';
+        ? '已保存；策略已变更（或超时发生变化），旧健康结果失效，正在全池复检。'
+        : '已保存；并发/抽样从下一轮检测开始生效，来源刷新与全池复检周期将在各自下一轮调度时应用。';
       if (result && result.baseline_refresh_attempted && !result.baseline_refreshed) {
         message += ' 基线刷新失败，暂保留旧基线；可稍后手动刷新。';
       }

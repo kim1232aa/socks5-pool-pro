@@ -101,22 +101,29 @@ func (s *StatusServer) endManualNodeVerify(key string) {
 	s.nodeVerifyMu.Unlock()
 }
 
-func runManualNodeVerifyChecks(ctx context.Context, operations manualNodeVerifyOperations, px Proxy, target string) (verified Proxy, reachable bool, attempts int, latencyMs int64, err error) {
+// runManualNodeVerifyChecks probes px against target, retrying up to manualNodeVerifyMaxAttempts
+// times. attemptTimeout controls the per-attempt connectivity deadline; callers derive it from
+// the operator-configured check_timeout_seconds so the manual path honours the same setting as
+// the batch-check path.
+func runManualNodeVerifyChecks(ctx context.Context, operations manualNodeVerifyOperations, px Proxy, target string, attemptTimeout time.Duration) (verified Proxy, reachable bool, attempts int, latencyMs int64, err error) {
 	verified = px
 	for attempts < manualNodeVerifyMaxAttempts {
 		if err := ctx.Err(); err != nil {
 			return verified, false, attempts, 0, err
 		}
-		attemptTimeout := manualNodeVerifyAttemptTimeout(attempts)
+		effectiveAttemptTimeout := attemptTimeout
+		if effectiveAttemptTimeout <= 0 {
+			effectiveAttemptTimeout = manualNodeVerifyAttemptTimeout(attempts)
+		}
 		attempts++
-		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, effectiveAttemptTimeout)
 		checked := verified
 		var ok bool
 		var latency time.Duration
 		if operations.checkURLCredentials != nil {
-			checked, ok, latency, _ = operations.checkURLCredentials(attemptCtx, verified, target, attemptTimeout)
+			checked, ok, latency, _ = operations.checkURLCredentials(attemptCtx, verified, target, effectiveAttemptTimeout)
 		} else if operations.checkURL != nil {
-			ok, latency = operations.checkURL(attemptCtx, verified, target, attemptTimeout)
+			ok, latency = operations.checkURL(attemptCtx, verified, target, effectiveAttemptTimeout)
 		}
 		cancel()
 		if err := ctx.Err(); err != nil {

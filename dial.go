@@ -358,7 +358,10 @@ func dialSOCKS5Context(ctx context.Context, px Proxy, target string) (result net
 	}
 	if header[1] != replySucceeded {
 		kind := UpstreamErrorTarget
-		if header[1] == replyGeneralFailure || header[1] == replyCommandNotSupported {
+		// replyGeneralFailure (0x01) means the upstream could not reach the target,
+		// not that the proxy itself is broken. Only replyCommandNotSupported (0x07)
+		// indicates a proxy-protocol incapability.
+		if header[1] == replyCommandNotSupported {
 			kind = UpstreamErrorProtocol
 		}
 		return nil, newUpstreamError(kind, "connect SOCKS5 target", fmt.Errorf("upstream status %d", header[1]))

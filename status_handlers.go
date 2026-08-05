@@ -276,10 +276,17 @@ func (s *StatusServer) handleNodeVerify(w http.ResponseWriter, r *http.Request) 
 	defer s.endManualNodeVerify(in.Key)
 
 	prevExitIP, prevCountry := px.ExitIP, px.Country
-	verifyCtx, cancel := context.WithTimeout(r.Context(), manualNodeVerifyTotalTimeout)
+	// Use the operator-configured check timeout for each attempt; derive a
+	// generous total that covers all retries plus exit-IP and geo probes.
+	configuredTimeout, _, _, _ := s.effectiveCheckOptions()
+	if configuredTimeout <= 0 {
+		configuredTimeout = manualNodeVerifyAttemptTimeout(0)
+	}
+	verifyTotal := configuredTimeout*manualNodeVerifyMaxAttempts + manualNodeVerifyRetryBackoff(manualNodeVerifyMaxAttempts) + manualNodeVerifyExitTimeout + manualNodeVerifyGeoTimeout
+	verifyCtx, cancel := context.WithTimeout(r.Context(), verifyTotal)
 	defer cancel()
 	verified, reachable, attempts, latencyMs, err := runManualNodeVerifyChecks(
-		verifyCtx, s.nodeVerifyOps, px, healthCheckURL,
+		verifyCtx, s.nodeVerifyOps, px, healthCheckURL, configuredTimeout,
 	)
 	if err != nil {
 		writeManualNodeVerifyCanceled(w, attempts, err)

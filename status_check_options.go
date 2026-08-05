@@ -135,8 +135,12 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 			writeConfigStoreError(w, err)
 			return
 		}
-		// Numeric options need no invalidation; the next cycle picks them up.
-		// A policy flip changes the meaning of every cached health verdict.
+		// A timeout change affects how strictly past health verdicts were
+		// reached; capture the old value before the store update so we can
+		// detect a real change and invalidate stale cached results.
+		oldTimeout, _, _, _ := s.effectiveCheckOptions()
+		// Numeric options (concurrency, max-candidates, intervals) need no
+		// invalidation; only a timeout change can make old verdicts wrong.
 		policyChanged := false
 		baselineRefreshAttempted := false
 		baselineRefreshed := false
@@ -161,7 +165,17 @@ func (s *StatusServer) handleCheckOptions(w http.ResponseWriter, r *http.Request
 				recheck, accepted = s.coordinator.triggerFullRecheck(s.pool)
 			}
 		}
+		// If the effective check timeout changed, cached verdicts under the old
+		// (more or less generous) deadline may no longer be accurate.
 		newTimeout, newConcurrent, newCandidates, newRequire := s.effectiveCheckOptions()
+		if !policyChanged && newTimeout != oldTimeout {
+			s.pool.InvalidateHealth(s.store.CheckURL())
+			s.pool.candidates.ResetHealthOutcomes()
+			if flushErr := s.pool.FlushCache(); flushErr == nil {
+				recheck, accepted = s.coordinator.triggerFullRecheck(s.pool)
+				policyChanged = true
+			}
+		}
 		newSourceRefresh, newFullRecheck := s.effectiveScheduleIntervals()
 		writeJSON(w, map[string]interface{}{
 			"status":                          "ok",

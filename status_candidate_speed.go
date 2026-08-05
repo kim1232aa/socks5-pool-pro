@@ -122,9 +122,13 @@ func (s *StatusServer) speedtestCandidate(ctx context.Context, key string) candi
 	}
 	s.coordinator.sourceLifecycleMu.RUnlock()
 
-	healthCtx, healthCancel := context.WithTimeout(ctx, manualNodeVerifyTotalTimeout)
+	speedCheckTimeout, _, _, _ := s.effectiveCheckOptions()
+	if speedCheckTimeout <= 0 {
+		speedCheckTimeout = manualNodeVerifyAttemptTimeout(0)
+	}
+	healthCtx, healthCancel := context.WithTimeout(ctx, speedCheckTimeout)
 	defer healthCancel()
-	healthVerified, reachable, healthErr := candidateHealthCheckContext(healthCtx, px, checkURL, manualNodeVerifyTotalTimeout)
+	healthVerified, reachable, healthErr := candidateHealthCheckContext(healthCtx, px, checkURL, speedCheckTimeout)
 	if healthErr != nil || !reachable {
 		if ctx.Err() == nil {
 			message := "candidate failed current health check criterion before speedtest"

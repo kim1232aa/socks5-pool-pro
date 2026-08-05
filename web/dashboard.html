@@ -82,6 +82,7 @@
       <label class="chk"><input type="checkbox" id="opt-require-ip-change"> 要求改IP（出口IP必须不同于入口）</label>
       <label class="chk"><input type="checkbox" id="opt-require-ip-change-default" onchange="syncRequireIPChangeDefault()" checked> 跟随命令行默认</label>
       <label class="chk"><input type="checkbox" id="opt-auto-check" checked> 候选自动批检（持续轮转候选库）</label>
+      <label class="chk"><input type="checkbox" id="opt-auto-check-default" onchange="syncAutoCheckDefault()"> 跟随命令行默认</label>
       <label class="small" for="opt-auto-check-interval">批间暂停(秒)</label><input id="opt-auto-check-interval" type="number" min="0" max="3600" step="1" inputmode="numeric">
       <button id="check-options-save" type="button" class="btn-sm" data-action="save-check-options">保存检测选项</button>
       <span class="checkurl-hint">留空/0 表示跟随命令行默认值；来源刷新与全池复检独立调度。完整全检可恢复不可用节点；连续 3 次完整全检失败后移出转发池，候选库记录仍保留。要求改IP 变更会立即失效旧健康结果并全池复检。候选自动批检默认开启，持续轮转待检候选（每批=每轮抽样规模）；批间暂停 0 表示连续检测，只影响候选批检，不会触碰失败节点。</span>

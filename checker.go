@@ -219,6 +219,7 @@ func checkURLWithDialContext(parent context.Context, testURL string, timeout tim
 	transport := &http.Transport{
 		DialContext:       dialContext,
 		DisableKeepAlives: true,
+		Proxy:             nil, // never follow host-level env proxy; use the dialer (the tested proxy) only
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
@@ -244,8 +245,30 @@ func checkURLWithDialContext(parent context.Context, testURL string, timeout tim
 	return true, nil
 }
 
+// canonicalCheckURL folds the spelling differences that leave a health target
+// semantically unchanged (surrounding space, a trailing slash, scheme/host
+// case) so a URL equal to the built-in default is still held to the default's
+// stricter 204 rule instead of slipping into the lenient custom-target branch.
+func canonicalCheckURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	separator := strings.Index(trimmed, "://")
+	if separator < 0 {
+		return strings.TrimRight(trimmed, "/")
+	}
+	origin := strings.ToLower(trimmed[:separator+3])
+	rest := trimmed[separator+3:]
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		origin += strings.ToLower(rest[:slash])
+		rest = rest[slash:]
+	} else {
+		origin += strings.ToLower(rest)
+		rest = ""
+	}
+	return strings.TrimRight(origin+rest, "/")
+}
+
 func healthResponseStatusAccepted(testURL string, status int) bool {
-	if strings.TrimSpace(testURL) == defaultCheckURL {
+	if canonicalCheckURL(testURL) == canonicalCheckURL(defaultCheckURL) {
 		return status == http.StatusNoContent
 	}
 	return status >= http.StatusOK && status < http.StatusMultipleChoices ||
@@ -273,6 +296,7 @@ func probeExitIPContext(parent context.Context, px Proxy, timeout time.Duration)
 			return DialUpstreamContext(ctx, px, addr, timeout)
 		},
 		DisableKeepAlives: true,
+		Proxy:             nil, // never follow host-level env proxy; the dialer routes through the tested proxy
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}

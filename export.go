@@ -30,6 +30,7 @@ func (s *StatusServer) collectExport(r *http.Request) []exportNode {
 	onlyChanged := q.Get("only_changed") == "1"
 	onlyAvailable := q.Get("available") == "1"
 	search := strings.ToLower(strings.TrimSpace(q.Get("search")))
+	anonymity := strings.ToLower(strings.TrimSpace(q.Get("anonymity")))
 
 	var out []exportNode
 	for _, px := range s.pool.All() {
@@ -46,6 +47,9 @@ func (s *StatusServer) collectExport(r *http.Request) []exportNode {
 			continue
 		}
 		if search != "" && !strings.Contains(strings.ToLower(px.Addr()+" "+px.ExitIP), search) {
+			continue
+		}
+		if !nodeAnonymityMatches(anonymity, strings.ToLower(px.Anonymity)) {
 			continue
 		}
 		succ, fail := s.pool.StatsOf(px.Key())

@@ -146,6 +146,26 @@ func (c *RefreshCoordinator) setCandidateCheckTotal(id string, total int) {
 	}
 }
 
+// dropCandidateCheckTotal shrinks a running operation's denominator when keys
+// enumerated up front turn out to be unleasable. Retry-all sets Total from the
+// administrator-enumerated failure list; keys deleted or re-tested before their
+// chunk leases never produce an outcome, so without this the progress bar would
+// stall short of 100% on an operation that actually finished.
+func (c *RefreshCoordinator) dropCandidateCheckTotal(id string, dropped int) {
+	if dropped <= 0 {
+		return
+	}
+	c.candidateCheckMu.Lock()
+	defer c.candidateCheckMu.Unlock()
+	if c.candidateCheckActive == nil || c.candidateCheckActive.ID != id {
+		return
+	}
+	c.candidateCheckActive.Total -= dropped
+	if c.candidateCheckActive.Total < c.candidateCheckActive.Completed {
+		c.candidateCheckActive.Total = c.candidateCheckActive.Completed
+	}
+}
+
 func (c *RefreshCoordinator) recordCandidateCheckOutcome(id string, outcome candidateCheckOutcome) {
 	if outcome.Kind == candidateCheckNoResult {
 		return
@@ -376,6 +396,11 @@ func runSingleCandidateBatch(parent context.Context, cfg *Config, store *ConfigS
 			if len(missing) > 0 {
 				coordinator.sourceLifecycleMu.RUnlock()
 				return "failed", fmt.Errorf("failed candidate keys are no longer available: %v", missing)
+			}
+			// Retry-all already counted these keys in Total up front. They will
+			// never report an outcome, so take them back out of the denominator.
+			if request.retryAll {
+				coordinator.dropCandidateCheckTotal(operationID, len(request.keys)-len(leases))
 			}
 		}
 	} else {

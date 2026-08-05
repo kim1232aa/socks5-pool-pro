@@ -252,8 +252,11 @@ func TestManualNodeVerifyRetriesUntilSuccessAndUsesSuccessfulAttemptLatency(t *t
 	if checks.Load() != 2 || exits.Load() != 1 || geos.Load() != 0 {
 		t.Fatalf("operation calls check/exit/geo = %d/%d/%d", checks.Load(), exits.Load(), geos.Load())
 	}
-	if len(attemptTimeouts) != 2 || attemptTimeouts[0] != 6*time.Second || attemptTimeouts[1] != 4*time.Second {
-		t.Fatalf("attempt timeout sequence = %v, want [6s 4s]", attemptTimeouts)
+	// All attempts now use the operator-configured check_timeout_seconds (default 10s)
+	// rather than the old hardcoded 6s/4s escalation pattern.
+	wantTimeout := 10 * time.Second
+	if len(attemptTimeouts) != 2 || attemptTimeouts[0] != wantTimeout || attemptTimeouts[1] != wantTimeout {
+		t.Fatalf("attempt timeout sequence = %v, want [%s %s]", attemptTimeouts, wantTimeout, wantTimeout)
 	}
 	updated, ok := pool.Find(px.Key())
 	if !ok || !updated.Available || updated.LatencyMs != 137 {
@@ -293,8 +296,10 @@ func TestManualNodeVerifyAllAttemptsFailAsOneHealthObservation(t *testing.T) {
 	if checks.Load() != 3 || exits.Load() != 0 {
 		t.Fatalf("all-failed calls check/exit = %d/%d", checks.Load(), exits.Load())
 	}
-	if len(attemptTimeouts) != 3 || attemptTimeouts[0] != 6*time.Second || attemptTimeouts[1] != 4*time.Second || attemptTimeouts[2] != 4*time.Second {
-		t.Fatalf("attempt timeout sequence = %v, want [6s 4s 4s]", attemptTimeouts)
+	// All attempts use the operator-configured check_timeout_seconds (default 10s).
+	wantTimeout2 := 10 * time.Second
+	if len(attemptTimeouts) != 3 || attemptTimeouts[0] != wantTimeout2 || attemptTimeouts[1] != wantTimeout2 || attemptTimeouts[2] != wantTimeout2 {
+		t.Fatalf("attempt timeout sequence = %v, want [%s %s %s]", attemptTimeouts, wantTimeout2, wantTimeout2, wantTimeout2)
 	}
 	updated, ok := pool.Find(px.Key())
 	if !ok || updated.Available || !updated.HealthInvalidated || updated.LatencyMs != 321 {

@@ -325,7 +325,9 @@ func TestDialUpstreamClassifiesSOCKSConnectFailures(t *testing.T) {
 		wantKind      UpstreamErrorKind
 		affectsHealth bool
 	}{
-		{name: "general upstream failure", reply: replyGeneralFailure, wantKind: UpstreamErrorProtocol, affectsHealth: true},
+		// 0x01 is the catch-all an upstream returns when it could not reach the
+		// target; it is target-scoped and must not count against proxy health.
+		{name: "general upstream failure", reply: replyGeneralFailure, wantKind: UpstreamErrorTarget},
 		{name: "command unsupported", reply: replyCommandNotSupported, wantKind: UpstreamErrorProtocol, affectsHealth: true},
 		{name: "network unreachable", reply: replyNetworkUnreachable, wantKind: UpstreamErrorTarget},
 		{name: "host unreachable", reply: replyHostUnreachable, wantKind: UpstreamErrorTarget},
