@@ -89,6 +89,10 @@ type Source struct {
 	AutoRefreshEnabled     bool   `json:"auto_refresh_enabled"`
 	RefreshIntervalSeconds int    `json:"refresh_interval_seconds"`
 	Builtin                bool   `json:"builtin"`
+	// FetchViaPool instructs the scraper to route this source's HTTP request
+	// through a randomly-selected healthy pool proxy instead of connecting
+	// directly. Useful for endpoints that block datacenter/non-residential IPs.
+	FetchViaPool           bool   `json:"fetch_via_pool,omitempty"`
 	Note                   string `json:"note,omitempty"`
 	autoRefreshMissing     bool
 	revision               uint64
@@ -680,6 +684,62 @@ func defaultPoolConfig() PoolConfig {
 				URL:      "https://raw.githubusercontent.com/proxygenerator1/ProxyGenerator/main/MostStable/socks5.txt",
 				Format:   FormatPlainList,
 				Protocol: "socks5",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:           "builtin-proxyscrape-v4-socks5",
+				Name:         "ProxyScrape v4 API SOCKS5",
+				URL:          "https://api.proxyscrape.com/v4/free-proxy-list/get?request=get_proxies&protocol=socks5&proxy_format=ipport&format=text&timeout=20000",
+				Format:       FormatPlainList,
+				Protocol:     "socks5",
+				Enabled:      true,
+				Builtin:      true,
+				FetchViaPool: true,
+			},
+			{
+				ID:           "builtin-proxyscrape-v4-http",
+				Name:         "ProxyScrape v4 API HTTP",
+				URL:          "https://api.proxyscrape.com/v4/free-proxy-list/get?request=get_proxies&protocol=http&proxy_format=ipport&format=text&timeout=20000",
+				Format:       FormatPlainList,
+				Protocol:     "http",
+				Enabled:      true,
+				Builtin:      true,
+				FetchViaPool: true,
+			},
+			{
+				ID:       "builtin-openproxylist-socks5",
+				Name:     "openproxylist.xyz SOCKS5",
+				URL:      "https://api.openproxylist.xyz/socks5.txt",
+				Format:   FormatPlainList,
+				Protocol: "socks5",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:       "builtin-openproxylist-http",
+				Name:     "openproxylist.xyz HTTP",
+				URL:      "https://api.openproxylist.xyz/http.txt",
+				Format:   FormatPlainList,
+				Protocol: "http",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:       "builtin-rdavydov-socks5",
+				Name:     "rdavydov SOCKS5",
+				URL:      "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+				Format:   FormatPlainList,
+				Protocol: "socks5",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:       "builtin-rdavydov-http",
+				Name:     "rdavydov HTTP",
+				URL:      "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+				Format:   FormatPlainList,
+				Protocol: "http",
 				Enabled:  true,
 				Builtin:  true,
 			},

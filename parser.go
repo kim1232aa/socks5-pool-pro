@@ -85,6 +85,13 @@ func FetchSource(src Source) ([]Proxy, error) {
 }
 
 func FetchSourceContext(parent context.Context, src Source) ([]Proxy, error) {
+	return fetchSourceContextWithPicker(parent, src, nil)
+}
+
+// fetchSourceContextWithPicker is the internal entry point used by
+// FetchSourceViaPool. picker, when non-nil, is called to obtain a live proxy
+// that the HTTP transport should dial through.
+func fetchSourceContextWithPicker(parent context.Context, src Source, picker func() (Proxy, bool)) ([]Proxy, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -97,7 +104,7 @@ func FetchSourceContext(parent context.Context, src Source) ([]Proxy, error) {
 		return nil, fmt.Errorf("source fetch queue is full: %w", queueCtx.Err())
 	}
 
-	client, transport, err := newSourceHTTPClient(src)
+	client, transport, err := newSourceHTTPClient(src, picker)
 	if err != nil {
 		return nil, err
 	}
@@ -112,13 +119,27 @@ type sourceIPResolver interface {
 	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
 }
 
-func newSourceHTTPClient(src Source) (*http.Client, *http.Transport, error) {
+func newSourceHTTPClient(src Source, picker func() (Proxy, bool)) (*http.Client, *http.Transport, error) {
 	if _, err := validateSourceURL(src.URL, src.AllowPrivate); err != nil {
 		return nil, nil, err
 	}
+	var dialCtx func(context.Context, string, string) (net.Conn, error)
+	if picker != nil {
+		// Pick per connection rather than per client: retries rotate away from a
+		// failed pool node instead of repeating the same broken route.
+		dialCtx = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			px, ok := picker()
+			if !ok {
+				return nil, fmt.Errorf("source requires pool routing but no healthy proxy is available")
+			}
+			return DialUpstreamContext(ctx, px, addr, sourceFetchAttemptTimeout)
+		}
+	} else {
+		dialCtx = guardedSourceDialContext(net.DefaultResolver, src.AllowPrivate)
+	}
 	transport := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           guardedSourceDialContext(net.DefaultResolver, src.AllowPrivate),
+		Proxy:                 nil, // never follow host-level env proxy
+		DialContext:           dialCtx,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          2,
 		MaxIdleConnsPerHost:   1,

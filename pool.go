@@ -1662,6 +1662,25 @@ func (p *ProxyPool) AvailableCount() int {
 	return count
 }
 
+// RandomHealthyProxy returns a randomly selected healthy (available and not
+// retired) proxy from the current pool snapshot. It is used to route source
+// fetches through the pool when Source.FetchViaPool is set. Returns ok=false
+// when the pool is empty or no healthy proxy exists.
+func (p *ProxyPool) RandomHealthyProxy() (Proxy, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	candidates := make([]Proxy, 0, len(p.proxies))
+	for _, px := range p.proxies {
+		if !px.SourceRetired && px.Available {
+			candidates = append(candidates, px)
+		}
+	}
+	if len(candidates) == 0 {
+		return Proxy{}, false
+	}
+	return cloneProxy(candidates[rand.Intn(len(candidates))]), true
+}
+
 func (p *ProxyPool) All() []Proxy {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

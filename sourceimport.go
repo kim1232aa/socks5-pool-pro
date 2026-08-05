@@ -103,12 +103,16 @@ func (cs *ConfigStore) ImportSource(name string, reader io.Reader) (Source, int,
 // LoadSourceContext dispatches source loading by persisted kind. Legacy empty
 // kinds remain remote feeds; uploaded sources never enter the HTTP fetch path.
 func (cs *ConfigStore) LoadSourceContext(ctx context.Context, source Source) ([]Proxy, error) {
+	return cs.loadSourceContextWithPicker(ctx, source, nil)
+}
+
+func (cs *ConfigStore) loadSourceContextWithPicker(ctx context.Context, source Source, picker func() (Proxy, bool)) ([]Proxy, error) {
 	kind := strings.ToLower(strings.TrimSpace(source.Kind))
 	if kind == "" {
 		kind = SourceKindRemote
 	}
 	if kind == SourceKindRemote {
-		return FetchSourceContext(ctx, source)
+		return fetchSourceContextWithPicker(ctx, source, picker)
 	}
 	if kind != SourceKindUpload {
 		return nil, fmt.Errorf("unknown source kind: %q", kind)

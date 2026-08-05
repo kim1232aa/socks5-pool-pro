@@ -746,7 +746,11 @@ func refreshPoolContext(ctx context.Context, cfg *Config, store *ConfigStore, po
 		go func() {
 			defer wg.Done()
 			for src := range jobs {
-				proxies, err := store.LoadSourceContext(ctx, src)
+				var picker func() (Proxy, bool)
+				if src.FetchViaPool {
+					picker = pool.RandomHealthyProxy
+				}
+				proxies, err := store.loadSourceContextWithPicker(ctx, src, picker)
 				if err != nil {
 					log.Printf("[error] scrape %s failed: %v", src.Name, err)
 					mu.Lock()
@@ -949,7 +953,13 @@ func refreshSourceContext(ctx context.Context, cfg *Config, store *ConfigStore, 
 	}
 	coordinator.sourceLifecycleMu.RUnlock()
 
-	proxies, err := store.LoadSourceContext(ctx, source)
+	// If the source requests pool-proxy routing, build a picker that pulls a
+	// random live proxy from the current pool snapshot.
+	var picker func() (Proxy, bool)
+	if source.FetchViaPool {
+		picker = pool.RandomHealthyProxy
+	}
+	proxies, err := store.loadSourceContextWithPicker(ctx, source, picker)
 	if err != nil {
 		if ctx.Err() != nil {
 			return refreshRunResult{Status: "cancelled", Error: ctx.Err().Error()}
