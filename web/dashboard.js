@@ -1566,7 +1566,7 @@ function finishCandidateCheckOperation(statusElId, operation) {
   if (operation.status === 'failed') { summary = '检测任务失败' + (operation.error ? '：' + operation.error : '。'); tone = 'error'; }
   else if (operation.status === 'cancelled') { summary = '检测任务已取消' + (operation.error ? '：' + operation.error : '。'); tone = 'error'; }
   else if (operation.status === 'superseded') { summary = '检测任务被更新的配置取代，结果未应用。'; tone = 'error'; }
-  setText(statusElId, summary);
+  renderCandidateCheckOperation(statusElId, operation);
   notify(summary, tone, 7000);
   refreshAfterCandidateCheck();
 }

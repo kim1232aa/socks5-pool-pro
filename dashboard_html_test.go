@@ -718,6 +718,7 @@ func TestDashboardExposesAutoCandidateCheckOptions(t *testing.T) {
 		`function cancelCandidateCheck()`,
 		`case 'cancel-candidate-check': cancelCandidateCheck(); break;`,
 		`task-panel-bar`,
+		`renderCandidateCheckOperation(statusElId, operation);`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing automatic candidate check option contract %q", want)

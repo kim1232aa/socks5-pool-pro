@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -326,5 +329,65 @@ func TestRetryableNetworkErrorIncludesDNSErrors(t *testing.T) {
 	}
 	if !isRetryableNetworkError(err) {
 		t.Fatalf("DNS error should be retryable: %v", err)
+	}
+}
+
+func TestNewSourceHTTPClientUsesCredentialCandidatesWhenPickerIsSet(t *testing.T) {
+	var connectAttempts atomic.Int32
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for i := 0; i < 2; i++ {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				if _, readErr := http.ReadRequest(bufio.NewReader(conn)); readErr != nil {
+					return
+				}
+				if connectAttempts.Add(1) == 1 {
+					_, _ = io.WriteString(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+					return
+				}
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+			}(conn)
+		}
+	}()
+
+	px := Proxy{
+		Protocol:  "http",
+		IP:        "127.0.0.1",
+		Port:      strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
+		Available: true,
+		Username:  "wrong-user",
+		Password:  "wrong-pass",
+		CredentialAlternates: []ProxyCredential{
+			{Username: "right-user", Password: "right-pass"},
+		},
+	}
+	pool := NewProxyPool()
+	pool.Prime([]Proxy{px}, nil)
+	picker := func() (Proxy, bool) { return pool.RandomHealthyProxy() }
+
+	_, transport, err := newSourceHTTPClient(Source{URL: "http://source.test/list"}, picker)
+	if err != nil {
+		t.Fatalf("newSourceHTTPClient() error = %v", err)
+	}
+	defer transport.CloseIdleConnections()
+
+	conn, err := transport.DialContext(context.Background(), "tcp", "example.test:443")
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	_ = conn.Close()
+
+	if got := connectAttempts.Load(); got < 2 {
+		t.Fatalf("CONNECT attempts = %d, want at least 2 (407 then alternate credential success)", got)
 	}
 }

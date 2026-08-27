@@ -1422,3 +1422,33 @@ func TestClearUnavailableDoesNotBlockUpdateDuringPersistence(t *testing.T) {
 		t.Fatalf("durable pool lost concurrent update: %#v", forwarding)
 	}
 }
+
+func TestRandomHealthyProxySkipsUnroutableNodes(t *testing.T) {
+	policyExcluded := testProxy("socks5", "192.0.2.231", "1080", true)
+	policyExcluded.PolicyExcluded = true
+	invalidated := testProxy("socks5", "192.0.2.232", "1080", true)
+	invalidated.HealthInvalidated = true
+	retired := testProxy("socks5", "192.0.2.233", "1080", true)
+	retired.SourceRetired = true
+	unavailable := testProxy("socks5", "192.0.2.234", "1080", false)
+	proxyip := testProxy("proxyip", "192.0.2.235", "443", true)
+
+	p := NewProxyPool()
+	p.Prime([]Proxy{policyExcluded, invalidated, retired, unavailable, proxyip}, nil)
+
+	if got, ok := p.RandomHealthyProxy(); ok {
+		t.Fatalf("RandomHealthyProxy() = (%v, true) when only unroutable nodes exist, want ok=false", got.Key())
+	}
+
+	healthy := testProxy("socks5", "192.0.2.236", "1080", true)
+	p.Prime([]Proxy{policyExcluded, invalidated, retired, unavailable, proxyip, healthy}, nil)
+	for i := 0; i < 32; i++ {
+		got, ok := p.RandomHealthyProxy()
+		if !ok {
+			t.Fatalf("RandomHealthyProxy() iteration %d returned ok=false with a healthy node present", i)
+		}
+		if got.Key() != healthy.Key() {
+			t.Fatalf("RandomHealthyProxy() iteration %d returned %q, want healthy node %q", i, got.Key(), healthy.Key())
+		}
+	}
+}

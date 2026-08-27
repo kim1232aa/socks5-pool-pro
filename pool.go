@@ -1662,16 +1662,18 @@ func (p *ProxyPool) AvailableCount() int {
 	return count
 }
 
-// RandomHealthyProxy returns a randomly selected healthy (available and not
-// retired) proxy from the current pool snapshot. It is used to route source
-// fetches through the pool when Source.FetchViaPool is set. Returns ok=false
-// when the pool is empty or no healthy proxy exists.
+// RandomHealthyProxy returns a randomly selected healthy forwarding proxy from
+// the current pool snapshot. It is used to route source fetches through the
+// pool when Source.FetchViaPool is set. Only nodes that would also be eligible
+// for client routing are considered, so policy-excluded, health-invalidated,
+// retired, and non-forwarding entries cannot be selected. Returns ok=false
+// when no such proxy exists.
 func (p *ProxyPool) RandomHealthyProxy() (Proxy, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	candidates := make([]Proxy, 0, len(p.proxies))
 	for _, px := range p.proxies {
-		if !px.SourceRetired && px.Available {
+		if px.Available && proxyHardRoutable(px) && isForwardingProtocol(px.Protocol) {
 			candidates = append(candidates, px)
 		}
 	}

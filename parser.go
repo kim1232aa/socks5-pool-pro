@@ -132,7 +132,21 @@ func newSourceHTTPClient(src Source, picker func() (Proxy, bool)) (*http.Client,
 			if !ok {
 				return nil, fmt.Errorf("source requires pool routing but no healthy proxy is available")
 			}
-			return DialUpstreamContext(ctx, px, addr, sourceFetchAttemptTimeout)
+			timeout := sourceFetchAttemptTimeout
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					return nil, context.DeadlineExceeded
+				}
+				if remaining < timeout {
+					timeout = remaining
+				}
+			}
+			conn, _, err := DialUpstreamCredentialCandidatesContext(ctx, px, addr, timeout)
+			return conn, err
 		}
 	} else {
 		dialCtx = guardedSourceDialContext(net.DefaultResolver, src.AllowPrivate)
