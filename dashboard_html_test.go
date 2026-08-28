@@ -80,7 +80,7 @@ func TestDashboardCandidatePageShowsOnlyPendingWithSimpleFilters(t *testing.T) {
 		`id="cf-source"`,
 		`id="cf-proto"`,
 		`id="cf-pagesize"`,
-		`正式检查失败的候选会移入失败节点页`,
+		`策略排除的候选会移入失败节点页`,
 	} {
 		if !strings.Contains(dashboardHTML, want) {
 			t.Fatalf("dashboard is missing pending-candidate filter contract %q", want)
@@ -455,7 +455,7 @@ func TestDashboardCandidateManagementKeepsPendingColumnShape(t *testing.T) {
 		`data-action="candidate-delete-selected"`,
 		`fetchJSON('/api/candidates/speedtest'`,
 		`fetchJSON('/api/candidates/delete'`,
-		`人工测速不受冷却限制；成功后立即加入转发池，正式检查失败的会移入失败节点页。`,
+		`人工测速不受冷却限制；成功后立即加入转发池。策略排除会移入失败节点页，连通失败不会进入转发池。`,
 	} {
 		if !strings.Contains(dashboardClientSource(), want) {
 			t.Fatalf("dashboard is missing candidate management contract %q", want)

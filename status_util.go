@@ -473,39 +473,41 @@ func strictV1PageParams(r *http.Request) (page, pageSize int, err error) {
 // /api/status response retains the registration-client contract; dashboard
 // polling only needs counters and group state.
 type compactStatusSummary struct {
-	Total                 int         `json:"total"`
-	ProxyIPTotal          int         `json:"proxyip_total"`
-	LastScrape            string      `json:"last_scrape"`
-	NextScrape            string      `json:"next_scrape"`
-	LastScrapeAt          string      `json:"last_scrape_at,omitempty"`
-	NextScrapeAt          string      `json:"next_scrape_at,omitempty"`
-	LastSourceRefresh     string      `json:"last_source_refresh"`
-	NextSourceRefresh     string      `json:"next_source_refresh"`
-	LastSourceRefreshAt   string      `json:"last_source_refresh_at,omitempty"`
-	NextSourceRefreshAt   string      `json:"next_source_refresh_at,omitempty"`
-	LastFullRecheck       string      `json:"last_full_recheck"`
-	NextFullRecheck       string      `json:"next_full_recheck"`
-	LastFullRecheckAt     string      `json:"last_full_recheck_at,omitempty"`
-	NextFullRecheckAt     string      `json:"next_full_recheck_at,omitempty"`
-	Groups                []GroupView `json:"groups"`
-	ActiveProxy           string      `json:"active_proxy"`
-	AvailableTotal        int         `json:"available_total"`
-	UnavailableTotal      int         `json:"unavailable_total"`
-	HealthRecheckPending  bool        `json:"health_recheck_pending"`
-	Scrape                ScrapeInfo  `json:"scrape"`
-	CandidateTotal        int         `json:"candidate_total"`
-	FailedCandidateTotal  int         `json:"failed_candidate_total"`
-	CandidatePhase        string      `json:"candidate_phase"`
-	CandidateSourceErrors int         `json:"candidate_source_errors"`
-	CandidateUpdatedAt    string      `json:"candidate_updated_at,omitempty"`
+	Total                    int         `json:"total"`
+	ProxyIPTotal             int         `json:"proxyip_total"`
+	LastScrape               string      `json:"last_scrape"`
+	NextScrape               string      `json:"next_scrape"`
+	LastScrapeAt             string      `json:"last_scrape_at,omitempty"`
+	NextScrapeAt             string      `json:"next_scrape_at,omitempty"`
+	LastSourceRefresh        string      `json:"last_source_refresh"`
+	NextSourceRefresh        string      `json:"next_source_refresh"`
+	LastSourceRefreshAt      string      `json:"last_source_refresh_at,omitempty"`
+	NextSourceRefreshAt      string      `json:"next_source_refresh_at,omitempty"`
+	LastFullRecheck          string      `json:"last_full_recheck"`
+	NextFullRecheck          string      `json:"next_full_recheck"`
+	LastFullRecheckAt        string      `json:"last_full_recheck_at,omitempty"`
+	NextFullRecheckAt        string      `json:"next_full_recheck_at,omitempty"`
+	Groups                   []GroupView `json:"groups"`
+	ActiveProxy              string      `json:"active_proxy"`
+	AvailableTotal           int         `json:"available_total"`
+	UnavailableTotal         int         `json:"unavailable_total"`
+	HealthRecheckPending     bool        `json:"health_recheck_pending"`
+	Scrape                   ScrapeInfo  `json:"scrape"`
+	CandidateTotal           int         `json:"candidate_total"`
+	FailedCandidateTotal     int         `json:"failed_candidate_total"`
+	IsolatedUnreachableTotal int         `json:"isolated_unreachable_total"`
+	CandidatePhase           string      `json:"candidate_phase"`
+	CandidateSourceErrors    int         `json:"candidate_source_errors"`
+	CandidateUpdatedAt       string      `json:"candidate_updated_at,omitempty"`
 }
 
 type compactCandidateSummary struct {
-	Total        int
-	FailedTotal  int
-	Phase        string
-	SourceErrors int
-	UpdatedAt    string
+	Total                    int
+	FailedTotal              int
+	IsolatedUnreachableTotal int
+	Phase                    string
+	SourceErrors             int
+	UpdatedAt                string
 }
 
 func (s *StatusServer) compactCandidateStatus() compactCandidateSummary {
@@ -525,8 +527,9 @@ func (s *StatusServer) compactCandidateStatus() compactCandidateSummary {
 			pending++
 		}
 	}
+	retryable, isolated := countRetryableFailedRecords(snapshot.failedRecords)
 	return compactCandidateSummary{
-		Total: pending, FailedTotal: len(snapshot.failedRecords), Phase: snapshot.phase,
+		Total: pending, FailedTotal: retryable, IsolatedUnreachableTotal: isolated, Phase: snapshot.phase,
 		SourceErrors: snapshot.sourceErrors, UpdatedAt: formatCandidateTime(snapshot.seenAt),
 	}
 }

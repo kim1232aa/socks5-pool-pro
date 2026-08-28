@@ -82,6 +82,28 @@ func (k CandidateFailureKind) String() string {
 	return "unreachable"
 }
 
+// failedCandidateRetryable reports whether a durable failure is shown on the
+// failed-nodes page and included in administrator retry. Unreachable first-check
+// results remain in failedRecords so later scrapes do not requeue them into
+// pending, but they are not a retry queue: public feeds would otherwise dump
+// hundreds of thousands of dead addresses onto that page.
+func failedCandidateRetryable(kind CandidateFailureKind) bool {
+	return kind == candidateFailurePolicyFiltered
+}
+
+func countRetryableFailedRecords(failures []candidateFailureRecord) (retryable, isolatedUnreachable int) {
+	for _, failure := range failures {
+		if failedCandidateRetryable(failure.kind) {
+			retryable++
+			continue
+		}
+		if failure.kind == candidateFailureUnreachable {
+			isolatedUnreachable++
+		}
+	}
+	return retryable, isolatedUnreachable
+}
+
 type candidateFailureRecord struct {
 	candidateRecord
 	kind      CandidateFailureKind
@@ -426,6 +448,9 @@ func (c *CandidateCatalog) FailedKeys() []string {
 	defer snapshot.mu.RUnlock()
 	keys := make([]string, 0, len(snapshot.failedRecords))
 	for _, failure := range snapshot.failedRecords {
+		if !failedCandidateRetryable(failure.kind) {
+			continue
+		}
 		keys = append(keys, snapshot.protocols[failure.protocolID]+"://"+failure.addr)
 	}
 	return keys
@@ -2070,17 +2095,18 @@ type FailedCandidateView struct {
 }
 
 type FailedCandidatePageResponse struct {
-	FailedCandidates []FailedCandidateView `json:"failed_candidates"`
-	SnapshotID       string                `json:"snapshot_id"`
-	Page             int                   `json:"page"`
-	PageSize         int                   `json:"page_size"`
-	PageCount        int                   `json:"page_count"`
-	HasNext          bool                  `json:"has_next"`
-	FilteredTotal    int                   `json:"filtered_total"`
-	FailedTotal      int                   `json:"failed_total"`
-	Sources          []CandidateFacet      `json:"sources"`
-	Protocols        []CandidateFacet      `json:"protocols"`
-	FailureTypes     []CandidateFacet      `json:"failure_types"`
+	FailedCandidates         []FailedCandidateView `json:"failed_candidates"`
+	SnapshotID               string                `json:"snapshot_id"`
+	Page                     int                   `json:"page"`
+	PageSize                 int                   `json:"page_size"`
+	PageCount                int                   `json:"page_count"`
+	HasNext                  bool                  `json:"has_next"`
+	FilteredTotal            int                   `json:"filtered_total"`
+	FailedTotal              int                   `json:"failed_total"`
+	IsolatedUnreachableTotal int                   `json:"isolated_unreachable_total"`
+	Sources                  []CandidateFacet      `json:"sources"`
+	Protocols                []CandidateFacet      `json:"protocols"`
+	FailureTypes             []CandidateFacet      `json:"failure_types"`
 }
 
 type ProxyIPPageResponse struct {
@@ -2236,13 +2262,16 @@ func (s *StatusServer) buildFailedCandidatePage(r *http.Request) FailedCandidate
 	failureType := strings.TrimSpace(r.URL.Query().Get("failure_type"))
 	snapshotID := formatCandidateSnapshotID(snapshot.generation, snapshot.revision, 0)
 	filteredTotal := 0
-	failedTotal := len(snapshot.failedRecords)
+	failedTotal, isolatedUnreachable := countRetryableFailedRecords(snapshot.failedRecords)
 	sourceCounts := make(map[string]int)
 	protocolCounts := make(map[string]int)
 	failureTypeCounts := make(map[string]int)
 	start := (page - 1) * pageSize
 	rows := make([]FailedCandidateView, 0, pageSize)
 	for _, failure := range snapshot.failedRecords {
+		if !failedCandidateRetryable(failure.kind) {
+			continue
+		}
 		kind := failure.kind.String()
 		protocolCounts[snapshot.protocols[failure.protocolID]]++
 		failureTypeCounts[kind]++
@@ -2265,6 +2294,9 @@ func (s *StatusServer) buildFailedCandidatePage(r *http.Request) FailedCandidate
 		rows = rows[:0]
 		matched := 0
 		for _, failure := range snapshot.failedRecords {
+			if !failedCandidateRetryable(failure.kind) {
+				continue
+			}
 			kind := failure.kind.String()
 			if !filter.matchesBase(snapshot, failure.candidateRecord) || failureType != "" && !strings.EqualFold(failureType, kind) {
 				continue
@@ -2284,7 +2316,8 @@ func (s *StatusServer) buildFailedCandidatePage(r *http.Request) FailedCandidate
 	return FailedCandidatePageResponse{
 		FailedCandidates: rows, SnapshotID: snapshotID, Page: page, PageSize: pageSize,
 		PageCount: pageCount, HasNext: page < pageCount, FilteredTotal: filteredTotal, FailedTotal: failedTotal,
-		Sources: candidateMapFacets(sourceCounts), Protocols: candidateMapFacets(protocolCounts),
+		IsolatedUnreachableTotal: isolatedUnreachable,
+		Sources:                  candidateMapFacets(sourceCounts), Protocols: candidateMapFacets(protocolCounts),
 		FailureTypes: candidateMapFacets(failureTypeCounts),
 	}
 }

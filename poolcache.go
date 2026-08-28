@@ -96,6 +96,9 @@ func (c *poolCache) loadWithHealthState() (forwarding, proxyip []Proxy, stats ma
 	if reset := normalizeCompletedCachedHealthState(&f); reset > 0 {
 		log.Printf("[cache] normalized %d completed health-recheck state(s)", reset)
 	}
+	if removedTerminal := filterTerminalFailedPoolCacheNodes(&f); removedTerminal > 0 {
+		log.Printf("[cache] dropped %d terminally failed forwarding node(s)", removedTerminal)
+	}
 	if f.AnonymityClassificationVersion < anonymityClassificationVersion {
 		cleared := clearCachedAnonymity(&f)
 		f.AnonymityClassificationVersion = anonymityClassificationVersion
@@ -113,7 +116,7 @@ func (c *poolCache) loadWithHealthState() (forwarding, proxyip []Proxy, stats ma
 // normalizeCompletedCachedHealthState distinguishes the old transient
 // HealthInvalidated marker from the terminal state now persisted in nodeStats.
 // Old caches decode the new terminal field as false and retain their historical
-// normalization; terminal failures keep the hard-routing mirror across restart.
+// normalization. Terminal failures are then dropped from the forwarding pool.
 func clearCachedAnonymity(f *poolCacheFile) int {
 	if f == nil {
 		return 0
@@ -153,6 +156,28 @@ func normalizeCompletedCachedHealthState(f *poolCacheFile) int {
 	return reset
 }
 
+// filterTerminalFailedPoolCacheNodes drops connectivity failures that older
+// versions retained as terminal forwarding history. Failed nodes belong in
+// the candidate catalog, not the live pool, including across restart.
+func filterTerminalFailedPoolCacheNodes(f *poolCacheFile) int {
+	if f == nil {
+		return 0
+	}
+	retained := f.Proxies[:0]
+	removed := 0
+	for _, px := range f.Proxies {
+		stats, ok := f.Stats[px.Key()]
+		if ok && stats.HealthFailureTerminal {
+			removed++
+			delete(f.Stats, px.Key())
+			continue
+		}
+		retained = append(retained, px)
+	}
+	f.Proxies = retained
+	return removed
+}
+
 // filterNonPublicPoolCacheNodes prevents pre-upgrade private or special-use
 // literals from becoming routable immediately after restart. It is deliberately
 // a per-node migration: one stale row must not discard the rest of a usable
@@ -163,7 +188,7 @@ func filterNonPublicPoolCacheNodes(f *poolCacheFile) (removedForwarding, removed
 		removed := 0
 		for _, px := range nodes {
 			ip := net.ParseIP(strings.TrimSpace(px.IP))
-			drop := ip != nil && !isPublicInternetIP(ip)
+			drop := ip != nil && (!isPublicInternetIP(ip) || (!proxyIP && isUnusableForwardingEndpointIP(ip)))
 			if proxyIP {
 				drop = drop || ip == nil || strings.TrimSpace(px.Port) != "443"
 			}

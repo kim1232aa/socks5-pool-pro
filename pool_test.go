@@ -501,8 +501,8 @@ func TestUpdateKeepsProtocolsAtSameAddressIndependent(t *testing.T) {
 	freshHTTP.LatencyMs = 75
 	p.Update([]Proxy{freshHTTP}, map[string]bool{socksProxy.Key(): true})
 
-	if p.Size() != 2 {
-		t.Fatalf("same-address protocol variants collapsed; size=%d", p.Size())
+	if p.Size() != 1 {
+		t.Fatalf("failed SOCKS variant was not dropped independently; size=%d", p.Size())
 	}
 	gotHTTP, ok := p.Find(httpProxy.Key())
 	if !ok || !gotHTTP.Available || gotHTTP.Country != "CA" || gotHTTP.LatencyMs != 75 {
@@ -511,10 +511,11 @@ func TestUpdateKeepsProtocolsAtSameAddressIndependent(t *testing.T) {
 	if p.EligibleForAutoRecheck(gotHTTP) {
 		t.Fatal("successful HTTP variant did not enter cooldown")
 	}
-	gotSOCKS, ok := p.Find(socksProxy.Key())
-	st := p.stats[socksProxy.Key()]
-	if !ok || gotSOCKS.Available || !gotSOCKS.HealthInvalidated || gotSOCKS.Country != "JP" || !st.HealthFailureTerminal || st.ConsecutiveHealthFailures != 1 {
-		t.Fatalf("SOCKS terminal failure affected wrong variant or lost data: proxy=%+v stats=%+v ok=%v", gotSOCKS, st, ok)
+	if _, ok := p.Find(socksProxy.Key()); ok {
+		t.Fatal("failed SOCKS variant remained in forwarding pool")
+	}
+	if _, ok := p.stats[socksProxy.Key()]; ok {
+		t.Fatal("failed SOCKS variant left terminal stats")
 	}
 }
 
@@ -524,21 +525,11 @@ func TestUpdateTerminalFailureRequiresManualRecoveryAndFailedNewCandidateStaysOu
 	p.Prime([]Proxy{known}, nil)
 
 	p.Update(nil, map[string]bool{known.Key(): true})
-	got, _ := p.Find(known.Key())
-	if got.Available || !got.HealthInvalidated || !p.stats[known.Key()].HealthFailureTerminal {
-		t.Fatalf("refresh failure was not terminal: proxy=%+v stats=%+v", got, p.stats[known.Key()])
+	if _, ok := p.Find(known.Key()); ok {
+		t.Fatal("unreachable known node remained in forwarding pool")
 	}
-
-	fresh := known
-	fresh.Available = false
-	fresh.LatencyMs = 42
-	p.Update([]Proxy{fresh}, nil)
-	got, _ = p.Find(known.Key())
-	if got.Available || !p.stats[known.Key()].HealthFailureTerminal {
-		t.Fatalf("automatic refresh recovered terminal node: proxy=%+v stats=%+v", got, p.stats[known.Key()])
-	}
-	if p.stats[known.Key()].Successes != 0 || p.stats[known.Key()].Failures != 0 {
-		t.Fatalf("refresh unexpectedly changed forwarding counters: %+v", p.stats[known.Key()])
+	if _, ok := p.stats[known.Key()]; ok {
+		t.Fatal("removed unreachable node left terminal stats")
 	}
 
 	unknown := testProxy("socks5", "192.0.2.27", "1080", false)
@@ -549,6 +540,55 @@ func TestUpdateTerminalFailureRequiresManualRecoveryAndFailedNewCandidateStaysOu
 	if _, ok := p.stats[unknown.Key()]; ok {
 		t.Fatal("failed new candidate created orphan health stats")
 	}
+}
+
+func TestUpdateDropsUnreachableNodesAndDoesNotAdmitEmptySourceFailures(t *testing.T) {
+	p := NewProxyPool()
+	source := Source{ID: "builtin-fyvri-http", Name: "Fyvri HTTP", Enabled: true}
+	deadA := testProxy("http", "8.8.8.187", "80", true)
+	deadA.SourceIDs = []string{source.ID}
+	deadA.SourceNames = []string{source.Name}
+	deadB := testProxy("http", "8.8.8.188", "80", true)
+	deadB.SourceIDs = []string{source.ID}
+	deadB.SourceNames = []string{source.Name}
+	keep := testProxy("http", "8.8.8.20", "8080", true)
+	keep.SourceIDs = []string{"other"}
+	keep.SourceNames = []string{"Other"}
+	other := Source{ID: "other", Name: "Other", Enabled: true}
+	p.Prime([]Proxy{deadA, keep}, nil)
+	p.groupState[GroupAny] = &groupCursor{stickyKey: deadA.Key(), lastPicked: deadA.Key(), pinned: true}
+
+	if !p.UpdateWithEnabledSourcesAndPolicy(nil, map[string]bool{deadA.Key(): true, deadB.Key(): true}, nil, []Source{source, other}, p.HealthGeneration()) {
+		t.Fatal("current-generation empty-source failure was rejected")
+	}
+	if _, ok := p.Find(deadA.Key()); ok {
+		t.Fatal("previously pooled unreachable node remained in forwarding pool")
+	}
+	if _, ok := p.stats[deadA.Key()]; ok {
+		t.Fatal("removed unreachable node left terminal stats that would block later revival")
+	}
+	if _, ok := p.Find(deadB.Key()); ok {
+		t.Fatal("never-alive failed candidate from empty source was admitted")
+	}
+	got, ok := p.Find(keep.Key())
+	if !ok || !got.Available {
+		t.Fatalf("unrelated healthy node = %+v ok=%v", got, ok)
+	}
+	if cursor := p.groupState[GroupAny]; cursor != nil && (cursor.stickyKey == deadA.Key() || cursor.lastPicked == deadA.Key()) {
+		t.Fatalf("sticky cursor still points at removed node: %+v", cursor)
+	}
+
+	revived := deadA
+	revived.Available = true
+	revived.LatencyMs = 41
+	if !p.Update([]Proxy{revived}, nil) {
+		t.Fatal("later successful observation could not re-admit dropped node")
+	}
+	got, ok = p.Find(deadA.Key())
+	if !ok || !got.Available || got.LatencyMs != 41 {
+		t.Fatalf("revived node = %+v ok=%v", got, ok)
+	}
+	assertProxyIndexInvariant(t, p)
 }
 
 func TestUpdateKeepsProxyIPInventoryAcrossPartialOrEmptyRefreshes(t *testing.T) {
@@ -1135,7 +1175,6 @@ func TestImportantMutationsArePersistedInBatch(t *testing.T) {
 	p.SetCache(cache)
 
 	p.RecordResult(px.Key(), true, 87)
-	p.ObserveHealthResult(px.Key(), false, 0)
 	p.SetAvailable(px.Key(), false)
 	p.UpdateLatency(px.Key(), 91)
 	if !p.UpdateGeo(px.Key(), "203.0.113.50", "SG", "Singapore", "AS", true, true) {
@@ -1155,8 +1194,7 @@ func TestImportantMutationsArePersistedInBatch(t *testing.T) {
 			if !got.Available && got.LatencyMs == 91 && got.ExitIP == "203.0.113.50" &&
 				got.Country == "SG" && got.IPChanged && got.IPChangeKnown && got.SpeedKbps == 2500.5 &&
 				got.SpeedBytes == 3_000_000 && got.SpeedDurationMs == 9600 &&
-				got.SpeedTestedAt >= before && st.Successes == 1 && st.Failures == 0 && st.LastLatencyMs == 87 &&
-				st.ConsecutiveHealthFailures == 1 && st.HealthFailureTerminal {
+				got.SpeedTestedAt >= before && st.Successes == 1 && st.Failures == 0 && st.LastLatencyMs == 87 {
 				break
 			}
 		}
@@ -1259,7 +1297,7 @@ func TestClearUnavailableReportsNonDurableCacheFailure(t *testing.T) {
 
 	validProxy := Proxy{Protocol: "socks5", IP: "127.0.0.1", Port: "1080", Available: true}
 	p.Update([]Proxy{validProxy}, nil)
-	p.Update(nil, map[string]bool{"socks5://127.0.0.1:1080": true})
+	p.SetAvailable(validProxy.Key(), false)
 	_ = p.FlushCache()
 
 	if p.Size() != 1 {
@@ -1356,7 +1394,7 @@ func TestRemoveKeysDoesNotBlockHealthUpdateDuringPersistence(t *testing.T) {
 	updateDone := make(chan struct{})
 	go func() {
 		p.UpdateLatency(keep.Key(), 77)
-		p.ObserveHealthResult(keep.Key(), false, 0)
+		p.SetAvailable(keep.Key(), false)
 		close(updateDone)
 	}()
 	select {
@@ -1370,12 +1408,9 @@ func TestRemoveKeysDoesNotBlockHealthUpdateDuringPersistence(t *testing.T) {
 		t.Fatalf("RemoveKeys failed: %v", err)
 	}
 
-	forwarding, _, stats := cache.load()
-	if len(forwarding) != 1 || forwarding[0].Key() != keep.Key() || forwarding[0].LatencyMs != 77 || forwarding[0].Available || !forwarding[0].HealthInvalidated {
+	forwarding, _, _ := cache.load()
+	if len(forwarding) != 1 || forwarding[0].Key() != keep.Key() || forwarding[0].LatencyMs != 77 || forwarding[0].Available {
 		t.Fatalf("durable pool lost concurrent health update: %#v", forwarding)
-	}
-	if !stats[keep.Key()].HealthFailureTerminal {
-		t.Fatalf("durable stats lost concurrent health update: %+v", stats[keep.Key()])
 	}
 }
 

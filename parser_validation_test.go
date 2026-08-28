@@ -61,6 +61,9 @@ func TestNormalizeFetchedProxyRejectsNonPublicLiteralIPsButKeepsHostnames(t *tes
 		{"link local v6", "fe80::1", false},
 		{"multicast v6", "ff02::1", false},
 		{"public v4", "8.8.8.8", true},
+		{"cloudflare dns 1.0.0.0/24", "1.0.0.187", false},
+		{"cloudflare dns 1.0.0.1", "1.0.0.1", false},
+		{"cloudflare dns sibling 1.1.1.1", "1.1.1.1", true},
 		{"public v6", "2606:4700:4700::1111", true},
 		{"hostname unchanged", "proxy.example.test", true},
 	}

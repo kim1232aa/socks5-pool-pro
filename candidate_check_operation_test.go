@@ -145,8 +145,14 @@ func TestFailedRetryFailureUpdatesAndRetainsFailure(t *testing.T) {
 		t.Fatalf("failed retry operation = %+v", operation)
 	}
 	page := NewStatusServer(pool, store).buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
-	if page.FailedTotal != 1 || len(page.FailedCandidates) != 1 || page.FailedCandidates[0].LastError != "retry connection refused upstream detail" {
-		t.Fatalf("retained failed record = %+v", page)
+	if page.FailedTotal != 0 || page.IsolatedUnreachableTotal != 1 || len(page.FailedCandidates) != 0 {
+		t.Fatalf("retryable failure that is now unreachable should be isolated: %+v", page)
+	}
+	snapshot := pool.candidates.snapshot.Load()
+	snapshot.mu.RLock()
+	defer snapshot.mu.RUnlock()
+	if len(snapshot.failedRecords) != 1 || snapshot.failedRecords[0].lastError != "retry connection refused upstream detail" {
+		t.Fatalf("isolated failure was dropped from catalog: %#v", snapshot.failedRecords)
 	}
 }
 
@@ -308,8 +314,8 @@ func TestFailedRetryAllWalksEveryFailureInChunks(t *testing.T) {
 		t.Fatalf("retry-all checked %d nodes, want every failure exactly once", calls.Load())
 	}
 	page := NewStatusServer(pool, store).buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
-	if page.FailedTotal != 2 {
-		t.Fatalf("failed total after retry-all = %d, want the 2 still-down nodes", page.FailedTotal)
+	if page.FailedTotal != 0 || page.IsolatedUnreachableTotal != 2 {
+		t.Fatalf("still-down retry-all nodes should be isolated, not listed: %+v", page)
 	}
 }
 
@@ -445,6 +451,10 @@ func candidateOperationTestPool(pending, failed []Proxy) *ProxyPool {
 	pool := NewProxyPool()
 	all := append(append([]Proxy(nil), pending...), failed...)
 	refresh := pool.candidates.begin(all, nil, nil, 0)
-	pool.candidates.complete(refresh, failed, nil, nil)
+	policy := make(map[string]bool, len(failed))
+	for _, px := range failed {
+		policy[px.Key()] = true
+	}
+	pool.candidates.complete(refresh, failed, nil, policy)
 	return pool
 }

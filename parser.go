@@ -262,6 +262,14 @@ var nonPublicInternetNetworks = mustSourceNetworks(
 	"fc00::/7", "fe80::/10", "ff00::/8",
 )
 
+// unusableForwardingEndpointNetworks are publicly routed anycast/service
+// prefixes that junk HTTP/SOCKS feeds keep advertising as generic proxies.
+// They remain valid source-fetch destinations (they are not private or
+// special-use), and Cloudflare ProxyIP records may still use them on 443.
+var unusableForwardingEndpointNetworks = mustSourceNetworks(
+	"1.0.0.0/24",
+)
+
 func mustSourceNetworks(values ...string) []*net.IPNet {
 	out := make([]*net.IPNet, 0, len(values))
 	for _, value := range values {
@@ -288,6 +296,18 @@ func isPublicInternetIP(ip net.IP) bool {
 		}
 	}
 	return true
+}
+
+func isUnusableForwardingEndpointIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, network := range unusableForwardingEndpointNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchSourceWithClient keeps retry timing injectable for fast deterministic
@@ -651,8 +671,13 @@ func normalizeFetchedProxy(px Proxy) (Proxy, bool) {
 	if !ok {
 		return Proxy{}, false
 	}
-	if ip := net.ParseIP(px.IP); ip != nil && !isPublicInternetIP(ip) {
-		return Proxy{}, false
+	if ip := net.ParseIP(px.IP); ip != nil {
+		if !isPublicInternetIP(ip) {
+			return Proxy{}, false
+		}
+		if px.Protocol != "proxyip" && isUnusableForwardingEndpointIP(ip) {
+			return Proxy{}, false
+		}
 	}
 	return px, true
 }

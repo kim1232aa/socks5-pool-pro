@@ -236,7 +236,7 @@ func TestFailedAndProxyIPPaginationSnapshotMetadata(t *testing.T) {
 	resource := Proxy{IP: "198.51.100.14", Port: "443", Protocol: "proxyip", SourceName: "resource-feed", Country: "US"}
 	pool := NewProxyPool()
 	refresh := pool.candidates.begin([]Proxy{failed, resource}, nil, nil, 0)
-	pool.candidates.complete(refresh, []Proxy{failed}, nil, nil)
+	pool.candidates.complete(refresh, []Proxy{failed}, nil, map[string]bool{failed.Key(): true})
 	handler := NewStatusServer(pool, &ConfigStore{}).handler()
 
 	failedRecorder := httptest.NewRecorder()
@@ -251,7 +251,7 @@ func TestFailedAndProxyIPPaginationSnapshotMetadata(t *testing.T) {
 	if failedPage.SnapshotID == "" || failedRecorder.Header().Get("X-Snapshot-ID") != failedPage.SnapshotID || failedPage.FailedTotal != 1 || len(failedPage.FailedCandidates) != 1 {
 		t.Fatalf("failed candidate page metadata = %#v headers=%v", failedPage, failedRecorder.Header())
 	}
-	if failedPage.FailedCandidates[0].FailureType != "unreachable" {
+	if failedPage.FailedCandidates[0].FailureType != "policy_filtered" {
 		t.Fatalf("failed candidate kind = %#v", failedPage.FailedCandidates[0])
 	}
 
@@ -288,7 +288,7 @@ func TestCompactStatusSeparatesPendingAndFailedCandidateTotals(t *testing.T) {
 	failed := Proxy{IP: "192.0.2.30", Port: "8080", Protocol: "http", SourceName: "feed"}
 	pool := NewProxyPool()
 	refresh := pool.candidates.begin([]Proxy{pending, failed}, nil, nil, 0)
-	pool.candidates.complete(refresh, []Proxy{failed}, nil, nil)
+	pool.candidates.complete(refresh, []Proxy{failed}, nil, map[string]bool{failed.Key(): true})
 
 	recorder := httptest.NewRecorder()
 	NewStatusServer(pool, &ConfigStore{}).handler().ServeHTTP(recorder, localTestRequest(http.MethodGet, "/api/status?compact=1", nil))
@@ -848,8 +848,8 @@ func TestCheckURLDurabilityUncertainConvergesRuntimeBeforeReturningError(t *test
 		t.Fatalf("failed candidate returned to pending after criterion change: %#v", candidatePage)
 	}
 	failedPage := statusServer.buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates?page_size=100", nil))
-	if failedPage.FailedTotal != 1 || len(failedPage.FailedCandidates) != 1 || failedPage.FailedCandidates[0].Key != candidate.Key() {
-		t.Fatalf("criterion change did not retain failed candidate: %#v", failedPage)
+	if failedPage.FailedTotal != 0 || failedPage.IsolatedUnreachableTotal != 1 || len(failedPage.FailedCandidates) != 0 {
+		t.Fatalf("criterion change did not keep unreachable failure isolated: %#v", failedPage)
 	}
 	if !coordinator.drainFullRecheckSignalForTest() {
 		t.Fatal("uncertain criterion change did not queue a full recheck")

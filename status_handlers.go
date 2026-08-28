@@ -96,7 +96,8 @@ func (s *StatusServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			HealthRecheckPending: summary.HealthRecheckPending,
 			Scrape:               summary.Scrape,
 			CandidateTotal:       candidate.Total, FailedCandidateTotal: candidate.FailedTotal,
-			CandidatePhase: candidate.Phase, CandidateSourceErrors: candidate.SourceErrors, CandidateUpdatedAt: candidate.UpdatedAt,
+			IsolatedUnreachableTotal: candidate.IsolatedUnreachableTotal,
+			CandidatePhase:           candidate.Phase, CandidateSourceErrors: candidate.SourceErrors, CandidateUpdatedAt: candidate.UpdatedAt,
 		})
 		return
 	}

@@ -60,6 +60,22 @@ func TestCandidateOutcomeMovesFailureOutOfCandidates(t *testing.T) {
 	}
 }
 
+func TestFailedCandidatePageOmitsUnreachableIsolation(t *testing.T) {
+	unreachable := Proxy{IP: "192.0.2.20", Port: "1080", Protocol: "socks5", SourceName: "Fyvri HTTP"}
+	policy := Proxy{IP: "192.0.2.21", Port: "8080", Protocol: "http", SourceName: "feed"}
+	pool := NewProxyPool()
+	refresh := pool.candidates.begin([]Proxy{unreachable, policy}, nil, nil, 0)
+	pool.candidates.complete(refresh, []Proxy{unreachable, policy}, nil, map[string]bool{policy.Key(): true})
+
+	page := NewStatusServer(pool, &ConfigStore{}).buildFailedCandidatePage(localTestRequest(http.MethodGet, "/api/failed-candidates", nil))
+	if page.FailedTotal != 1 || page.IsolatedUnreachableTotal != 1 || len(page.FailedCandidates) != 1 || page.FailedCandidates[0].Key != policy.Key() || page.FailedCandidates[0].FailureType != "policy_filtered" {
+		t.Fatalf("retry page = %#v", page)
+	}
+	if keys := pool.candidates.FailedKeys(); len(keys) != 1 || keys[0] != policy.Key() {
+		t.Fatalf("retry-all keys = %v, want only policy-filtered", keys)
+	}
+}
+
 func TestCandidateOutcomeHidesAliveRecordBehindPoolOwnership(t *testing.T) {
 	alive := Proxy{IP: "192.0.2.22", Port: "1080", Protocol: "socks5", SourceName: "feed", Available: true}
 	pool := NewProxyPool()

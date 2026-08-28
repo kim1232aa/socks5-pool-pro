@@ -837,7 +837,9 @@ func filterNonPublicCandidateRecords(snapshot *candidateSnapshot) int {
 		host, port, _ := net.SplitHostPort(record.addr)
 		ip := net.ParseIP(host)
 		protocol := snapshot.protocols[record.protocolID]
-		return (ip == nil || isPublicInternetIP(ip)) && (protocol != "proxyip" || ip != nil && port == "443")
+		return (ip == nil || isPublicInternetIP(ip)) &&
+			(protocol != "proxyip" || ip != nil && port == "443") &&
+			(protocol == "proxyip" || ip == nil || !isUnusableForwardingEndpointIP(ip))
 	}
 	retained := snapshot.records[:0]
 	for _, record := range snapshot.records {

@@ -1175,23 +1175,24 @@ func (p *ProxyPool) Prime(forwarding, proxyip []Proxy) {
 
 // Update merges this cycle's health-check results into the live pool,
 // splitting out info-only proxyip nodes. Nodes are identified by Proxy.Key()
-// (protocol + address) and are never dropped here; the same endpoint can
-// legitimately expose HTTP and SOCKS independently:
+// (protocol + address) so the same endpoint can legitimately expose HTTP and
+// SOCKS independently:
 //   - an address present in freshlyAlive is marked Available=true and gets
 //     its newly-observed connection data, while durable measurements survive.
 //   - an already-known address in failedAddrs (dialed and genuinely failed to
-//     connect - see CheckProxies) is immediately marked terminally unavailable.
-//     A failed new candidate is absent from the merged pool and is not admitted.
+//     connect - see CheckProxies) is dropped from the forwarding pool. A failed
+//     new candidate is never admitted. Catalog/failure pages keep the history.
 //   - a reachable candidate excluded for policy is kept but hard-excluded.
 //   - an address in neither (deferred this cycle or absent from the source) is
 //     left completely untouched, including its previous Available value.
 //
-// The retained-node list only grows here; terminal failures remain as history
-// for explanation and manual recovery. ClearUnavailable is the explicit purge.
+// Unreachable nodes do not occupy the forwarding pool. A later successful
+// observation can re-admit the same key. ClearUnavailable remains the explicit
+// purge for other retained-but-unusable states.
 //
-// Per-group cursors are left as-is; Pick re-anchors automatically against
-// whatever is present in the new list. The merged pool is persisted to the
-// cache (if enabled) for fast recovery on restart.
+// Sticky cursors that pointed at a removed unreachable node are cleared.
+// The merged pool is persisted to the cache (if enabled) for fast recovery
+// on restart.
 func (p *ProxyPool) Update(freshlyAlive []Proxy, failedAddrs map[string]bool, expectedGeneration ...uint64) bool {
 	return p.update(freshlyAlive, failedAddrs, nil, nil, expectedGeneration...)
 }
@@ -1261,22 +1262,15 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 		st.LastHealthSuccessAt = time.Now().UTC()
 		merged[key] = px
 	}
-	for key, existing := range merged {
-		if !failedAddrs[key] || freshKeys[key] {
+	for key := range failedAddrs {
+		if freshKeys[key] {
 			continue
 		}
-		st := p.statsForKeyLocked(key)
-		st.ConsecutiveHealthFailures++
-		st.HealthFailureTerminal = true
-		// Mirror the durable terminal state into the hard-routing bit so every
-		// fallback (all-unavailable included) excludes it without a Proxy schema
-		// change. A later successful observation clears this in one place.
-		if existing.Available || !existing.HealthInvalidated {
-			existing.HealthInvalidated = true
-			existing.PolicyExcluded = false
-			existing.Available = false
-			merged[key] = existing
+		if _, ok := merged[key]; !ok {
+			continue
 		}
+		delete(merged, key)
+		delete(p.stats, key)
 		failed++
 	}
 	// Policy is a hard routing boundary and wins defensively even if a caller
@@ -1343,6 +1337,17 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 		// The retirement helper mutates p.proxies, not its order or keys, so the
 		// index built immediately above remains valid.
 	}
+	if failed > 0 {
+		liveKeys := make(map[string]bool, len(p.proxies))
+		for _, px := range p.proxies {
+			liveKeys[px.Key()] = true
+		}
+		p.groupState = cleanedGroupState(p.groupState, liveKeys)
+		if p.recheckCursor != "" && !liveKeys[p.recheckCursor] {
+			p.recheckCursor = ""
+		}
+		p.statsRevision++
+	}
 	p.routingRevision++
 	cache := p.cache
 	p.cacheGeneration++
@@ -1352,7 +1357,7 @@ func (p *ProxyPool) update(freshlyAlive []Proxy, failedAddrs, policyFiltered map
 	if cache != nil {
 		_ = cache.saveWithHealthState(generation, snapshotFwd, snapshotInfo, snapshotStats, healthCheckURL, healthPolicy, healthRecheckPending)
 	}
-	log.Printf("[pool] updated: %d known forwarding proxies total (+%d new, %d revived, %d marked terminally unavailable), %d proxyip (info-only) nodes",
+	log.Printf("[pool] updated: %d known forwarding proxies total (+%d new, %d revived, %d unreachable removed), %d proxyip (info-only) nodes",
 		len(fwd), added, revived, failed, len(info))
 	return true
 }

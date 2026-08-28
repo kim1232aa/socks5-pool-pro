@@ -174,7 +174,7 @@
 <div id="tab-candidates" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-candidates">
   <div class="view-hero view-hero-catalog">
     <div><span class="panel-kicker">Catalog</span><h2>候选待检</h2><p>只列出等待正式检测、且尚未被转发池占用的候选。</p></div>
-    <div class="catalog-boundary"><b>边界说明</b><span>正式检查失败的候选会移入失败节点页，不会留在这里。</span></div>
+    <div class="catalog-boundary"><b>边界说明</b><span>策略排除的候选会移入失败节点页。连通失败不会进入转发池，也不进入失败重测队列。</span></div>
   </div>
 
   <section class="task-metrics task-metrics-candidate" aria-label="候选待检概览">
@@ -214,7 +214,7 @@
       <span id="candidate-selected-count" role="status" aria-live="polite">已选 0 / 16</span>
       <button type="button" class="btn-sm" data-action="candidate-speedtest-selected" disabled>批量测速并加入转发池</button>
       <button type="button" class="btn-sm danger" data-action="candidate-delete-selected" disabled>删除已选</button>
-      <span class="candidate-speedtest-note">人工测速不受冷却限制；成功后立即加入转发池，正式检查失败的会移入失败节点页。</span>
+      <span class="candidate-speedtest-note">人工测速不受冷却限制；成功后立即加入转发池。策略排除会移入失败节点页，连通失败不会进入转发池。</span>
     </div>
     <div class="candidate-check-bar" aria-label="批量正式检测">
       <label class="small" for="candidate-batch-limit">本次检测数量</label>
@@ -223,7 +223,7 @@
       <span class="candidate-speedtest-note">按有效“每轮抽样”数量为上限；检测在后台运行，可同时浏览其他页面。</span>
       <div id="candidate-operation-status" class="task-panel-container" role="status" aria-live="polite"></div>
     </div>
-    <span class="candidate-filter-note">筛选和分页均在服务端执行。正式检查失败的候选会移入失败节点页，只能在那里手动重新检测。</span>
+    <span class="candidate-filter-note">筛选和分页均在服务端执行。策略排除的候选会移入失败节点页；连通失败不会进入转发池。</span>
   </div>
   <div id="candidate-notice" class="list-notice" role="status" aria-live="polite" hidden></div>
 
@@ -240,8 +240,8 @@
 
 <div id="tab-failed-candidates" class="tab-panel" style="display:none" role="tabpanel" aria-labelledby="tab-link-failed-candidates">
   <div class="view-hero view-hero-catalog">
-    <div><span class="panel-kicker">Quarantine</span><h2>失败节点</h2><p>正式检查失败或被出口策略排除的候选，隔离在这里等待人工处置。</p></div>
-    <div class="catalog-boundary"><b>边界说明</b><span>失败节点不会自动重新检测，也不会自动回到候选待检。</span></div>
+    <div><span class="panel-kicker">Quarantine</span><h2>失败节点</h2><p>被出口策略排除、需要人工处置的候选。连通失败的公开列表项不会进入转发池，也不进入本页重测队列。</p></div>
+    <div class="catalog-boundary"><b>边界说明</b><span>本页只保留策略排除项。连通失败已隔离，来源刷新不会把它们重新丢回待检。</span></div>
   </div>
 
   <section class="task-metrics task-metrics-candidate" aria-label="失败节点概览">
@@ -270,7 +270,7 @@
       <span id="failed-selected-count" role="status" aria-live="polite">已选 0</span>
       <button type="button" class="btn-sm" id="failed-retry-button" data-action="failed-retry-selected" disabled>手动重新检测已选</button>
       <button type="button" class="btn-sm" id="failed-retry-all-button" data-action="failed-retry-all">一键重查全部失败节点</button>
-      <span class="candidate-speedtest-note">失败节点不会自动重新检测；勾选后手动提交，或一键重查全部（按抽样规模分批走完），通过的回到转发池，仍失败的留在这里。</span>
+      <span class="candidate-speedtest-note">失败节点不会自动重新检测；勾选后手动提交，或一键重查全部（按抽样规模分批走完），通过的回到转发池，仍失败的留在这里。连通失败的列表项已隔离，不出现在本页。</span>
       <div id="failed-operation-status" class="task-panel-container" role="status" aria-live="polite"></div>
     </div>
     <span class="candidate-filter-note">筛选和分页均在服务端执行。失败节点只能从这里手动重新检测，来源刷新和定时任务不会触碰它们。</span>
@@ -280,7 +280,7 @@
   <div class="pager candidate-pager-top" id="failed-pager-top" aria-label="失败节点分页（顶部）"></div>
   <div class="table-scroll candidate-table-scroll" tabindex="0" aria-label="失败节点表格">
   <table class="candidate-table">
-  <caption class="sr-only">正式检查失败或被策略排除的候选</caption>
+  <caption class="sr-only">策略排除、需要人工重测的候选</caption>
   <thead><tr><th><input id="failed-select-page" type="checkbox" data-action="failed-select-page" aria-label="选择本页失败节点"></th><th>失败类型</th><th>协议</th><th>候选地址</th><th>来源</th><th>错误摘要</th></tr></thead>
   <tbody id="failed-tbody"><tr><td colspan="6" class="empty">切换到本页后加载失败节点...</td></tr></tbody>
   </table>

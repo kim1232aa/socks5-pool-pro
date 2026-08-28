@@ -1317,6 +1317,7 @@ function applyFailedView() {
   var rows = Array.isArray(data.failed_candidates) ? data.failed_candidates : [];
   var total = Math.max(0, Number(data.filtered_total || 0));
   var failedTotal = Math.max(0, Number(data.failed_total || 0));
+  var isolatedUnreachable = Math.max(0, Number(data.isolated_unreachable_total || 0));
   var pageSize = Math.max(1, Number(data.page_size || failedPageSize || 50));
   var pageCount = Math.max(1, Math.ceil(total / pageSize));
   var page = Math.max(1, Number(data.page || failedPage || 1));
@@ -1328,10 +1329,10 @@ function applyFailedView() {
   setText('failed-total', formatCount(failedTotal));
   setText('tab-link-failed-candidates', '失败节点 (' + formatCount(failedTotal) + ')');
   setText('failed-matching', formatCount(total));
-  setText('failed-count', (total ? ('显示 ' + formatCount(start + 1) + '-' + formatCount(start + rows.length) + ' · 匹配 ' + formatCount(total)) : '匹配 0') + ' · 失败节点 ' + formatCount(failedTotal));
+  setText('failed-count', (total ? ('显示 ' + formatCount(start + 1) + '-' + formatCount(start + rows.length) + ' · 匹配 ' + formatCount(total)) : '匹配 0') + ' · 失败节点 ' + formatCount(failedTotal) + (isolatedUnreachable ? ' · 已隔离连通失败 ' + formatCount(isolatedUnreachable) : ''));
 
   if (!failedTotal) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">当前没有失败节点；正式检查失败的候选会出现在这里。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">当前没有需要人工重测的失败节点。连通失败的公开列表项已隔离，不会进入转发池，也不出现在本页。</td></tr>';
     renderFailedPagers('');
     updateFailedSelectionUI();
     return;
@@ -1561,7 +1562,7 @@ function finishCandidateCheckOperation(statusElId, operation) {
   setCandidateCheckButtonsDisabled(false);
   updateCandidateSelectionUI();
   updateFailedSelectionUI();
-  var summary = '检测完成：通过 ' + formatCount(operation.alive || 0) + ' · 失败 ' + formatCount(operation.failed || 0) + (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '') + '，失败项已移入失败节点页';
+  var summary = '检测完成：通过 ' + formatCount(operation.alive || 0) + ' · 连通失败 ' + formatCount(operation.failed || 0) + (Number(operation.policy_filtered) ? ' · 策略排除 ' + formatCount(operation.policy_filtered) : '') + '；连通失败已隔离且不进池，策略排除进入失败节点页';
   var tone = 'success';
   if (operation.status === 'failed') { summary = '检测任务失败' + (operation.error ? '：' + operation.error : '。'); tone = 'error'; }
   else if (operation.status === 'cancelled') { summary = '检测任务已取消' + (operation.error ? '：' + operation.error : '。'); tone = 'error'; }
@@ -3193,8 +3194,8 @@ function showTab(name) {
   if (validTabs.indexOf(name) < 0) name = 'nodes';
   var viewMeta = {
     nodes: ['转发代理池','健康节点、真实出口与全量复检。'],
-    candidates: ['候选待检','等待正式检测的候选；失败会隔离到失败节点页。'],
-    'failed-candidates': ['失败节点','正式检查失败或策略排除的候选；只能手动重新检测。'],
+    candidates: ['候选待检','等待正式检测的候选；策略排除会隔离到失败节点页，连通失败不会进池。'],
+    'failed-candidates': ['失败节点','策略排除、需要人工处置的候选；连通失败已隔离，不进入本页。'],
     'proxyip': ['Cloudflare ProxyIP','独立的 Worker 外部资源与专用验证。'],
     sources: ['来源管理','远程订阅、本地导入与库存保留策略。'],
     rules: ['分流规则','从上到下构建可预测的路由决策。'],

@@ -18,13 +18,14 @@ func TestPoolCacheDropsNonPublicLiteralsPerNodeOnUpgrade(t *testing.T) {
 	hostname := testProxy("socks5", "proxy.example.test", "1080", true)
 	private := testProxy("http", "10.0.0.1", "8080", true)
 	documentation := testProxy("socks5", "192.0.2.1", "1080", true)
+	unusable := testProxy("http", "1.0.0.187", "80", true)
 	completedFailure := testProxy("http", "9.9.9.9", "3128", false)
 	completedFailure.HealthInvalidated = true
 	completedFailure.PolicyExcluded = true
 	publicProxyIP := Proxy{IP: "1.1.1.1", Port: "443", Protocol: "proxyip"}
 	reservedProxyIP := Proxy{IP: "203.0.113.1", Port: "443", Protocol: "proxyip"}
 	legacy := poolCacheFile{
-		Proxies:      []Proxy{public, private, hostname, documentation, completedFailure},
+		Proxies:      []Proxy{public, private, hostname, documentation, unusable, completedFailure},
 		ProxyIPNodes: []Proxy{reservedProxyIP, publicProxyIP},
 		Stats: map[string]nodeStats{
 			public.Key():        {Successes: 1},
@@ -55,6 +56,11 @@ func TestPoolCacheDropsNonPublicLiteralsPerNodeOnUpgrade(t *testing.T) {
 	}
 	if _, ok := stats[documentation.Key()]; ok {
 		t.Fatalf("documentation node stats survived cache migration: %#v", stats)
+	}
+	for _, px := range forwarding {
+		if px.IP == "1.0.0.187" {
+			t.Fatalf("unusable 1.0.0.0/24 forwarding node survived cache migration: %#v", forwarding)
+		}
 	}
 }
 
@@ -203,24 +209,25 @@ func TestPoolCacheHealthFailureStreakIsBackwardCompatibleAndPersistent(t *testin
 	}
 }
 
-func TestPoolCachePersistsAutomaticHealthTerminalAndCooldown(t *testing.T) {
+func TestPoolCacheDropsAutomaticHealthTerminalFailures(t *testing.T) {
 	cache := newPoolCache(t.TempDir())
 	px := testProxy("socks5", "8.8.8.91", "1080", false)
 	px.HealthInvalidated = true
+	keep := testProxy("http", "8.8.8.92", "8080", true)
 	want := nodeStats{
 		LastLatencyMs:             91,
 		ConsecutiveHealthFailures: 1,
 		LastHealthSuccessAt:       time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC),
 		HealthFailureTerminal:     true,
 	}
-	cache.save(1, []Proxy{px}, nil, map[string]nodeStats{px.Key(): want})
+	cache.save(1, []Proxy{px, keep}, nil, map[string]nodeStats{px.Key(): want, keep.Key(): {Successes: 1}})
 
 	forwarding, _, stats := cache.load()
-	if len(forwarding) != 1 || forwarding[0].Available || !forwarding[0].HealthInvalidated || forwarding[0].PolicyExcluded {
-		t.Fatalf("terminal proxy round trip = %#v", forwarding)
+	if len(forwarding) != 1 || forwarding[0].Key() != keep.Key() {
+		t.Fatalf("terminal failed node survived cache load: %#v", forwarding)
 	}
-	if got := stats[px.Key()]; got != want {
-		t.Fatalf("terminal stats round trip = %+v, want %+v", got, want)
+	if _, ok := stats[px.Key()]; ok {
+		t.Fatalf("terminal stats survived cache load: %+v", stats[px.Key()])
 	}
 }
 

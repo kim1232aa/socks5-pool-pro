@@ -551,8 +551,8 @@ func TestCandidateSpeedtestHealthCheckFailureMovesPendingToFailed(t *testing.T) 
 	if pending.CandidateTotal != 0 || len(pending.Candidates) != 0 {
 		t.Fatalf("failed candidate remained pending: %#v", pending)
 	}
-	if failed.FailedTotal != 1 || len(failed.FailedCandidates) != 1 || failed.FailedCandidates[0].Key != candidate.Key() || failed.FailedCandidates[0].FailureType != "unreachable" || !strings.Contains(failed.FailedCandidates[0].LastError, "health criterion rejected candidate") {
-		t.Fatalf("failed candidate page = %#v", failed)
+	if failed.FailedTotal != 0 || failed.IsolatedUnreachableTotal != 1 || len(failed.FailedCandidates) != 0 {
+		t.Fatalf("unreachable healthcheck failure should be isolated from retry page = %#v", failed)
 	}
 }
 

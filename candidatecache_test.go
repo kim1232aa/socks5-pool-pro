@@ -92,12 +92,8 @@ func TestCandidateCatalogCacheRoundTripRetainsCredentialsAndRestoresReadiness(t 
 	if err := json.Unmarshal(failedRecorder.Body.Bytes(), &failedPage); err != nil {
 		t.Fatal(err)
 	}
-	if failedPage.FailedTotal != 1 || len(failedPage.FailedCandidates) != 1 {
-		t.Fatalf("restored failure API page = %#v", failedPage)
-	}
-	got := failedPage.FailedCandidates[0]
-	if got.FailureType != "unreachable" || !got.HasAuth || got.Country != "JP" || got.City != "Tokyo" || got.Username != secretUser || got.Password != secretPass || got.ProxyURL != proxy.ConsumerURL() || !strings.Contains(failedRecorder.Body.String(), secretUser) || !strings.Contains(failedRecorder.Body.String(), secretPass) {
-		t.Fatalf("restored failure API omitted metadata or credentials: %#v raw=%s", got, failedRecorder.Body.String())
+	if failedPage.FailedTotal != 0 || failedPage.IsolatedUnreachableTotal != 1 || len(failedPage.FailedCandidates) != 0 {
+		t.Fatalf("restored unreachable failure should stay isolated: %#v", failedPage)
 	}
 
 	next := restored.begin([]Proxy{proxy}, labels, nil, 0)
