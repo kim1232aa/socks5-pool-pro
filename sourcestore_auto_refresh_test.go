@@ -191,6 +191,17 @@ func TestAdditionalDefaultProxySourcesContract(t *testing.T) {
 		"builtin-gproxynet-socks5":      {"https://raw.githubusercontent.com/gproxynet/free-proxy-list/main/socks5.txt", FormatPlainList, "socks5"},
 		"builtin-proxygenerator-http":   {"https://raw.githubusercontent.com/proxygenerator1/ProxyGenerator/main/Stable/http.txt", FormatPlainList, "http"},
 		"builtin-proxygenerator-socks5": {"https://raw.githubusercontent.com/proxygenerator1/ProxyGenerator/main/MostStable/socks5.txt", FormatPlainList, "socks5"},
+		"builtin-hookzof-socks5":        {"https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", FormatPlainList, "socks5"},
+		"builtin-vakhov-http":           {"https://vakhov.github.io/fresh-proxy-list/http.txt", FormatPlainList, "http"},
+		"builtin-vakhov-socks5":         {"https://vakhov.github.io/fresh-proxy-list/socks5.txt", FormatPlainList, "socks5"},
+		"builtin-solispirit-http":       {"https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/http.txt", FormatPlainList, "http"},
+		"builtin-solispirit-socks5":     {"https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/socks5.txt", FormatPlainList, "socks5"},
+		"builtin-dpangestuw-http":       {"https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt", FormatTextRegex, ""},
+		"builtin-dpangestuw-socks5":     {"https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks5_proxies.txt", FormatTextRegex, ""},
+	}
+	disabled := map[string]expectedSource{
+		builtinRdavydovHTTPSourceID:   {"https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt", FormatPlainList, "http"},
+		builtinRdavydovSOCKS5SourceID: {"https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt", FormatPlainList, "socks5"},
 	}
 
 	sources := defaultPoolConfig().Sources
@@ -208,6 +219,13 @@ func TestAdditionalDefaultProxySourcesContract(t *testing.T) {
 			t.Fatalf("duplicate default source URL %q on %q and %q", source.URL, other, source.ID)
 		}
 		seenURLs[source.URL] = source.ID
+		if want, ok := disabled[source.ID]; ok {
+			if source.URL != want.url || source.Format != want.format || source.Protocol != want.protocol || !source.Builtin || source.Enabled || !source.AutoRefreshEnabled {
+				t.Fatalf("stale default source %q = %#v, want URL=%q format=%q protocol=%q disabled builtin auto-refresh", source.ID, source, want.url, want.format, want.protocol)
+			}
+			delete(disabled, source.ID)
+			continue
+		}
 		want, ok := expected[source.ID]
 		if !ok {
 			continue
@@ -219,6 +237,9 @@ func TestAdditionalDefaultProxySourcesContract(t *testing.T) {
 	}
 	if len(expected) != 0 {
 		t.Fatalf("missing additional default sources: %#v", expected)
+	}
+	if len(disabled) != 0 {
+		t.Fatalf("missing disabled stale default sources: %#v", disabled)
 	}
 }
 

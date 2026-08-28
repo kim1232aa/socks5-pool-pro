@@ -54,10 +54,11 @@ func TestNewConfigStoreMigratesOnlyLegacyProxyIPMetadataAndPersists(t *testing.T
 		Nodes: []string{"socks5://192.0.2.1:1080"},
 	}}
 	path := writeTestPoolConfig(t, dir, PoolConfig{
-		Sources:  []Source{legacy, other},
-		Rules:    rules,
-		Groups:   groups,
-		CheckURL: "https://health.example.test/check",
+		Sources:               []Source{legacy, other},
+		Rules:                 rules,
+		Groups:                groups,
+		CheckURL:              "https://health.example.test/check",
+		BuiltinCatalogVersion: builtinSourceCatalogVersion,
 	})
 
 	store, err := NewConfigStore(dir)
@@ -101,7 +102,10 @@ func TestNewConfigStoreMigratesPreBuiltinLegacyRecord(t *testing.T) {
 		URL: "https://zip.cm.edu.kg/all.json", Format: FormatProxyIPJSON,
 		Enabled: true, Builtin: false, Note: legacyProxyIPSourceNote,
 	}
-	path := writeTestPoolConfig(t, dir, PoolConfig{Sources: []Source{legacy}})
+	path := writeTestPoolConfig(t, dir, PoolConfig{
+		Sources:               []Source{legacy},
+		BuiltinCatalogVersion: builtinSourceCatalogVersion,
+	})
 
 	store, err := NewConfigStore(dir)
 	if err != nil {
@@ -126,7 +130,10 @@ func TestNewConfigStorePreservesCustomizedProxyIPMetadata(t *testing.T) {
 		URL: "https://example.test/proxyip.json", Format: FormatProxyIPJSON,
 		Enabled: true, Builtin: true, Note: "保留我的说明",
 	}
-	path := writeTestPoolConfig(t, dir, PoolConfig{Sources: []Source{custom}})
+	path := writeTestPoolConfig(t, dir, PoolConfig{
+		Sources:               []Source{custom},
+		BuiltinCatalogVersion: builtinSourceCatalogVersion,
+	})
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -212,5 +219,102 @@ func TestNewConfigStoreCanonicalizesLegacyGroupReferences(t *testing.T) {
 	persisted := readTestPoolConfig(t, path)
 	if persisted.Rules[0].Group != "Tokyo-Egress" || persisted.Listeners[0].Group != "Tokyo-Egress" {
 		t.Fatalf("canonical group references were not persisted: rules=%#v listeners=%#v", persisted.Rules, persisted.Listeners)
+	}
+}
+
+func TestNewConfigStoreMigratesBuiltinSourceCatalogV1(t *testing.T) {
+	dir := t.TempDir()
+	userDatabay := Source{
+		ID: "src-user-databay", Name: "Databay copy",
+		URL:    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
+		Format: FormatPlainList, Protocol: "http", Enabled: true,
+	}
+	rdavydov := Source{
+		ID: builtinRdavydovHTTPSourceID, Name: "rdavydov HTTP",
+		URL:    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+		Format: FormatPlainList, Protocol: "http", Enabled: true, Builtin: true,
+	}
+	path := writeTestPoolConfig(t, dir, PoolConfig{Sources: []Source{userDatabay, rdavydov}})
+
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := store.Snapshot()
+	if got.BuiltinCatalogVersion != builtinSourceCatalogVersion {
+		t.Fatalf("catalog version = %d, want %d", got.BuiltinCatalogVersion, builtinSourceCatalogVersion)
+	}
+
+	user, ok := store.SourceByID(userDatabay.ID)
+	if !ok || user.Enabled {
+		t.Fatalf("user duplicate = %#v found=%v, want disabled", user, ok)
+	}
+	stale, ok := store.SourceByID(builtinRdavydovHTTPSourceID)
+	if !ok || stale.Enabled {
+		t.Fatalf("rdavydov = %#v found=%v, want disabled", stale, ok)
+	}
+	official, ok := store.SourceByID("builtin-databay-http")
+	if !ok || !official.Enabled || !official.Builtin || official.URL != userDatabay.URL {
+		t.Fatalf("matching builtin was not inserted: %#v found=%v", official, ok)
+	}
+	for _, id := range catalogV1BuiltinSourceIDs {
+		src, ok := store.SourceByID(id)
+		if !ok || !src.Builtin || !src.Enabled || !src.AutoRefreshEnabled {
+			t.Fatalf("catalog v1 source %q = %#v found=%v", id, src, ok)
+		}
+	}
+
+	persisted := readTestPoolConfig(t, path)
+	if persisted.BuiltinCatalogVersion != builtinSourceCatalogVersion {
+		t.Fatalf("persisted catalog version = %d", persisted.BuiltinCatalogVersion)
+	}
+	if err := store.DeleteSource("builtin-hookzof-socks5"); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restarted.SourceByID("builtin-hookzof-socks5"); ok {
+		t.Fatal("deleted catalog v1 source was re-added after restart")
+	}
+	userAfter, ok := restarted.SourceByID(userDatabay.ID)
+	if !ok {
+		t.Fatal("user duplicate was deleted")
+	}
+	if userAfter.Enabled {
+		t.Fatal("user duplicate was re-enabled on restart")
+	}
+}
+
+func TestNewConfigStoreDoesNotInjectCatalogIntoCustomOnlyStore(t *testing.T) {
+	dir := t.TempDir()
+	onlySource := Source{
+		ID: "custom-only", Name: "only", URL: "https://example.test/list",
+		Format: FormatPlainList, Protocol: "http", Enabled: true,
+	}
+	writeTestPoolConfig(t, dir, PoolConfig{Sources: []Source{onlySource}})
+
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := store.Sources()
+	if len(got) != 1 || got[0].ID != onlySource.ID {
+		t.Fatalf("custom-only store gained sources: %#v", got)
+	}
+	if _, ok := store.SourceByID("builtin-hookzof-socks5"); ok {
+		t.Fatal("catalog v1 source was injected into a custom-only store")
+	}
+	if store.Snapshot().BuiltinCatalogVersion != builtinSourceCatalogVersion {
+		t.Fatalf("custom-only catalog version = %d", store.Snapshot().BuiltinCatalogVersion)
+	}
+}
+
+func TestSourceURLKeyNormalizesSchemeAndHost(t *testing.T) {
+	left := sourceURLKey("HTTPS://Raw.GitHubusercontent.COM/databay-labs/free-proxy-list/master/http.txt")
+	right := sourceURLKey("https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt")
+	if left == "" || left != right {
+		t.Fatalf("sourceURLKey mismatch: %q vs %q", left, right)
 	}
 }

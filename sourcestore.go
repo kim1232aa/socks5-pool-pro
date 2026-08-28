@@ -27,16 +27,19 @@ const defaultCheckURL = "https://www.google.com/generate_204"
 const legacyDefaultCheckURL = "http://www.google.com/generate_204"
 
 const (
-	builtinProxyIPSourceID = "builtin-proxyip"
-	maxConfiguredSources   = 64
-	maxSourceNameBytes     = 256
-	maxSourceURLBytes      = 8 << 10
-	maxPoolConfigBytes     = 8 << 20
-	maxConfigRules         = 4096
-	maxConfigGroups        = 1024
-	maxConfigListValues    = 4096
-	maxConfigValueBytes    = 8 << 10
-	maxConfigListeners     = 256
+	builtinProxyIPSourceID        = "builtin-proxyip"
+	builtinRdavydovSOCKS5SourceID = "builtin-rdavydov-socks5"
+	builtinRdavydovHTTPSourceID   = "builtin-rdavydov-http"
+	builtinSourceCatalogVersion   = 1
+	maxConfiguredSources          = 64
+	maxSourceNameBytes            = 256
+	maxSourceURLBytes             = 8 << 10
+	maxPoolConfigBytes            = 8 << 20
+	maxConfigRules                = 4096
+	maxConfigGroups               = 1024
+	maxConfigListValues           = 4096
+	maxConfigValueBytes           = 8 << 10
+	maxConfigListeners            = 256
 
 	minSourceRefreshIntervalSeconds = 60
 	maxSourceRefreshIntervalSeconds = 7 * 24 * 60 * 60
@@ -86,16 +89,16 @@ type Source struct {
 	AllowEmpty bool `json:"allow_empty,omitempty"`
 	// AutoRefreshEnabled controls scheduled refreshes for this source.
 	// RefreshIntervalSeconds is zero when the global scrape interval applies.
-	AutoRefreshEnabled     bool   `json:"auto_refresh_enabled"`
-	RefreshIntervalSeconds int    `json:"refresh_interval_seconds"`
-	Builtin                bool   `json:"builtin"`
+	AutoRefreshEnabled     bool `json:"auto_refresh_enabled"`
+	RefreshIntervalSeconds int  `json:"refresh_interval_seconds"`
+	Builtin                bool `json:"builtin"`
 	// FetchViaPool instructs the scraper to route this source's HTTP request
 	// through a randomly-selected healthy pool proxy instead of connecting
 	// directly. Useful for endpoints that block datacenter/non-residential IPs.
-	FetchViaPool           bool   `json:"fetch_via_pool,omitempty"`
-	Note                   string `json:"note,omitempty"`
-	autoRefreshMissing     bool
-	revision               uint64
+	FetchViaPool       bool   `json:"fetch_via_pool,omitempty"`
+	Note               string `json:"note,omitempty"`
+	autoRefreshMissing bool
+	revision           uint64
 }
 
 // UnmarshalJSON preserves an explicit false while defaulting legacy records
@@ -149,6 +152,9 @@ type PoolConfig struct {
 	// AutoCheckIntervalSeconds pauses the automatic rotation worker between
 	// batches. 0 runs batches back-to-back.
 	AutoCheckIntervalSeconds int `json:"auto_check_interval_seconds,omitempty"`
+	// BuiltinCatalogVersion records which shipped source-catalog migration
+	// has been applied. Missing or 0 means the store predates catalog v1.
+	BuiltinCatalogVersion int `json:"builtin_catalog_version,omitempty"`
 }
 
 // UnmarshalJSON bounds the top-level collections while they are decoded. A
@@ -205,6 +211,8 @@ func (cfg *PoolConfig) UnmarshalJSON(data []byte) error {
 			err = decoder.Decode(&out.AutoCandidateCheck)
 		case "auto_check_interval_seconds":
 			err = decoder.Decode(&out.AutoCheckIntervalSeconds)
+		case "builtin_catalog_version":
+			err = decoder.Decode(&out.BuiltinCatalogVersion)
 		default:
 			err = skipJSONValue(decoder)
 		}
@@ -436,6 +444,9 @@ func NewConfigStore(dataDir string) (*ConfigStore, error) {
 		cs.cfg.CheckURL = defaultCheckURL
 		migrated = true
 	}
+	if migrateBuiltinSourceCatalog(&cs.cfg) {
+		migrated = true
+	}
 	if migrated {
 		if err := cs.writeLocked(); err != nil {
 			return nil, fmt.Errorf("persist config migration: %w", err)
@@ -481,6 +492,134 @@ func migrateProxyIPSourceMetadata(cfg *PoolConfig) bool {
 			source.Note = currentProxyIPSourceNote
 			changed = true
 		}
+	}
+	return changed
+}
+
+var catalogV1BuiltinSourceIDs = []string{
+	"builtin-hookzof-socks5",
+	"builtin-vakhov-http",
+	"builtin-vakhov-socks5",
+	"builtin-solispirit-http",
+	"builtin-solispirit-socks5",
+	"builtin-dpangestuw-http",
+	"builtin-dpangestuw-socks5",
+}
+
+func sourceURLKey(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return strings.ToLower(raw)
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.Fragment = ""
+	return u.String()
+}
+
+func migrateBuiltinSourceCatalog(cfg *PoolConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.BuiltinCatalogVersion < 0 {
+		cfg.BuiltinCatalogVersion = 0
+	}
+	if cfg.BuiltinCatalogVersion >= builtinSourceCatalogVersion {
+		return false
+	}
+
+	defaults := defaultPoolConfig().Sources
+	defaultByID := make(map[string]Source, len(defaults))
+	defaultByURL := make(map[string]string, len(defaults))
+	defaultIDs := make(map[string]struct{}, len(defaults))
+	for _, src := range defaults {
+		defaultByID[src.ID] = src
+		defaultIDs[src.ID] = struct{}{}
+		if key := sourceURLKey(src.URL); key != "" {
+			defaultByURL[key] = src.ID
+		}
+	}
+
+	existingIDs := make(map[string]int, len(cfg.Sources))
+	hasShippedBuiltin := false
+	for i, src := range cfg.Sources {
+		existingIDs[src.ID] = i
+		if _, ok := defaultIDs[src.ID]; ok {
+			hasShippedBuiltin = true
+		}
+	}
+
+	changed := false
+	for _, id := range []string{builtinRdavydovSOCKS5SourceID, builtinRdavydovHTTPSourceID} {
+		if i, ok := existingIDs[id]; ok && cfg.Sources[i].Enabled {
+			cfg.Sources[i].Enabled = false
+			cfg.Sources[i].revision++
+			changed = true
+		}
+	}
+
+	if hasShippedBuiltin {
+		insertIDs := make([]string, 0, len(catalogV1BuiltinSourceIDs)+8)
+		insertSeen := make(map[string]struct{}, len(catalogV1BuiltinSourceIDs)+8)
+		queueInsert := func(id string) {
+			if id == "" {
+				return
+			}
+			if _, exists := existingIDs[id]; exists {
+				return
+			}
+			if _, seen := insertSeen[id]; seen {
+				return
+			}
+			insertSeen[id] = struct{}{}
+			insertIDs = append(insertIDs, id)
+		}
+		for _, id := range catalogV1BuiltinSourceIDs {
+			queueInsert(id)
+		}
+		for _, src := range cfg.Sources {
+			if src.Builtin {
+				continue
+			}
+			if id := defaultByURL[sourceURLKey(src.URL)]; id != "" {
+				queueInsert(id)
+			}
+		}
+		for _, id := range insertIDs {
+			src, ok := defaultByID[id]
+			if !ok {
+				continue
+			}
+			if len(cfg.Sources) >= maxConfiguredSources {
+				break
+			}
+			cfg.Sources = append(cfg.Sources, src)
+			existingIDs[id] = len(cfg.Sources) - 1
+			changed = true
+		}
+	}
+
+	for i := range cfg.Sources {
+		src := &cfg.Sources[i]
+		if src.Builtin || !src.Enabled {
+			continue
+		}
+		builtinID, ok := defaultByURL[sourceURLKey(src.URL)]
+		if !ok {
+			continue
+		}
+		if _, present := existingIDs[builtinID]; !present {
+			continue
+		}
+		src.Enabled = false
+		src.revision++
+		changed = true
+	}
+
+	if cfg.BuiltinCatalogVersion != builtinSourceCatalogVersion {
+		cfg.BuiltinCatalogVersion = builtinSourceCatalogVersion
+		changed = true
 	}
 	return changed
 }
@@ -726,21 +865,82 @@ func defaultPoolConfig() PoolConfig {
 				Builtin:  true,
 			},
 			{
-				ID:       "builtin-rdavydov-socks5",
-				Name:     "rdavydov SOCKS5",
-				URL:      "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+				ID:       "builtin-hookzof-socks5",
+				Name:     "hookzof SOCKS5",
+				URL:      "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
 				Format:   FormatPlainList,
 				Protocol: "socks5",
 				Enabled:  true,
 				Builtin:  true,
 			},
 			{
-				ID:       "builtin-rdavydov-http",
+				ID:       "builtin-vakhov-http",
+				Name:     "vakhov HTTP",
+				URL:      "https://vakhov.github.io/fresh-proxy-list/http.txt",
+				Format:   FormatPlainList,
+				Protocol: "http",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:       "builtin-vakhov-socks5",
+				Name:     "vakhov SOCKS5",
+				URL:      "https://vakhov.github.io/fresh-proxy-list/socks5.txt",
+				Format:   FormatPlainList,
+				Protocol: "socks5",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:       "builtin-solispirit-http",
+				Name:     "SoliSpirit HTTP",
+				URL:      "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/http.txt",
+				Format:   FormatPlainList,
+				Protocol: "http",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:       "builtin-solispirit-socks5",
+				Name:     "SoliSpirit SOCKS5",
+				URL:      "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/socks5.txt",
+				Format:   FormatPlainList,
+				Protocol: "socks5",
+				Enabled:  true,
+				Builtin:  true,
+			},
+			{
+				ID:      "builtin-dpangestuw-http",
+				Name:    "dpangestuw HTTP",
+				URL:     "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt",
+				Format:  FormatTextRegex,
+				Enabled: true,
+				Builtin: true,
+			},
+			{
+				ID:      "builtin-dpangestuw-socks5",
+				Name:    "dpangestuw SOCKS5",
+				URL:     "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks5_proxies.txt",
+				Format:  FormatTextRegex,
+				Enabled: true,
+				Builtin: true,
+			},
+			{
+				ID:       builtinRdavydovSOCKS5SourceID,
+				Name:     "rdavydov SOCKS5",
+				URL:      "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+				Format:   FormatPlainList,
+				Protocol: "socks5",
+				Enabled:  false,
+				Builtin:  true,
+			},
+			{
+				ID:       builtinRdavydovHTTPSourceID,
 				Name:     "rdavydov HTTP",
 				URL:      "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
 				Format:   FormatPlainList,
 				Protocol: "http",
-				Enabled:  true,
+				Enabled:  false,
 				Builtin:  true,
 			},
 			{
@@ -756,7 +956,8 @@ func defaultPoolConfig() PoolConfig {
 		Rules: []Rule{
 			{ID: "default-match", Type: RuleMatch, Group: GroupAny},
 		},
-		Groups: []Group{},
+		Groups:                []Group{},
+		BuiltinCatalogVersion: builtinSourceCatalogVersion,
 	}
 	for i := range cfg.Sources {
 		cfg.Sources[i].Kind = SourceKindRemote
@@ -1221,6 +1422,12 @@ func clonePoolConfig(cfg PoolConfig) PoolConfig {
 	out.MaxCandidates = cfg.MaxCandidates
 	out.SourceRefreshIntervalSeconds = cfg.SourceRefreshIntervalSeconds
 	out.FullRecheckIntervalSeconds = cfg.FullRecheckIntervalSeconds
+	out.AutoCheckIntervalSeconds = cfg.AutoCheckIntervalSeconds
+	out.BuiltinCatalogVersion = cfg.BuiltinCatalogVersion
+	if cfg.AutoCandidateCheck != nil {
+		v := *cfg.AutoCandidateCheck
+		out.AutoCandidateCheck = &v
+	}
 	if cfg.RequireIPChange != nil {
 		v := *cfg.RequireIPChange
 		out.RequireIPChange = &v
